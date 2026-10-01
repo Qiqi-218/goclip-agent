@@ -1,0 +1,16 @@
+{
+  "name": "dsh-profile-video",
+  "private": true,
+  "dependencies": {
+    "dsh-video-workspace": "link:../../platform/dsh/packages/video/video-workspace"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-video-workspace"
+      ]
+    }
+  }
+}

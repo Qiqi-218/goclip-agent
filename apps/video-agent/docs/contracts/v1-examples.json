@@ -1,0 +1,9 @@
+{
+  "analysis_completed": {"project_id":"f01","asset_id":"asset-a","asset_content_hash":"sha256:abc","analyzer_version":"asr-v1","provider":"mock","parameters":{"language":"zh"},"cache_key":"sha256:cache-a","status":"completed","evidence":[{"id":"ev-1","project_id":"f01","asset_id":"asset-a","start_us":3000000,"end_us":10000000,"transcript":"产品结论"}]},
+  "search_no_match": {"code":"no_match","message":"没有颁奖、领奖台或获奖感言的来源证据","project_id":"f01","searched_asset_ids":["asset-a","asset-b","asset-c"]},
+  "model_unavailable": {"code":"model_unavailable","message":"provider is not configured"},
+  "timeout": {"code":"timeout","message":"analysis deadline exceeded"},
+  "budget_exhausted": {"code":"budget_exhausted","message":"analysis budget exhausted"},
+  "cancelled": {"code":"cancelled","message":"request cancelled"},
+  "revision_conflict": {"code":"revision_conflict","timeline_id":"f01-cut","base_revision":2,"current_revision":3}
+}

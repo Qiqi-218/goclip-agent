@@ -1,0 +1,206 @@
+{
+  "phase": "P1",
+  "passed": true,
+  "verified_at": "2026-09-30T15:43:58Z",
+  "environment": {
+    "go": "go1.25.6 darwin/arm64",
+    "ffmpeg": "ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers",
+    "sqlite": "modernc.org/sqlite v1.39.1"
+  },
+  "commands": [
+    {
+      "command": "go test -race ./...",
+      "passed": true,
+      "scope": "11 unit/storage tests; media suite explicitly skipped without env"
+    },
+    {
+      "command": "go vet ./...",
+      "passed": true
+    },
+    {
+      "command": "VIDEO_AGENT_INTEGRATION=1 VIDEO_AGENT_SAMPLE=<local-sintel-trailer.mp4> VIDEO_AGENT_ACCEPTANCE_DIR=<artifact-directory> go test -count=1 -v ./integration",
+      "passed": true,
+      "tests": [
+        {
+          "name": "TestP1MediaBoundaries",
+          "seconds": 0.82
+        },
+        {
+          "name": "TestP1EndToEnd",
+          "seconds": 17.48
+        },
+        {
+          "name": "TestP1ExternalSample",
+          "seconds": 17.06
+        }
+      ]
+    }
+  ],
+  "checks": [
+    "mixed frame rates and orientation",
+    "rotation metadata",
+    "mono/stereo/no-audio normalization",
+    "content-addressed import and dedup",
+    "original change isolation",
+    "36-second export and preview",
+    "pixel-verified reorder and replacement",
+    "audio-verified reorder and silence",
+    "five edits across fresh CLI processes",
+    "restore and byte-identical re-export",
+    "stale revision and locks",
+    "idempotency payload check",
+    "cross-project rejection",
+    "no overwrite",
+    "tampered source rejected"
+  ],
+  "audio": {
+    "tone_rms": 2039.4940203087137,
+    "silence_rms": 0
+  },
+  "revision_count": 8,
+  "synthetic_exports": [
+    {
+      "id": "5cc2cd4bafbc1371befbd33d8a1b5d6d",
+      "kind": "export",
+      "revision": 1,
+      "output": "data/p1-acceptance/run-1034416389/01-original.mp4",
+      "width": 1280,
+      "height": 720,
+      "frames": 1080,
+      "duration_us": 36000000,
+      "sha256": "67ec0cebfbae312b054e9fe201132b5c856d333f693ecfd7e07a204b1647638f",
+      "probe_passed": true,
+      "decode_passed": true
+    },
+    {
+      "id": "8cd00908e8c5fd12bddd548540b22d78",
+      "kind": "preview",
+      "revision": 1,
+      "output": "data/p1-acceptance/run-1034416389/02-preview.mp4",
+      "width": 640,
+      "height": 360,
+      "frames": 1080,
+      "duration_us": 36000000,
+      "sha256": "edf26dac996cf103b4e0923a8f28d8cc52b8af945c2645a82d0fd9d0563712de",
+      "probe_passed": true,
+      "decode_passed": true
+    },
+    {
+      "id": "7ee71d64ea9d302443bb2bfde1fb7f32",
+      "kind": "export",
+      "revision": 2,
+      "output": "data/p1-acceptance/run-1034416389/03-swapped.mp4",
+      "width": 1280,
+      "height": 720,
+      "frames": 1080,
+      "duration_us": 36000000,
+      "sha256": "8f9db5e1115825abd5fa2a643c84823387a53ccfcf39d4d0c4ed004542039ab6",
+      "probe_passed": true,
+      "decode_passed": true
+    },
+    {
+      "id": "a9901bca7c10e08191fd0d88cc1efb26",
+      "kind": "export",
+      "revision": 3,
+      "output": "data/p1-acceptance/run-1034416389/04-replaced.mp4",
+      "width": 1280,
+      "height": 720,
+      "frames": 1080,
+      "duration_us": 36000000,
+      "sha256": "7238de58825c9dcbd474f21b5cb3588764fd6f0860cf244cf54be88181c28c6e",
+      "probe_passed": true,
+      "decode_passed": true
+    },
+    {
+      "id": "d835b6288dc18487c7b9b5395e6e0b8f",
+      "kind": "export",
+      "revision": 6,
+      "output": "data/p1-acceptance/run-1034416389/05-edited-34s.mp4",
+      "width": 1280,
+      "height": 720,
+      "frames": 1020,
+      "duration_us": 34000000,
+      "sha256": "2e92964ffedc2bd69c3ced4d283a01c50f03000c1f3b68da306ec0aacfaf48bf",
+      "probe_passed": true,
+      "decode_passed": true
+    },
+    {
+      "id": "949d38536bf6c330dcbc0787b16aae0d",
+      "kind": "export",
+      "revision": 8,
+      "output": "data/p1-acceptance/run-1034416389/06-restored.mp4",
+      "width": 1280,
+      "height": 720,
+      "frames": 1080,
+      "duration_us": 36000000,
+      "sha256": "67ec0cebfbae312b054e9fe201132b5c856d333f693ecfd7e07a204b1647638f",
+      "probe_passed": true,
+      "decode_passed": true
+    }
+  ],
+  "footage": {
+    "source": "https://media.w3.org/2010/05/sintel/trailer.mp4",
+    "credit": "Sintel — Blender Foundation",
+    "source_sha256": "b670602fa00934ca27c4351bb0efe7ea7a07fae57284e44226025eeed7c51254",
+    "source_metadata": {
+      "width": 854,
+      "height": 480,
+      "fps": "24/1",
+      "duration_us": 52208333,
+      "audio_channels": 2
+    },
+    "checks": [
+      "real footage 36-second two-source render",
+      "25fps portrait silent derivative mixed with original",
+      "full decode of preview and both exports",
+      "replacement changes output without duration change"
+    ],
+    "exports": [
+      {
+        "id": "78643fed792d607fd735ba3e2c2dc94f",
+        "kind": "export",
+        "revision": 1,
+        "output": "data/p1-acceptance/footage-825215631/original-36s.mp4",
+        "width": 1280,
+        "height": 720,
+        "frames": 1080,
+        "duration_us": 36000000,
+        "sha256": "4c3e1c98641bc2bd24bf30d6b4b890701c98062a2dbc81acd75f0113ac2965bb",
+        "probe_passed": true,
+        "decode_passed": true
+      },
+      {
+        "id": "b5eb495e661678b0bfb3f780d4470c19",
+        "kind": "preview",
+        "revision": 1,
+        "output": "data/p1-acceptance/footage-825215631/preview-36s.mp4",
+        "width": 640,
+        "height": 360,
+        "frames": 1080,
+        "duration_us": 36000000,
+        "sha256": "373709c4c4b4f9c1864a20d73f784c78954a18843f5acc27536aa9a6b9555a03",
+        "probe_passed": true,
+        "decode_passed": true
+      },
+      {
+        "id": "63adc12ad9a412998cb56cc6e3dbfbb3",
+        "kind": "export",
+        "revision": 2,
+        "output": "data/p1-acceptance/footage-825215631/replaced-36s.mp4",
+        "width": 1280,
+        "height": 720,
+        "frames": 1080,
+        "duration_us": 36000000,
+        "sha256": "dd064f47cbc59f5ef0dacb04a26a894701fe9bf285a16e46d9720c9462a3ed31",
+        "probe_passed": true,
+        "decode_passed": true
+      }
+    ]
+  },
+  "limits": [
+    "P1 deterministic editing only; no semantic video understanding or model loop",
+    "Synthetic fixtures plus one public footage sample, not P4's 8 creative tasks",
+    "Synchronous rendering; hard-kill recovery and async task scheduling are not implemented",
+    "Media artifacts stay local under ignored data/"
+  ]
+}

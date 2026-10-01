@@ -1,0 +1,15 @@
+# Local machine state and credentials
+.DS_Store
+runtime/
+apps/video-agent/.env.ps1
+!apps/video-agent/.env.ps1.example
+apps/video-agent/bin/
+apps/video-agent/data/
+apps/video-agent/workspace/data/
+apps/video-agent/workspace/input/*
+!apps/video-agent/workspace/input/.gitkeep
+config/profile/node_modules/
+
+# Preserve the pre-consolidation repository metadata locally without publishing it.
+apps/video-agent/.git-history/
+platform/dsh/.git-history/

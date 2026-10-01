@@ -1,0 +1,14 @@
+.git
+.github
+bin
+data
+workspace/data
+workspace/input
+*.db
+*.db-shm
+*.db-wal
+*.mp4
+*.mov
+*.wav
+*.log
+.env

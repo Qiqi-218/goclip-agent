@@ -1,0 +1,8 @@
+{
+  "id": "trim-opening-001",
+  "timeline_id": "demo-timeline",
+  "base_revision": 1,
+  "kind": "trim_clip",
+  "target_clip_id": "opening",
+  "duration_frames": 300
+}

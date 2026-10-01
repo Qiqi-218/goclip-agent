@@ -1,0 +1,18 @@
+name: 缺陷报告
+description: 记录可复现的失败或 P1 回归
+labels: ["bug", "status:backlog"]
+body:
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤与实际/预期结果
+      description: 给出命令、版本、源素材规格和错误；不要粘贴密钥或私人素材。
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境与证据
+      description: 系统、Go/FFmpeg 版本、脱敏日志、相关 Issue/PR。
+    validations:
+      required: true

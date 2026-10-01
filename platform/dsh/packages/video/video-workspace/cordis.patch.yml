@@ -1,0 +1,16 @@
+# 智能剪辑助手 bundle
+#
+# 一个 host 侧插件行：把本地 video-agent 服务的剪辑动作注册成 agent 工具。
+# 工具的 endpoint / 超时 / 帧回传比例 / 访问令牌由 profile 层覆盖本行 config 来配置。
+#
+# 默认 endpoint 是回环地址，令牌为空，对应「本机开发」。公网部署时三处都要改：
+# 服务的监听地址与 VIDEO_AGENT_SHARED_SECRET，以及这里的 authToken —— 两者必须一致。
+
+- insert:
+    - id: video-workspace
+      name: dsh-video-workspace
+      config:
+        endpoint: http://127.0.0.1:8090
+        timeoutMs: 900000
+        framePreviewScale: 0.5
+        authToken: ''

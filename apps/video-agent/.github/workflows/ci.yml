@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  base:
+    name: Go build, race, and vet
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.0'
+          check-latest: true
+      - run: go build ./cmd/video-agent
+      - run: go test -race ./...
+      - run: go vet ./...
+
+  media-acceptance:
+    name: FFmpeg P1 acceptance
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.0'
+          check-latest: true
+      - name: Verify media tools
+        run: ffmpeg -version && ffprobe -version
+      - name: Run generated-fixture acceptance
+        env:
+          VIDEO_AGENT_INTEGRATION: '1'
+          VIDEO_AGENT_ACCEPTANCE_DIR: ${{ runner.temp }}/video-agent-acceptance
+        run: |
+          set -o pipefail
+          go test -count=1 -v ./integration 2>&1 | tee "$RUNNER_TEMP/integration.log"
+      - name: Collect reports (no media artifacts)
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-reports"
+          find "$RUNNER_TEMP/video-agent-acceptance" -name report.json -exec cp {} "$RUNNER_TEMP/ci-reports/" \; 2>/dev/null || true
+          cp "$RUNNER_TEMP/integration.log" "$RUNNER_TEMP/ci-reports/" 2>/dev/null || true
+      - name: Upload reports and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p1-acceptance-report
+          path: ${{ runner.temp }}/ci-reports
+          if-no-files-found: warn

@@ -1,0 +1,12 @@
+{
+  "id": "demo-timeline",
+  "project_id": "demo",
+  "fps_num": 30,
+  "fps_den": 1,
+  "width": 1280,
+  "height": 720,
+  "items": [
+    {"id": "opening", "asset_id": "REPLACE_WITH_FIRST_IMPORTED_ASSET_ID", "source_in_us": 2000000, "source_out_us": 20000000},
+    {"id": "ending", "asset_id": "REPLACE_WITH_SECOND_IMPORTED_ASSET_ID", "source_in_us": 1000000, "source_out_us": 19000000}
+  ]
+}

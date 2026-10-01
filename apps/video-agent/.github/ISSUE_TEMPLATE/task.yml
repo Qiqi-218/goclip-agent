@@ -1,0 +1,48 @@
+name: 开发任务
+description: 为双人协作拆分一个有边界、可验收的任务
+title: "[任务ID] "
+labels: ["type:task", "status:backlog"]
+body:
+  - type: dropdown
+    id: owner
+    attributes:
+      label: 负责人角色
+      options:
+        - A：媒体与智能
+        - B：平台与交互
+        - 待共同确定
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: 目标与范围
+      description: 说明交付后用户可以完成什么，哪些内容不属于本任务。
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: 前置任务与接口
+      description: 链接依赖 Issue，写清启动条件、联调条件及需要对方提供的接口。
+    validations:
+      required: true
+  - type: textarea
+    id: files
+    attributes:
+      label: 预计修改范围
+      description: 列出包或路径；共享 domain、store、render 的变更先协商。
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收清单
+      description: 使用勾选项，写清实际操作、预期结果及能证明完成的测试/产物。
+    validations:
+      required: true
+  - type: textarea
+    id: handoff
+    attributes:
+      label: 交接与工作量估算
+      description: 下游调用方、负责评审的人，以及有效工作日估算。
