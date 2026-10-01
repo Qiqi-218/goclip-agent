@@ -45,7 +45,7 @@
 - id: agent-default-model
   config:
     provider: bailian
-    model: qwen3.8-omni-flash
+    model: qwen-plus
 
 - id: ui-settings-general
   name: "@deepseek-ai/dsh-client-ui-settings-general"

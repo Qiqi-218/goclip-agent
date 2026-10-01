@@ -2,7 +2,7 @@
   "name": "dsh-profile-video",
   "private": true,
   "dependencies": {
-    "dsh-video-workspace": "link:../../platform/dsh/packages/video/video-workspace"
+    "dsh-video-workspace": "link:../../../../platform/dsh/packages/video/video-workspace"
   },
   "dsh": {
     "profile": {
