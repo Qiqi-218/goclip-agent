@@ -16,26 +16,9 @@
         baseURL: https://llm-gg1ri1xazge7fzx4.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
         displayName: 阿里云百炼
         models:
-          # 文本主力：工具调用已验证。name 是界面显示名，省得模型选择器
-          # 用 pi-ai 目录里的默认名把这个 id 显示成另一个厂商的模型。
-          - id: qwen-plus
-            name: Qwen-Plus
-          # 视觉：用于「看画面抽帧」，是 U4/U5 两条需求的关键
-          - id: qwen-vl-plus
-            name: Qwen-VL-Plus
-            input: [text, image]
-          - id: qwen-vl-max
-            name: Qwen-VL-Max
-            input: [text, image]
-          # 长上下文兜底
-          - id: qwen-max
-            name: Qwen-Max
-          # 主力换成 omni-flash：实测该端点上可用（HTTP 200）。
-          # 前一个主力 qwen-plus 在一次「帮我剪精彩的地方」里**空转了 60 多次**，
-          # 反复用 amazing / wow / 精彩 / 高潮 这些词搜字幕 —— 见下面 system-prompt
-          # 一段的说明。换模型只是缓解，真正的修法是提示词 + 工具描述。
-          - id: qwen3.5-omni-flash
-            name: Qwen3.5-Omni-Flash
+          # 主力：已实测该端点可用（HTTP 200）。
+          - id: qwen3.8-omni-flash
+            name: Qwen3.8-Omni-Flash
             contextWindow: 1048576
 
 # 默认模型必须显式指向百炼。
@@ -46,7 +29,7 @@
 - id: agent-default-model
   config:
     provider: bailian
-    model: qwen3.5-omni-flash
+    model: qwen3.8-omni-flash
 
 - id: ui-settings-general
   name: "@deepseek-ai/dsh-client-ui-settings-general"
