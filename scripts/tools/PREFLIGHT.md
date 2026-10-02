@@ -21,7 +21,7 @@ E:\huabei\.venv\Scripts\python.exe E:\huabei\tools\preflight.py
 
 **密钥扫描只扫我们自己的路径。** DSH 上游仓库整棵树里有几十处 `sk-test-…` 之类的
 测试夹具，把它们报出来只会训练人忽略报告 —— 那比不报更糟。
-所以 `apps/video-agent` 全扫，`platform/dsh` 只扫 `packages/video/`（我们加的那个插件）。
+所以 `config/` 与 `platform/dsh/packages/video/` 会被扫描；后者是我们加的插件。
 形似占位值的匹配会被识别并计数，但不算不合格。
 
 **「未套用官网模板」是警告不是失败。** 模板下载在官网登录后，团队拿到之前这条无法消除；
@@ -47,7 +47,7 @@ python tools/preflight.py --no-repos
 [2/3] 设计文档      PASS  6 个章节 / 3 张截图
                    WARN  文档仍未套用官网模板
                    WARN  仍有未填占位：封面信息 4 处、AI 写码比例 1 处
-[3/3] 密钥          PASS  goclip-agent 126 个文件（仅 apps/video-agent 与 platform/dsh/packages/video）
+[3/3] 密钥          PASS  goclip-agent（仅 config 与 platform/dsh/packages/video）
 
 1 项不合格 —— 视频未录
 ```

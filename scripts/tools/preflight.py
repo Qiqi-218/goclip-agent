@@ -73,7 +73,7 @@ def looks_like_placeholder(value: str) -> bool:
 # Only the parts of a checkout we own. Scanning an upstream project's whole tree
 # reports its test fixtures, which are not ours to fix and not a finding.
 OWNED_PATHS = (
-    'apps/video-agent/',                     # the whole service belongs to this project
+    'config/',                               # profile configuration belongs to this project
     'platform/dsh/packages/video/',           # only the plugin is ours in the upstream harness
 )
 

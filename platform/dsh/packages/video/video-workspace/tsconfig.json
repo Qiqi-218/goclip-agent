@@ -1,13 +1,11 @@
 {
-  "extends": "../../../tsconfig.base.client.json",
+  "extends": "../../../tsconfig.base.json",
   "compilerOptions": {
     "rootDir": "src",
     "outDir": "lib/types"
   },
   "include": [
-    "src",
-    "src/client",
-    "src/css-modules.d.ts"
+    "src"
   ],
   "references": [
     {
@@ -21,27 +19,6 @@
     },
     {
       "path": "../../util/values"
-    },
-    {
-      "path": "../../client/locale/tsconfig.client.json"
-    },
-    {
-      "path": "../../client/ui-layout"
-    },
-    {
-      "path": "../../client/ui-primitives"
-    },
-    {
-      "path": "../../client/ui-sidebar"
-    },
-    {
-      "path": "../../client/ui-tool"
-    },
-    {
-      "path": "../../client/ui-renderer"
-    },
-    {
-      "path": "../../client/ui-slots"
     }
   ]
 }

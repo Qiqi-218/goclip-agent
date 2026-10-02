@@ -1,13 +1,8 @@
 # Local machine state and credentials
 .DS_Store
 runtime/
-apps/video-agent/.env.ps1
-!apps/video-agent/.env.ps1.example
-apps/video-agent/bin/
-apps/video-agent/data/
-apps/video-agent/workspace/data/
-apps/video-agent/workspace/input/*
-!apps/video-agent/workspace/input/.gitkeep
+runtime/.env.ps1
+bilibili-BV1P5h16JE8n.mp4
 config/profile/node_modules/
 
 # Preserve the pre-consolidation repository metadata locally without publishing it.
