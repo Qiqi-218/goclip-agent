@@ -18,3 +18,23 @@
         ossOutputPrefix: goclip-exports
         ossProjectPrefix: goclip-projects
         signedUrlSeconds: 900
+        # 导入时整个文件会被读进内存再上传 OSS，这个上限防止长视频撑爆进程堆。
+        maxImportBytes: 4294967296
+        requestTimeoutMs: 120000
+        modelTimeoutMs: 1800000
+        searchLimit: 50
+        # 导入后是否保留本地源文件。默认 false（删源文件，素材归 OSS）；
+        # 想保住原始文件就改成 true。
+        # ⚠️ 改为 true：默认值 false 会在导入后删除本地源文件。
+        # 素材是你的测试数据，删了就只剩 OSS 一份，所以这里保留源文件。
+        keepSourceFiles: true
+        # 起点离关键帧超过这个毫秒数就重新编码（保证帧精确），否则直接复制（快）。
+        keyframeToleranceMs: 500
+        # 一次回复的输出上限（含推理 token）。模型硬顶 131072；
+        # 不设的话服务端会用一个隐藏上限，撞上时 JSON 被截半，报错却像"模型没按要求回答"。
+        maxOutputTokens: 32768
+        # 思考强度：low / medium / high。留空用部署默认值。
+        # 推理按输出计费，短查询不需要长思考链，可以调低省钱。
+        reasoningEffort: medium
+        # 单个模型请求的尝试次数（含首次）。覆盖限流与 5xx；非 429 的 4xx 不重试。
+        modelAttempts: 3

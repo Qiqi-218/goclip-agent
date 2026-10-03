@@ -1,0 +1,88 @@
+{
+  "_note": "人工看片标注，边界用抽帧逐点核对（见每条 _frames）。不是用工具输出反填。\n按粒度分两层，因为两类查询测的是不同的东西：\n  event  —— 画面/声音有明确切换边界的事件，用 video_find_in_video 测重叠与边界误差；\n  topic  —— 连续口播里的主题段落，没有视觉边界，video_find_in_video 会返回字幕行级的窄区间，\n             用整段主题去比对会误判为失败。这类应由 video_outline / video_highlights 承担。",
+  "project_id": "highlight_clip_001",
+  "asset_id": "asset-5601170d3db82c9c1791",
+  "verify_boundaries": false,
+  "queries": [
+    {
+      "tier": "event",
+      "text": "AI 飞碟来摘低垂果实",
+      "start_us": 182200000,
+      "end_us": 197800000,
+      "precise_boundaries": true,
+      "_frames": "180/180.5/181/181.5/182.0s 口播；182.5s 梗图出现；198s 已回口播"
+    },
+    {
+      "tier": "event",
+      "text": "玩王者荣耀的画面",
+      "start_us": 288000000,
+      "end_us": 299839274,
+      "precise_boundaries": true,
+      "_frames": "281/283/285/287s 口播（含「你所热爱的，就是你的生活」）；288s 游戏画面出现；292s 仍游戏"
+    },
+    {
+      "tier": "topic",
+      "text": "注意到 zeta 函数在正偶数点的取值和π有关系",
+      "start_us": 91000000,
+      "end_us": 112000000,
+      "precise_boundaries": false,
+      "_frames": "90/100/110s 字幕均为该句；80s 是「可以追溯到200多年前的欧拉时代」。无视觉边界，属主题段。"
+    },
+    {
+      "tier": "topic",
+      "text": "1979年数学家阿佩里证明了 zeta3 是无理数",
+      "start_us": 121000000,
+      "end_us": 140000000,
+      "precise_boundaries": false,
+      "_frames": "120s 该句；130/140s 转「可是对于在人类视角下更困难的 zeta5」"
+    },
+    {
+      "tier": "topic",
+      "text": "大数学家祖吉林20多年来一直在研究这个公开问题",
+      "start_us": 143000000,
+      "end_us": 159000000,
+      "precise_boundaries": false,
+      "_frames": "140/150s 该句；160s 转「正如我之前介绍的那篇 AI 的论文」"
+    },
+    {
+      "tier": "topic",
+      "text": "人类数学家得到了 zeta5 是无理数的证明",
+      "start_us": 169000000,
+      "end_us": 179500000,
+      "precise_boundaries": true,
+      "_frames": "169-180s 字幕均为该句；181.5s 仍口播；182.5s 转梗图"
+    },
+    {
+      "tier": "topic",
+      "text": "这篇论文的可信度不高",
+      "start_us": 38000000,
+      "end_us": 49000000,
+      "precise_boundaries": false,
+      "_frames": "40s 该句；49s 已转「所以 arxiv 对投稿有严格的审核」"
+    },
+    {
+      "tier": "topic",
+      "text": "用一个比较容易理解又不会那么恰当的比喻",
+      "start_us": 208000000,
+      "end_us": 223000000,
+      "precise_boundaries": false,
+      "_frames": "209/210/211/220s 字幕为该句或「在AI的视角下，数学问题只是token能解决的问题」"
+    },
+    {
+      "tier": "topic",
+      "text": "AI 发明之前围棋选手下棋讲究棋风",
+      "start_us": 224000000,
+      "end_us": 246000000,
+      "precise_boundaries": false,
+      "_frames": "230/240/245/246s 字幕均为该句；250s 转「结果 AI 发明以后，我们下棋就是去学 AI 了」"
+    },
+    {
+      "tier": "topic",
+      "text": "我是真有点无地自容",
+      "start_us": 250000000,
+      "end_us": 262000000,
+      "precise_boundaries": false,
+      "_frames": "250/251/252s 为「结果 AI 发明以后…」；260/261s 为「怎么说呢，我是真有点无地自容」"
+    }
+  ]
+}

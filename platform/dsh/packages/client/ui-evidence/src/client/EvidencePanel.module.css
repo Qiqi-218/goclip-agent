@@ -1,0 +1,232 @@
+/**
+ * Evidence panel: one shared-time-axis stack of read-only tracks.
+ *
+ * The axis column is a fixed width so every track starts at the same x, which
+ * is the whole point of the panel — a curve, a tick and a caption at the same
+ * left offset are the same moment in the recording.
+ *
+ * Every length that is a share of the recording is written by the component as
+ * an inline `left`/`width` percentage; this sheet owns only appearance.
+ */
+
+.panel {
+  margin: 8px 0;
+  padding: 12px 14px 10px;
+  border: 0.5px solid var(--dsw-alias-settings-card-stroke);
+  border-radius: var(--dsw-radius-xl);
+  background: var(--dsw-alias-settings-card-fill);
+}
+
+.summary {
+  margin-left: 8px;
+  overflow: hidden;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.note {
+  margin: 8px 0 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+}
+
+.head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.title {
+  margin: 0;
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.meta {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.duration {
+  color: var(--dsw-alias-label-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+
+.complete {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: var(--dsw-radius-xs);
+  background: var(--dsw-alias-state-success-secondary);
+  color: var(--dsw-alias-label-primary);
+  font-size: 11px;
+}
+
+.incomplete {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: var(--dsw-radius-xs);
+  background: var(--dsw-alias-state-warn-secondary);
+  color: var(--dsw-alias-state-warn-label);
+  font-size: 11px;
+}
+
+.axis {
+  display: grid;
+  /* Wide enough for the loudness range label ("-18.2 … -13.3 dBFS"), which is the
+     longest string any track contributes; truncating it would hide the one number
+     that gives the curve its scale. */
+  grid-template-columns: 92px 1fr;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.label {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  overflow: hidden;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.labelText {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.labelAside {
+  overflow: hidden;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.track {
+  position: relative;
+  height: 22px;
+  border-radius: var(--dsw-radius-xs);
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+/* Hovering a track dims nothing but lifts the frame, so a reader can tell which
+   row the pointer's title text belongs to. */
+.track:hover {
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+.absent {
+  position: absolute;
+  inset: 50% 0 auto;
+  border-top: 0.5px dashed var(--dsw-alias-border-l2);
+}
+
+.plot {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* The producer's "loud" threshold, dashed so a reader can see which peaks cross it. */
+.loudLine {
+  stroke: var(--dsw-alias-state-warn-primary);
+  stroke-width: 1;
+  stroke-dasharray: 6 6;
+  vector-effect: non-scaling-stroke;
+}
+
+.loudArea {
+  fill: var(--dsw-alias-state-business-tertiary);
+}
+
+.loudStroke {
+  fill: none;
+  stroke: var(--dsw-alias-link);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.ruler {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 100%;
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+.tick {
+  position: absolute;
+  top: 25%;
+  width: 1px;
+  height: 50%;
+  background: var(--dsw-alias-label-deep-diving);
+}
+
+.silenceBar {
+  position: absolute;
+  top: 50%;
+  /* A silence can be a fraction of a second, and a strictly proportional width
+     rounds it to a hairline that reads as noise rather than as a marked gap. */
+  min-width: 3px;
+  height: 8px;
+  transform: translateY(-50%);
+  border-radius: var(--dsw-radius-xs);
+  /* Amber, matching the loudness threshold line: both mark a level the audio
+     crosses, unlike the blue text bands which mark spans of content. */
+  background: var(--dsw-alias-state-warn-secondary);
+}
+
+.bar_text {
+  position: absolute;
+  top: 50%;
+  min-width: 2px;
+  height: 10px;
+  transform: translateY(-50%);
+  border-radius: var(--dsw-radius-xs);
+  background: var(--dsw-alias-state-business-tertiary);
+}
+
+.segment {
+  position: absolute;
+  top: 50%;
+  height: 12px;
+  transform: translateY(-50%);
+  border-radius: var(--dsw-radius-xs);
+  background: var(--dsw-alias-brand-primary);
+}
+
+/* A segment taken from another asset has no position on this axis; it is drawn
+   hollow so it reads as "part of the cut, not part of this recording". */
+.segmentOffAxis {
+  position: absolute;
+  top: 50%;
+  height: 12px;
+  transform: translateY(-50%);
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-xs);
+  background: transparent;
+}
+
+.footer {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 0.5px solid var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}

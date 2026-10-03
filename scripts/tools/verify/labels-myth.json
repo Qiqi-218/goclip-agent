@@ -1,0 +1,24 @@
+{
+  "_note": "人工看片标注（纪录片《流言终结者》一箭射穿12个圆环，160s）。边界用抽帧逐点核对。",
+  "project_id": "probe_myth",
+  "asset_id": "asset-138952169a08b05f0a3e",
+  "verify_boundaries": false,
+  "queries": [
+    {
+      "tier": "event",
+      "text": "片头演示一箭射穿12个圆环的动画",
+      "start_us": 0,
+      "end_us": 8300000,
+      "precise_boundaries": true,
+      "_frames": "0-7s 均为金色圆环阵列+危险行为警告的动画（1/2/3/4/5/6/7s 画面同源）；9s 已切到射箭者实拍 → 终点取镜头证据的切点 8.3s"
+    },
+    {
+      "tier": "event",
+      "text": "弓箭手拉弓射箭的特写",
+      "start_us": 8300000,
+      "end_us": 17900000,
+      "precise_boundaries": false,
+      "_frames": "9/10s 男子持弓拉弦的近景；11s 起为弓与靶的对照示意；17.9s 是镜头切点"
+    }
+  ]
+}
