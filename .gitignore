@@ -1,10 +1,84 @@
 # Local machine state and credentials
 .DS_Store
-runtime/
-runtime/.env.ps1
+# 前导斜杠是必须的：写成 `runtime/` 会匹配**任意层级**的 runtime 目录，
+# 把 platform/dsh 里 packages/experimental/inspector/src/**/runtime/ 这类源码目录
+# 一起忽略掉 —— 已因此漏掉 10 个源文件，clone 下来构建直接失败（error TS6053）。
+/runtime/
 bilibili-BV1P5h16JE8n.mp4
 config/profile/node_modules/
 
 # Preserve the pre-consolidation repository metadata locally without publishing it.
 apps/video-agent/.git-history/
 platform/dsh/.git-history/
+
+# ── 本仓库自己的临时脚本 ─────────────────────────────────────────────────────
+#
+# 排查/一次性用的脚本一律以点开头命名，并且不进仓库：它们是过程产物，
+# 提交进去会让评审看到一堆与产品无关的调试文件。
+# （已经因为漏了这条规则误提交过 5 个 .serve*/.diag* 脚本，靠 amend 修掉。）
+scripts/tools/verify/.*.sh
+scripts/tools/verify/.*.py
+scripts/tools/verify/.*.mjs
+scripts/tools/verify/.*.json
+# 桩件目录（假 pnpm / 假 ffmpeg），只在本机哈内斯里用
+scripts/tools/verify/.shim/
+# 例外：目录占位文件要跟踪，否则空目录 clone 不出来
+!scripts/tools/verify/.gitkeep
+
+# ── platform/dsh 的忽略规则（前缀化后搬到这里）────────────────────────────────
+#
+# 为什么必须搬：DSH 是作为**子目录**随本仓库一起提交的，它自带的 .gitignore
+# 在嵌套 .git 被移除后不再参与本仓库的决策 —— 而它忽略的正是 node_modules 与
+# 各种构建产物（合计约 261 MB）。不搬过来的话，一次 `git add .` 会把整个
+# node_modules 树和 lib/ 产物一起提交。
+#
+# 来源：platform/dsh/.gitignore（上游 DSH 仓库自己的规则），逐条加前缀翻译。
+# 上游更新那份文件时，这里要跟着更新。
+platform/dsh/CLAUDE.local.md
+platform/dsh/.env
+platform/dsh/apps/desktop/.env.windows
+platform/dsh/apps/desktop/.env.macos
+platform/dsh/apps/desktop/*.p12
+platform/dsh/node_modules/
+platform/dsh/lib/
+platform/dsh/**/node_modules/
+platform/dsh/**/lib/
+platform/dsh/**/*.tsbuildinfo
+platform/dsh/pnpm-debug.log
+platform/dsh/.pnpm-store/
+platform/dsh/.cache/
+platform/dsh/examples/*/*.jsonl
+platform/dsh/.storages/
+platform/dsh/.sessions/
+platform/dsh/examples/*/.sessions/
+platform/dsh/coverage/
+platform/dsh/.coverage-times.json
+platform/dsh/.doc-typecheck-*/
+platform/dsh/.node-next-types-*/
+platform/dsh/.oxlint-contract-*/
+platform/dsh/.oxlintrc.contract-*.json
+platform/dsh/oxlint-contract-*.ts
+platform/dsh/.humanize/
+platform/dsh/tmp/
+platform/dsh/.claude/commands/
+platform/dsh/.claude/launch.json
+platform/dsh/.claude/settings.json
+platform/dsh/.vscode/
+platform/dsh/.idea
+platform/dsh/mise.toml
+platform/dsh/dist-exe/
+platform/dsh/dist/
+platform/dsh/apps/web/dist/
+platform/dsh/apps/desktop/.desktop-build/
+platform/dsh/python/sdk-runtime/src/deepseek_harness_runtime/runtime/
+platform/dsh/python/**/__pycache__/
+platform/dsh/python/**/.pytest_cache/
+platform/dsh/packages/**/__pycache__/
+platform/dsh/.artifacts/
+platform/dsh/.dsh-build/
+platform/dsh/.playwright-mcp/
+platform/dsh/.worktrees/
+platform/dsh/worktrees/
+platform/dsh/.agents/worktrees/
+platform/dsh/.typert-*/
+platform/dsh/native/system/test/bin/

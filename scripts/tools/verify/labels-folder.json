@@ -1,0 +1,48 @@
+{
+  "_note": "人工看片标注（口播 vlog《一个文件夹的故事》120.6s）。边界用抽帧核对。\n这份是**对照素材**：全片只有一个镜头（切点仅 1 个，在 108.6s），画面是一人对着镜头说话，\n没有任何视觉事件。所以它测的是两件别处测不到的事：\n  1) 检索能不能找到纯口播内容（只靠字幕与语音）；\n  2) 找不到时会不会编造区间。",
+  "project_id": "probe_folder",
+  "asset_id": "asset-91ad90e2ba5b59d70b93",
+  "verify_boundaries": false,
+  "queries": [
+    {
+      "tier": "topic",
+      "text": "讲大家在任何时间都有精神内耗",
+      "start_us": 0,
+      "end_us": 12000000,
+      "precise_boundaries": false,
+      "_frames": "2s/10s 字幕为「大家在任何时间都有精神内耗」；18s 已转「每次我焦虑的时候都会想起这个故事」"
+    },
+    {
+      "tier": "topic",
+      "text": "说同事说小辣一直在拿着它",
+      "start_us": 34000000,
+      "end_us": 46000000,
+      "precise_boundaries": false,
+      "_frames": "34s 字幕「我同事就说小辣」；42s 已转「所以就等于一直在拿着它」"
+    },
+    {
+      "tier": "topic",
+      "text": "说对我的启发真的是极大的",
+      "start_us": 58000000,
+      "end_us": 68000000,
+      "precise_boundaries": false,
+      "_frames": "58s 字幕「对我的启发真的是极大的」；66s 已转「即便现在我也经常在后台」"
+    },
+    {
+      "tier": "topic",
+      "text": "说这一刻才是成长这个过程具象化了",
+      "start_us": 112000000,
+      "end_us": 120614000,
+      "precise_boundaries": false,
+      "_frames": "118s 字幕「这一刻才是成长这个过程具象化了」；110s 是「可是它现在竟然已经长成你想要的样子」"
+    },
+    {
+      "tier": "event",
+      "text": "画面里出现一只猫",
+      "start_us": 0,
+      "end_us": 0,
+      "precise_boundaries": false,
+      "_negative": "负例：这段视频里没有猫。测的是「找不到时会不会编造区间」——正确处理是返回 0 段。"
+    }
+  ]
+}

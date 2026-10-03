@@ -1,4 +1,5 @@
 # Store text files with LF line endings regardless of the contributor's OS.
+# 这一条对 setup.sh / start.sh 是必需的：它们在 Linux 上要能直接执行。
 * text=auto eol=lf
 
 # Preserve binary media and generated binary packages exactly.
@@ -10,5 +11,24 @@
 *.jpeg binary
 *.gif binary
 *.ico binary
+*.webp binary
 *.zip binary
 *.exe binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.zst binary
+*.sqlite binary
+*.node binary
+
+# ── Vendored DSH base ────────────────────────────────────────────────────────
+#
+# platform/dsh 是 DSH 基座的完整源码，随仓库提交以保证 clone 后可构建。
+# 标记为 vendored 有两个作用：
+#   1. GitHub 的语言统计不再被这 14000 个文件淹没 —— 本作品自己的代码
+#      （剪辑插件与证据面板）才应该是主语言构成。
+#   2. 让评审一眼看出哪部分是上游基座、哪部分是本作品实现。
+#
+# linguist-vendored 只影响统计与高亮，不影响 git 的正常跟踪与 diff。
+platform/dsh/** linguist-vendored

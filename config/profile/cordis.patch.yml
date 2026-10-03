@@ -13,7 +13,13 @@
       bailian:
         apiKeyEnv: AUTOCLIP_TEXT_API_KEY
         api: openai-completions
-        baseURL: https://llm-gg1ri1xazge7fzx4.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+        # 端点走环境变量，不写死。
+        #
+        # 百炼的 baseURL 是**按 workspace 分配的**（形如
+        # https://llm-<每个账号不同>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1），
+        # 写死意味着别人 clone 下来必须来改这一行才能跑。它也不是密钥，
+        # 但把某个具体 workspace 的地址放进公开仓库没有意义。
+        baseURL: !!js process.env.AUTOCLIP_TEXT_BASE_URL
         displayName: 阿里云百炼
         models:
           # 主力：已实测该端点可用（HTTP 200）。
@@ -35,6 +41,20 @@
   name: "@deepseek-ai/dsh-client-ui-settings-general"
   config:
     welcomeNoticeVersion: 2026-09-28.1
+
+# 证据面板：`video_evidence_view` 的调用卡片。
+#
+# 它必须作为**独立的一行**出现，不能只写进插件的 cordis.patch.yml ——
+# 客户端 bundle 的清单是服务端启动时按 loader 行扫出来的（读每行的包名 →
+# package.json 的 dsh.client → exports["./client"] → lib/client.js），
+# 没有这一行就没有那次扫描，界面里只会看到通用工具行。
+#
+# 而且必须放在 `insert:` 里：patch 的一条**不带 insert 的顶层项**只会去
+# 匹配已有的同名行，匹配不到就什么都不做（不报错），这一行也就永远不存在。
+# 实测过：写成裸顶层项时启动没有任何报错，但页面里就是没有它。
+- insert:
+    - id: ui-evidence
+      name: "@deepseek-ai/dsh-client-ui-evidence"
 
 # ── 系统提示词注入 ────────────────────────────────────────────────────────────
 #
