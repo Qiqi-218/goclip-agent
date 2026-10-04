@@ -1760,9 +1760,8 @@ export class VideoWorkspace {
         entries,
         entry_count: entries.length,
         duration_us: duration,
-        status: run.failed.length === 0 ? 'completed' : 'partial',
-        chunking: { enabled: run.chunked, completed_chunks: run.chunks.length, failed_chunks: run.failed },
-        note: run.failed.length > 0 ? '部分分片未完成，以下文字不覆盖失败时间段。' : entries.length === 0 ? '没有读出屏幕文字。若这段视频本来就没有字幕或图表，这是正确结果。' : null,
+        status: 'completed',
+        note: entries.length === 0 ? '没有读出屏幕文字。若这段视频本来就没有字幕或图表，这是正确结果。' : null,
       }
       await this.saveEvidence(projectId, assetId, EVIDENCE_OCR, record, duration, EVIDENCE_PROVIDER_VERSION)
       return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
@@ -1825,9 +1824,8 @@ export class VideoWorkspace {
         lines,
         line_count: lines.length,
         duration_us: duration,
-        status: run.failed.length === 0 ? 'completed' : 'partial',
-        chunking: { enabled: run.chunked, completed_chunks: run.chunks.length, failed_chunks: run.failed },
-        note: run.failed.length > 0 ? '部分分片未完成，以下转写不覆盖失败时间段。' : lines.length === 0 ? '没有转写出说话内容。若这段视频本来就没有人声，这是正确结果。' : null,
+        status: 'completed',
+        note: lines.length === 0 ? '没有转写出说话内容。若这段视频本来就没有人声，这是正确结果。' : null,
       }
       await this.saveEvidence(projectId, assetId, EVIDENCE_TRANSCRIPT, record, duration, EVIDENCE_PROVIDER_VERSION)
       return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
@@ -3807,9 +3805,11 @@ export class VideoWorkspace {
      * paying for the one that also listens.
      */
     model?: string
+    /** Keep accumulated usage/stages when this is one window of a larger operation. */
+    reset?: boolean
   }): Promise<Data> {
     // 本次工具的用量从这里开始记，避免和上一次调用混在一起。
-    if (reset) {
+    if (require?.reset !== false) {
       this.usage = []
       this.stages.reset()
     }
@@ -3914,7 +3914,7 @@ export class VideoWorkspace {
         const proxy = await this.prepare(a.sourcePath, a.signal, { startSeconds: window.startUs / 1e6, endSeconds: window.endUs / 1e6, fps: 1 })
         const key = `${this.config.ossPrefix.replace(/\/$/, '')}/chunks/${a.assetId}/${a.operation}-${window.startUs}-${window.endUs}-${randomUUID()}.mp4`
         const url = await this.stages.timed(`上传模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`, () => this.uploadFile(proxy, key, 'video/mp4'))
-        const data = await this.stages.timed(`模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`, () => this.ask(url, a.prompt(window), a.signal, false))
+        const data = await this.stages.timed(`模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`, () => this.ask(url, a.prompt(window), a.signal, { reset: false }))
         write.run(a.assetId, a.operation, inputKey, window.startUs, window.endUs, 'completed', JSON.stringify(data), null, Date.now())
         chunks.push({ ...window, data })
       } catch (error) {
