@@ -88,6 +88,24 @@ raw.prepare('INSERT INTO analyses (asset_id,instruction,data,created_at) VALUES 
 }), Date.now())
 raw.close()
 
+// 一条逐字转写，供多锚点检索使用。
+// 形状与真实识别结果一致：句子级区间、逐字文本。
+{
+  const rawT = new DatabaseSync(join(dir, 'video-tools.sqlite'))
+  rawT.exec('PRAGMA foreign_keys=ON')
+  rawT.prepare('INSERT INTO assets (id,project_id,path,meta) VALUES (?,?,?,?)').run('at', 'pf', clip, JSON.stringify({ duration_us: 10_000_000 }))
+  rawT.prepare('INSERT INTO evidence (asset_id,kind,duration_us,payload,provider,provider_version,created_at) VALUES (?,?,?,?,?,?,?)')
+    .run('at', 'transcript', 10_000_000, JSON.stringify({
+      lines: [
+        { start_us: 1_000_000, end_us: 2_500_000, text: '第一句原话讲的是开场介绍。' },
+        { start_us: 3_000_000, end_us: 4_500_000, text: '第二句原话提到了飞虹塔的琉璃。' },
+        { start_us: 6_000_000, end_us: 7_500_000, text: '第三句原话在讲赵城金藏的下落。' },
+      ],
+      line_count: 3, duration_us: 10_000_000, note: null,
+    }), 'asr', 'omni-v2-windowed', Date.now())
+  rawT.close()
+}
+
 // 先把三条证据算出来，检索才有条件可用
 await vw.acousticEvidence('pf', 'af', new AbortController().signal)
 await vw.shotEvidence('pf', 'af', new AbortController().signal)
@@ -188,6 +206,35 @@ await vw.timingEvidence('pf', 'af', new AbortController().signal)
   record('两份分析的不同切法都还在（不替用户选）',
     again.matches.some(m => m.from_instruction === '第二份分析') && again.matches.some(m => m.from_instruction === '按内容分段'),
     `来源=${JSON.stringify([...new Set(again.matches.map(m => m.from_instruction))])}`)
+}
+
+// ---- 多锚点：一次问多句原话 ----------------------------------------------
+//
+// 这是那场真实事故的直接对策。当时模型一次要定位两三句原话，而本地检索只收
+// 一个查询词，于是它转去让多模态模型重看整条 43 分钟视频（21 次，838 秒）。
+{
+  const one = await vw.findSpans('pf', 'at', { text: '飞虹塔的琉璃' })
+  record('单句原话能直接命中并给出区间',
+    one.match_count === 1 && one.matches[0].start_us === 3_000_000 && one.matches[0].end_us === 4_500_000,
+    `命中 ${one.match_count} 段 @${(one.matches[0]?.start_us ?? 0) / 1e6}s`)
+
+  const many = await vw.findSpans('pf', 'at', { texts: ['开场介绍', '赵城金藏的下落'] })
+  const starts = many.matches.map(m => m.start_us / 1e6).sort((a, b) => a - b)
+  record('一次问两句原话能同时返回两段',
+    starts.length === 2 && starts[0] === 1 && starts[1] === 6,
+    `返回 ${starts.length} 段 @${starts.join('s, ')}s`)
+
+  record('每条结果标明命中的是哪一句，而不是让调用方猜',
+    many.matches.every(m => typeof m.matched_text === 'string' && m.matched_text !== '')
+    && new Set(many.matches.map(m => m.matched_text)).size === 2,
+    `matched_text=${JSON.stringify(many.matches.map(m => m.matched_text))}`)
+
+  // 多锚点里只要有一句不存在，存在的那句仍要返回 —— 整批失败会让调用方
+  // 以为「什么都没找到」，那正是升级到重看整片视频的触发条件。
+  const partial = await vw.findSpans('pf', 'at', { texts: ['飞虹塔的琉璃', '这句话素材里没有'] })
+  record('其中一个锚点找不到时，其余锚点的结果仍然返回',
+    partial.match_count === 1 && partial.matches[0].start_us === 3_000_000,
+    `命中 ${partial.match_count} 段`)
 }
 
 vw.dispose()

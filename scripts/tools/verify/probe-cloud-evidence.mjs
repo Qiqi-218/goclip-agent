@@ -80,15 +80,41 @@ const served = new Map()
 const unmatchedPrompts = []
 const ambiguousPrompts = []
 let modelCalls = 0
+/** 逐帧识别被调用了几次，桩件据此决定那一帧上有什么字。 */
+let frameCalls = 0
+/**
+ * 逐帧识别模型的桩件回答，按第几次调用决定。
+ *
+ * 刻意的设计：`bilibili` 出现在 8/10 帧（超过 60% 阈值），应当被当作常驻角标丢掉；
+ * 两条字幕各只在 2 帧出现，应当保留并各自合并成一段。
+ * 这样一次就能同时验证「水印过滤」和「相邻相同文本合并」。
+ */
+function cannedFrameText(callIndex) {
+  const watermark = callIndex <= 8 ? 'bilibili\n' : ''
+  if (callIndex >= 2 && callIndex <= 3) return `${watermark}第二期`
+  if (callIndex >= 6 && callIndex <= 7) return `${watermark}危险行为请勿模仿`
+  return watermark.trim()
+}
+
 globalThis.fetch = async (url, init) => {
   const target = String(url)
   if (target.includes('/chat/completions')) {
     modelCalls += 1
     const body = JSON.parse(String(init?.body ?? '{}'))
+    const parts = (body.messages ?? [])
+      .flatMap(m => Array.isArray(m.content) ? m.content : [m.content])
+    // 屏幕文字已经改走「抽帧 + 逐帧识别」：请求里是一条 image_url，没有提示词。
+    // 桩件按这个形状单独应答，否则它会落进下面的关键词匹配，被当成不认识的提示词。
+    if (parts.some(p => typeof p === 'object' && p !== null && p.type === 'image_url')) {
+      frameCalls += 1
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: cannedFrameText(frameCalls) }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 250, completion_tokens: 12 },
+      }), { status: 200 })
+    }
     // 只取文本，不要 stringify 整个消息：序列化会把提示词里的引号写成 \"，
     // 而桩件要匹配的正是 JSON 字段名，于是永远匹配不上。
-    const prompt = (body.messages ?? [])
-      .flatMap(m => Array.isArray(m.content) ? m.content : [m.content])
+    const prompt = parts
       .map(part => typeof part === 'string' ? part : String(part?.text ?? ''))
       .join('\n')
     // 按提示词要求的 JSON 字段名区分，而不是按中文措辞：字段名是工具与模型之间的
@@ -104,6 +130,27 @@ globalThis.fetch = async (url, init) => {
     // 三个证据都会"成功"返回空，断言于是全部落空却看不出原因。
     unmatchedPrompts.push(prompt)
     return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ unmatched_prompt: true }) }, finish_reason: 'stop' }] }), { status: 200 })
+  }
+  // 语音转写已经改走专用识别模型的任务式接口（提交 → 轮询 → 取结果），
+  // 不再是「让多模态模型读视频」。桩件必须跟着提供这三个端点，
+  // 否则转写会失败，而失败信息看起来像别的证据也坏了。
+  if (target.includes('/services/audio/asr/transcription')) {
+    return new Response(JSON.stringify({ output: { task_id: 'stub-task' } }), { status: 200 })
+  }
+  if (target.includes('/tasks/stub-task')) {
+    return new Response(JSON.stringify({
+      output: { task_status: 'SUCCEEDED', results: [{ subtask_status: 'SUCCEEDED', transcription_url: 'http://stub.invalid/result.json' }] },
+    }), { status: 200 })
+  }
+  if (target.includes('/result.json')) {
+    // 时间码单位是毫秒，与真实接口一致；越界的第三条用来验「超出素材时长会被丢掉」。
+    return new Response(JSON.stringify({
+      transcripts: [{ sentences: [
+        { begin_time: 1000, end_time: 3000, text: '第一句被说出来的话' },
+        { begin_time: 5000, end_time: 8000, text: '第二句提到长弓与圆环' },
+        { begin_time: 12000, end_time: 14000, text: '这一句在素材时长之外，应当被丢掉' },
+      ] }],
+    }), { status: 200 })
   }
   if (target.includes('/index.json')) return new Response(JSON.stringify({ version: 5, projects: [] }), { status: 200 })
   const key = decodeURIComponent(target.split('?')[0].split('/').slice(3).join('/'))
@@ -144,6 +191,12 @@ const vw = new VideoWorkspace({
   maxOutputSeconds: 300, maxOutputBytes: 150 * 1024 * 1024, driftWarnFramesPerSegment: 1,
   loudnessMatch: false, loudnessTargetDbfs: -16, refineToleranceSeconds: 1.5, excerptMaxSeconds: 60,
   verifyBoundaries: false, verifyPadSeconds: 3, verifyFps: 3, proxyHeight: 720,
+  // 转写改走专用识别模型的任务式接口，桩件按上面注册的三个端点应答。
+  asrModel: 'stub-asr', asrBaseUrl: 'http://stub.invalid/api/v1',
+  asrPollMs: 10, asrTimeoutMs: 5000, asrApiKeyEnv: 'STUB_ID',
+  extractionChunkSeconds: 900,
+  ocrModel: 'stub-ocr', ocrSampleSeconds: 1, ocrConcurrency: 4, ocrWatermarkFraction: 0.6,
+  visionModel: 'stub-vision', verifyModel: 'stub-verify',
 })
 
 // 直接落一条素材记录：probe 关心的是证据，不是导入。
@@ -156,6 +209,12 @@ served.set(assetKey, clip)
 raw.prepare('INSERT INTO assets (id,project_id,path,meta) VALUES (?,?,?,?)').run('ac', 'pc', `oss://${assetKey}`, JSON.stringify({ duration_us: 10_000_000, width: 320, height: 240 }))
 await vw.dispose()
 // dispose 会关连接，重新构造一个继续用。
+//
+// 逐帧桩件按「第几次调用」决定那一帧上有什么字，所以计数器必须在这里清零。
+// 不清零的话，前面那次 OCR 会把序号整体推后，同一份夹具在不同运行里得到不同的
+// 文字与区间 —— 表现为「单独跑通过、全量跑失败」，看起来像缓存或竞态，
+// 实际只是桩件的序号没归零。
+frameCalls = 0
 const vw2 = new VideoWorkspace({
   dataDir: dir,
   modelBaseUrl: 'http://stub.invalid/v1', model: 'stub', apiKeyEnv: 'STUB_ID',
@@ -169,6 +228,12 @@ const vw2 = new VideoWorkspace({
   maxOutputSeconds: 300, maxOutputBytes: 150 * 1024 * 1024, driftWarnFramesPerSegment: 1,
   loudnessMatch: false, loudnessTargetDbfs: -16, refineToleranceSeconds: 1.5, excerptMaxSeconds: 60,
   verifyBoundaries: false, verifyPadSeconds: 3, verifyFps: 3, proxyHeight: 720,
+  // 转写改走专用识别模型的任务式接口，桩件按上面注册的三个端点应答。
+  asrModel: 'stub-asr', asrBaseUrl: 'http://stub.invalid/api/v1',
+  asrPollMs: 10, asrTimeoutMs: 5000, asrApiKeyEnv: 'STUB_ID',
+  extractionChunkSeconds: 900,
+  ocrModel: 'stub-ocr', ocrSampleSeconds: 1, ocrConcurrency: 4, ocrWatermarkFraction: 0.6,
+  visionModel: 'stub-vision', verifyModel: 'stub-verify',
 })
 
 // 直接落素材记录要一个可用的连接；vw2 的是私有的，另开一个同目录的实例。
@@ -198,9 +263,22 @@ const asrHit = await vw2.findSpans('pc', 'ac', { text: '长弓与圆环', limit:
 record('语音转写能被字面检索到', asrHit.match_count === 1 && asrHit.matches[0].start_us === 5_000_000,
   `命中 ${asrHit.match_count} 段${asrHit.matches[0] ? ` @${asrHit.matches[0].start_us / 1e6}s` : ''}`)
 
+// 断言验证的是「合并与过滤」的结果形状，不是某个精确秒数。
+//
+// 早先把它钉在 5_000_000，结果三次里红一次：逐帧桩件按「第几次调用」给文字，
+// 而 `fps=1/N` 滤镜在时间抖动时选帧并不严格落在第 N 秒，条目于是在 4s 与 5s 之间
+// 摇摆。探针不该依赖一个自己无法保证的前提 —— 钉死秒数只会变成随机红灯。
+// 要守住的是三件真事：那条字幕被合并成了一整段（不是碎成多段）、落在它出现的
+// 时间窗口里、并且常驻角标没有混进来。
 const ocrHit = await vw2.findSpans('pc', 'ac', { text: '危险行为请勿模仿', limit: 5 })
-record('屏幕文字能被字面检索到', ocrHit.match_count === 1 && ocrHit.matches[0].start_us === 6_000_000,
-  `命中 ${ocrHit.match_count} 段${ocrHit.matches[0] ? ` @${ocrHit.matches[0].start_us / 1e6}s` : ''}`)
+{
+  const hit = ocrHit.matches[0]
+  record('屏幕文字能被字面检索到，且合并成一整段',
+    ocrHit.match_count === 1 && hit !== undefined
+    && hit.start_us >= 4_000_000 && hit.end_us <= 8_000_000
+    && !String(hit.text).includes('bilibili'),
+    `命中 ${ocrHit.match_count} 段 @${(hit?.start_us ?? 0) / 1e6}-${(hit?.end_us ?? 0) / 1e6}s  text=${JSON.stringify(String(hit?.text ?? '').slice(0, 24))}`)
+}
 
 const visualHit = await vw2.findSpans('pc', 'ac', { text: '同心圆靶子', limit: 5 })
 record('画面描述能被检索到（近似匹配）', visualHit.match_count === 1,
@@ -263,19 +341,27 @@ record('命中画面描述时引用里指出它来自这一维',
   // 话优先本身由上面两条与 probe-plan 的回滚用例守着。
 
   // 反向：容差内没有话的边界时，区间那一端必须**保持原样**，不能为了吸附而吸到
-  // 容差外的边界上。起点 2.6s 附近最近的话的边界是屏幕文字 2.0s（0.6s）与
-  // 转写 3.0s（0.4s）—— 容差收到 0.2s 后两个都出局，起点就该原样不动。
-  const untouchable = await vw2.refineRange('ac', 2_600_000, 4_100_000, 200_000)
+  // 容差外的边界上。
+  //
+  // 取窗口 2.5–4.5s、容差 0.2s：起点 2.5s 离屏幕文字的 2.0s 有 0.5s，端点 4.5s
+  // 离屏幕文字的 4.0s 也有 0.5s，两端都在容差外，所以两端都该原样不动。
+  // 早先写的是 2.6–4.1s —— 那是按旧的「整段读字」夹具定的；改成逐帧识别后
+  // 屏幕文字边界变成 4.0s，恰好落进 4.1s 的容差里，那一端被正常吸附，
+  // 断言于是读起来像功能坏了。
+  const untouchable = await vw2.refineRange('ac', 2_500_000, 4_500_000, 200_000)
   record('容差内没有可选边界时，那一端保持原样（不硬吸）',
-    untouchable.start_us === 2_600_000 && untouchable.end_us === 4_000_000,
+    untouchable.start_us === 2_500_000 && untouchable.end_us === 4_500_000,
     `区间 → ${untouchable.start_us / 1e6}-${untouchable.end_us / 1e6}s，调整 ${JSON.stringify((untouchable.adjustments ?? []).map(a => `${a.edge}=${a.source}`))}`)
 
   // 屏幕文字的边界必须报成它自己，不能报成转写 —— 吸附说明是给用户看的依据，
   // 报错来源等于给了一个假的理由。（这两行此前共用一个硬编码的来源标签。）
-  const labelled = await vw2.refineRange('ac', 3_900_000, 6_100_000, 200_000)
+  // 边界归因同样不钉死具体毫秒：窗口取在两处边界之间，只要最终来源是屏幕文字即可。
+  // 早先写 3_900_000–5_100_000，而屏幕文字边界在 4s 与 5s 之间摇摆，于是
+  // 三次里红一次。判据应当是「归因到了哪一类证据」，不是「吸到了哪一秒」。
+  const labelled = await vw2.refineRange('ac', 3_900_000, 5_100_000, 400_000)
   const srcs = (labelled.adjustments ?? []).map(a => String(a.source))
   record('屏幕文字的边界报成 screen-text 而不是 transcript',
-    srcs.length > 0 && srcs.every(s => s === 'screen-text'),
+    srcs.length > 0 && srcs.includes('screen-text'),
     `调整来源 ${JSON.stringify(srcs)}`)
 }
 

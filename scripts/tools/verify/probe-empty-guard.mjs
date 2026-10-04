@@ -51,6 +51,8 @@ await run('ffmpeg', ['-nostdin', '-v', 'error', '-y',
 let script = []
 let modelCalls = 0
 const promptsSeen = []
+/** 每次请求里 content 的原始 part，用来断言重试请求本身是合法的。 */
+const requestParts = []
 const served = new Map()
 
 globalThis.fetch = async (url, init) => {
@@ -66,9 +68,14 @@ globalThis.fetch = async (url, init) => {
       .map(part => (typeof part === 'string' ? part : String(part?.text ?? '')))
       .join('\n')
     promptsSeen.push(prompt)
+    // 留下本次请求的 content part 原样，供「重试请求是否合法」的断言使用。
+    requestParts.push((body.messages ?? []).flatMap(m => (Array.isArray(m.content) ? m.content : [])))
     const next = script.length > 0 ? script.shift() : { answer: {}, reasoningTokens: 10 }
+    // content 为 undefined 才模拟「只有推理、正文为空」——真实 400 就是这种情况。
+    // 用空字符串模拟不了：那会走 `text !== undefined` 的分支，测不到要测的路径。
+    const hasContent = next.content !== undefined || next.answer !== undefined
     return new Response(JSON.stringify({
-      choices: [{ message: { content: JSON.stringify(next.answer) }, finish_reason: 'stop' }],
+      choices: [{ message: hasContent ? { content: next.content ?? JSON.stringify(next.answer) } : {}, finish_reason: 'stop' }],
       usage: { completion_tokens: 10, completion_tokens_details: { reasoning_tokens: next.reasoningTokens ?? 10, text_tokens: 10 } },
     }), { status: 200 })
   }
@@ -91,7 +98,8 @@ const config = {
   acousticSampleRate: 8000, acousticWindowMs: 1000, acousticPeakLimit: 20,
   shotSceneThreshold: 0.3, shotMinSeconds: 0.4, shotPacingWindowSeconds: 5, shotBusyLimit: 8,
   silenceMinSeconds: 0.4, silenceNoiseDb: -30,
-  maxOutputTokens: 32_768, reasoningEffort: 'medium',
+  maxOutputTokens: 32_768, reasoningEffort: 'medium', extractionChunkSeconds: 900,
+  asrModel: 'stub-asr', asrBaseUrl: 'http://stub.invalid/api/v1', asrPollMs: 10, asrTimeoutMs: 5000, asrApiKeyEnv: 'STUB_ID',
 }
 process.env.STUB_ID = 'x'
 process.env.STUB_SECRET = 'y'
@@ -105,6 +113,7 @@ await vw.createProject('pg', '守卫测试')
   const db = new DatabaseSync(join(dir, 'video-tools.sqlite'))
   db.exec('PRAGMA foreign_keys=ON')
   db.prepare('INSERT INTO assets VALUES (?,?,?,?)').run('ag', 'pg', clip, JSON.stringify({ duration_us: 10_000_000 }))
+  db.prepare('DELETE FROM evidence WHERE asset_id=?').run('ag')
   db.close()
 }
 const signal = new AbortController().signal
@@ -117,15 +126,15 @@ const warnLines = []
 const realWarn = console.warn
 console.warn = (...args) => { warnLines.push(args.map(String).join(' ')) }
 script = [
-  { answer: { lines: [] }, reasoningTokens: 16000 },
-  { answer: { lines: [{ start_us: 1_000_000, end_us: 3_000_000, text: '重试后拿到的台词' }] }, reasoningTokens: 200 },
+  { answer: { entries: [] }, reasoningTokens: 16000 },
+  { answer: { entries: [{ start_us: 1_000_000, end_us: 3_000_000, text: '重试后拿到的字幕' }] }, reasoningTokens: 200 },
 ]
 modelCalls = 0
 promptsSeen.length = 0
-const recovered = await vw.transcriptEvidence('pg', 'ag', signal)
-record('空结果配大量推理时没有被当成「没有人声」存下来',
-  recovered.line_count === 1 && recovered.lines[0].text === '重试后拿到的台词',
-  `line_count=${recovered.line_count}  text=${recovered.lines[0]?.text ?? '(无)'}`)
+const recovered = await vw.ocrEvidence('pg', 'ag', signal)
+record('空结果配大量推理时没有被当成「没有内容」存下来',
+  (recovered.entries ?? []).length === 1 && recovered.entries[0].text === '重试后拿到的字幕',
+  `entries=${(recovered.entries ?? []).length}  text=${recovered.entries[0]?.text ?? '(无)'}`)
 record('确实发生了一次重试（模型被调用两次）', modelCalls === 2, `模型调用 ${modelCalls} 次`)
 // 这条断言改成检查「运行时把投诉写进了重试消息」，而不是去桩件里捞文本。
 //
@@ -135,10 +144,10 @@ record('确实发生了一次重试（模型被调用两次）', modelCalls === 
 // 已经把投诉原文打出来了，且输出顺序就在两次模型调用之间。
 // 直接问运行时自己更可靠。
 const complaintLogged = warnLines.some(line =>
-  line.includes('16000') && line.includes('推理') && line.includes('lines 是空数组'))
+  line.includes('16000') && line.includes('推理') && line.includes('entries 是空数组'))
 record('重试时把问题讲清楚了，而不是只说「重来」',
   complaintLogged,
-  complaintLogged ? `运行时投诉：${(warnLines.find(l => l.includes('lines 是空数组')) ?? '').slice(0, 64)}…` : '运行时没有报出可用的投诉')
+  complaintLogged ? `运行时投诉：${(warnLines.find(l => l.includes('entries 是空数组')) ?? '').slice(0, 64)}…` : '运行时没有报出可用的投诉')
 console.warn = realWarn
 
 // ---- 2. empty answer that cost nothing -> must be accepted ----------------
@@ -148,14 +157,15 @@ console.log('\n=== 情形 B：空结果 + 几乎没有推理（真的是无声�
   const db = new DatabaseSync(join(dir, 'video-tools.sqlite'))
   db.exec('PRAGMA foreign_keys=ON')
   db.prepare('INSERT INTO assets VALUES (?,?,?,?)').run('ag2', 'pg', clip, JSON.stringify({ duration_us: 10_000_000 }))
+  db.prepare('DELETE FROM evidence WHERE asset_id=?').run('ag2')
   db.close()
 }
-script = [{ answer: { lines: [] }, reasoningTokens: 10 }]
+script = [{ answer: { entries: [] }, reasoningTokens: 10 }]
 modelCalls = 0
-const silent = await vw.transcriptEvidence('pg', 'ag2', signal)
-record('低代价的空结果被如实存为「没有人声」',
-  silent.line_count === 0 && typeof silent.note === 'string' && silent.note.includes('没有转写'),
-  `line_count=${silent.line_count}  note=${String(silent.note).slice(0, 30)}`)
+const silent = await vw.ocrEvidence('pg', 'ag2', signal)
+record('低代价的空结果被如实存为「没有内容」',
+  (silent.entries ?? []).length === 0 && typeof silent.note === 'string' && silent.note.includes('没有读出'),
+  `entries=${(silent.entries ?? []).length}  note=${String(silent.note).slice(0, 30)}`)
 record('没有为此发起重试', modelCalls === 1, `模型调用 ${modelCalls} 次`)
 
 // ---- 3. the guard must not fire when the answer has content ---------------
@@ -164,14 +174,15 @@ console.log('\n=== 情形 C：有内容的回答，即使推理很多也不该�
   const db = new DatabaseSync(join(dir, 'video-tools.sqlite'))
   db.exec('PRAGMA foreign_keys=ON')
   db.prepare('INSERT INTO assets VALUES (?,?,?,?)').run('ag3', 'pg', clip, JSON.stringify({ duration_us: 10_000_000 }))
+  db.prepare('DELETE FROM evidence WHERE asset_id=?').run('ag3')
   db.close()
 }
-script = [{ answer: { lines: [{ start_us: 0, end_us: 5_000_000, text: '想很久才写出来的一句' }] }, reasoningTokens: 16000 }]
+script = [{ answer: { entries: [{ start_us: 0, end_us: 5_000_000, text: '想很久才写出来的一条' }] }, reasoningTokens: 16000 }]
 modelCalls = 0
-const heavy = await vw.transcriptEvidence('pg', 'ag3', signal)
+const heavy = await vw.ocrEvidence('pg', 'ag3', signal)
 record('推理量大但确实有内容时直接采纳，不重试',
-  heavy.line_count === 1 && modelCalls === 1,
-  `line_count=${heavy.line_count}  模型调用 ${modelCalls} 次`)
+  (heavy.entries ?? []).length === 1 && modelCalls === 1,
+  `entry_count=${heavy.line_count}  模型调用 ${modelCalls} 次`)
 
 // ---- 4. a missing field is also a contract violation ----------------------
 console.log('\n=== 情形 D：JSON 里根本没有 lines 字段 ===')
@@ -179,17 +190,59 @@ console.log('\n=== 情形 D：JSON 里根本没有 lines 字段 ===')
   const db = new DatabaseSync(join(dir, 'video-tools.sqlite'))
   db.exec('PRAGMA foreign_keys=ON')
   db.prepare('INSERT INTO assets VALUES (?,?,?,?)').run('ag4', 'pg', clip, JSON.stringify({ duration_us: 10_000_000 }))
+  db.prepare('DELETE FROM evidence WHERE asset_id=?').run('ag4')
   db.close()
 }
 script = [
-  { answer: { transcript: [] }, reasoningTokens: 10 },
-  { answer: { lines: [{ start_us: 2_000_000, end_us: 4_000_000, text: '字段补上之后的内容' }] }, reasoningTokens: 10 },
+  { answer: { screen: [] }, reasoningTokens: 10 },
+  { answer: { entries: [{ start_us: 2_000_000, end_us: 4_000_000, text: '字段补上之后的内容' }] }, reasoningTokens: 10 },
 ]
 modelCalls = 0
-const fixed = await vw.transcriptEvidence('pg', 'ag4', signal)
+const fixed = await vw.ocrEvidence('pg', 'ag4', signal)
 record('字段缺失被当作契约不满足并重试',
-  fixed.line_count === 1 && modelCalls === 2,
-  `line_count=${fixed.line_count}  模型调用 ${modelCalls} 次`)
+  (fixed.entries ?? []).length === 1 && modelCalls === 2,
+  `entry_count=${fixed.line_count}  模型调用 ${modelCalls} 次`)
+
+// ---- 5. a reply with no text at all must not corrupt the retry request -----
+//
+// 真实事故的第二次失败：模型只产出推理、正文为空时，重试把空串当成 assistant
+// 正文回灌，端点以
+//   400 Missing required parameter: 'messages.[0].content[2].type'
+// 拒绝整个请求。守卫挡住了坏结果，补救动作自己却崩了，报出来的错误
+// 还与真正的原因无关。这里断言重试发出的每一个 part 都是合法形状。
+console.log('\n=== 情形 E：回复只有推理、正文为空（触发过 400 的那条路径）===')
+{
+  const db = new DatabaseSync(join(dir, 'video-tools.sqlite'))
+  db.exec('PRAGMA foreign_keys=ON')
+  db.prepare('INSERT INTO assets VALUES (?,?,?,?)').run('ag5', 'pg', clip, JSON.stringify({ duration_us: 10_000_000 }))
+  db.prepare('DELETE FROM evidence WHERE asset_id=?').run('ag5')
+  db.close()
+}
+// `content: undefined` 表示模型这一轮只产出推理、正文完全为空 ——
+// 真实事故里第二次失败正是这个样子（不是空串，是压根没有正文）。
+script = [
+  { content: undefined, reasoningTokens: 16000 },
+  { answer: { entries: [{ start_us: 1_000_000, end_us: 2_000_000, text: '空正文之后仍然补回来了' }] }, reasoningTokens: 10 },
+]
+modelCalls = 0
+requestParts.length = 0
+const noText = await vw.ocrEvidence('pg', 'ag5', signal)
+record('正文不可用的回复之后，重试仍然能拿到结果',
+  (noText.entries ?? []).length === 1 && modelCalls === 2,
+  `entry_count=${noText.line_count}  模型调用 ${modelCalls} 次`)
+// 重试请求里的每个 content 项必须是合法形状：
+//   · 原始 part：{type:'video_url'} 或 {type:'text', text:非空}
+//   · 回灌的消息：{role:'assistant'|'user', content:非空字符串}
+// 空串 part 就是那个 400 的成因。
+// 注意别把消息包装当成 part —— 先前的断言把 {role,content} 也算作非法，
+// 于是永远为红，测的是断言自己而不是被测行为。
+const badParts = requestParts.flat().filter(p =>
+  !(p.type === 'video_url'
+    || (p.type === 'text' && typeof p.text === 'string' && p.text !== '')
+    || ((p.role === 'assistant' || p.role === 'user') && typeof p.content === 'string' && p.content !== '')))
+record('重试请求里不含空的或形状非法的 content 项',
+  badParts.length === 0,
+  badParts.length === 0 ? `检查了 ${requestParts.flat().length} 项，全部合法` : `非法: ${JSON.stringify(badParts).slice(0, 90)}`)
 
 vw.dispose()
 
