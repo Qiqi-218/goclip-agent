@@ -14,7 +14,7 @@
  * 例如：node runtime/start-dsh.mjs --host 127.0.0.1 --port 8099 --no-open
  */
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -45,6 +45,35 @@ if (!existsSync(join(profileDir, 'node_modules', 'dsh-video-workspace'))) {
     `检查 ${join(profileDir, 'package.json')} 里 dsh-video-workspace 的 link 路径能否解析`,
   )
 }
+
+// 每次启动把仓库里的 profile 配置同步过去。
+//
+// `setup.ps1` 只在安装时复制一次 `config/profile` 到 `runtime/home/profiles/video`，
+// 之后 **`config/profile/cordis.patch.yml` 的改动不会生效** —— 而它里面装着系统提示词
+// 与插件配置。这个漂移很隐蔽：改了源、重启服务、看起来一切正常，实际跑的还是旧提示词。
+// 实测踩过一次：系统提示词里的检索规则改了两轮，运行的那份仍是两天前的
+// 「五条不许违反」，模型因此一直按旧规则行事。
+//
+// 只同步 `cordis.patch.yml`：它由仓库拥有。同目录下的 `package.json`、
+// `pnpm-workspace.yaml`、`node_modules` 是 setup 生成或安装的，覆盖会破坏安装。
+const profileConfigSource = join(root, 'config', 'profile', 'cordis.patch.yml')
+const profileConfigTarget = join(profileDir, 'cordis.patch.yml')
+try {
+  if (existsSync(profileConfigSource)) {
+    const wanted = readFileSync(profileConfigSource)
+    const current = existsSync(profileConfigTarget) ? readFileSync(profileConfigTarget) : null
+    if (current === null || !current.equals(wanted)) {
+      writeFileSync(profileConfigTarget, wanted)
+      console.log('profile 配置已同步：config/profile/cordis.patch.yml → runtime/home/profiles/video/')
+    }
+  }
+} catch (error) {
+  fail(
+    `无法把 profile 配置同步到 ${profileConfigTarget}`,
+    `${error instanceof Error ? error.message : String(error)} —— 没有它，插件配置与系统提示词会停留在旧版本`,
+  )
+}
+
 // 凭据文件按平台命名：Windows 上是 `.env.ps1`（由 start.ps1 点源加载），
 // Linux/macOS 上是 `.env`（由 start.sh 点源加载）。两个都必须认。
 //
