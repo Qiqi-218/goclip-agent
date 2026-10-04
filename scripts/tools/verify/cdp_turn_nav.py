@@ -1,9 +1,11 @@
-"""Submit a prompt and wait for the turn to actually finish.
+"""导航到 DSH、新建会话、提交一轮提示词、等到回合真正结束。
 
-Waits on the presence of the stop control, which the composer shows only while a
-turn is running. An earlier version inferred completion from "no tool calls in the
-first poll", which reported a finished turn while the interface still said
-"preparing to call".
+与 `cdp_turnwait.py` 的区别只有一处，但它是决定性的：那个脚本假设页面**已经在**
+DSH 上（它只做 `Page.reload`）。而 CDP 启动的浏览器停在 `about:blank`，
+于是提示词被输入到一个空白页里 —— 实测表现为「脚本一直跑、会话日志一行不写」，
+看起来像模型在慢慢思考，实际什么都没发生。
+
+这个版本先 `Page.navigate` 到带 token 的地址，等应用渲染出输入框再动手。
 """
 import asyncio
 import json
@@ -13,9 +15,11 @@ import urllib.request
 
 import websockets
 
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
 TOKEN = sys.argv[1]
 PROMPT = sys.argv[2]
-LIMIT = int(sys.argv[3]) if len(sys.argv) > 3 else 600
+LIMIT = int(sys.argv[3]) if len(sys.argv) > 3 else 900
 URL = 'http://127.0.0.1:8098/?token=' + TOKEN
 
 
@@ -53,16 +57,14 @@ SURVEY = """
   const names = t.match(/video_[a-z_]+/g) || [];
   const counts = {};
   for (const n of names) counts[n] = (counts[n] || 0) + 1;
-  const queries = [...t.matchAll(/["“]([^"”]{1,22})["”]/g)].map(m => m[1]);
-  // The composer shows a stop control only while a turn runs.
   const running = [...document.querySelectorAll('button,[role="button"]')]
     .some(b => b.offsetParent !== null && /^(停止|Stop)/.test((b.innerText||'').trim()));
   return JSON.stringify({
     toolCounts: counts,
     totalCalls: names.length,
-    quoted: [...new Set(queries)],
     running,
-    tail: t.replace(/\\s+/g,' ').slice(-240),
+    url: location.origin + location.pathname,
+    tail: t.replace(/\\s+/g, ' ').slice(-260),
   });
 })()
 """
@@ -74,23 +76,52 @@ async def main():
         c = Cdp(ws)
         await c.send('Runtime.enable')
         await c.send('Page.enable')
-        await c.send('Page.reload')
-        await asyncio.sleep(17)
-        await c.ev("""
+
+        # 关键一步：先导航过去。token 会换成 cookie 并 303 回根路径。
+        print('导航到', URL.split('?')[0])
+        await c.send('Page.navigate', url=URL)
+
+        # 等应用渲染出输入框，而不是盲等固定秒数。
+        for waited in range(0, 90, 3):
+            await asyncio.sleep(3)
+            state = await c.ev("""JSON.stringify({
+              url: location.origin + location.pathname,
+              editable: document.querySelectorAll('[contenteditable="true"]').length,
+              text: document.body.innerText.slice(0,80),
+            })""")
+            if isinstance(state, str) and state.startswith('{'):
+                s = json.loads(state)
+                if s['editable'] > 0:
+                    print(f'  应用就绪（{waited + 3}s）url={s["url"]}')
+                    break
+                if waited % 15 == 0:
+                    print(f'  {waited + 3}s 等待中… url={s["url"]} 输入框={s["editable"]} 文本={s["text"][:40]!r}')
+        else:
+            print('  ❌ 应用没有渲染出输入框，放弃')
+            return 2
+
+        # 新建会话，避免接到旧的对话上
+        clicked = await c.ev("""
         (() => { const norm = s => (s||'').replace(/\\s+/g,' ').trim();
           const b = [...document.querySelectorAll('button,[role="button"]')]
-            .find(x => norm(x.innerText).startsWith('新会话'));
-          if (b) b.click(); return Boolean(b); })()
+            .filter(x => x.offsetParent !== null)
+            .find(x => norm(x.innerText).startsWith('新会话') || norm(x.getAttribute('aria-label')||'') === '新会话');
+          if (b) { b.click(); return true; } return false; })()
         """)
-        await asyncio.sleep(6)
+        print('  新建会话:', clicked)
+        await asyncio.sleep(5)
 
-        print('prompt:', PROMPT)
-        await c.ev("""
+        print('提示词:', PROMPT[:100] + ('…' if len(PROMPT) > 100 else ''))
+        typed = await c.ev("""
         (() => { const b = document.querySelector('[contenteditable="true"]');
+          if (!b) return 'no-composer';
           b.focus(); document.execCommand('insertText', false, %s); return 'typed'; })()
         """ % json.dumps(PROMPT, ensure_ascii=False))
+        print('  输入:', typed)
+        if typed != 'typed':
+            return 3
         await asyncio.sleep(1)
-        await c.ev("""
+        sent = await c.ev("""
         (() => { const norm = s => (s||'').replace(/\\s+/g,' ').trim();
           const s = [...document.querySelectorAll('button,[role="button"]')]
             .filter(x => x.offsetParent !== null)
@@ -100,6 +131,7 @@ async def main():
             .dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));
           return 'enter'; })()
         """)
+        print('  发送:', sent)
 
         started = time.time()
         last = None
@@ -121,10 +153,9 @@ async def main():
         d = json.loads(await c.ev(SURVEY))
         print()
         print('=== 结果 ===')
-        print('是否见过运行态:', saw_running, '（False 说明可能是判据没抓到）')
+        print('见过运行态:', saw_running)
         print('总调用:', d['totalCalls'], json.dumps(d['toolCounts'], ensure_ascii=False))
-        print('文中引号内容:', json.dumps(d['quoted'][:14], ensure_ascii=False))
-        print('结尾:', d['tail'][-300:])
+        print('结尾:', d['tail'][-400:])
         return 0
 
 
