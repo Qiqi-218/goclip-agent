@@ -1204,9 +1204,17 @@ export class VideoWorkspace {
         start_us: start, end_us: end, seconds: round2((end - start) / 1e6),
         bytes, kilobytes: round2(bytes / 1024),
         clamped_to_max_seconds: clamped ? maxSeconds : null,
+        // 这个片段是给**人**看的，不是给模型看的。
+        //
+        // 工具返回给模型的只有文本；74 次真实调用的结果里没有一个图片或视频块。
+        // 不说清楚的话，模型会以为调用它就能「看到」那一秒，于是为了确认一个
+        // 边界反复调用 —— 实测里 25 次调用中有相当一部分是这个动机，
+        // 而它一个字都读不到。这段说明放在返回值里，是因为模型读的是返回值。
+        readable_by_model: false,
+        for_human_review: true,
         note: clamped
-          ? `请求的区间超过 ${maxSeconds} 秒上限，已截到前 ${maxSeconds} 秒。要整段请分几次取。`
-          : '片段已生成，可直接打开核对这段证据是否成立。',
+          ? `请求的区间超过 ${maxSeconds} 秒上限，已截到前 ${maxSeconds} 秒。要整段请分几次取。片段已生成，链接可交给用户打开核对。`
+          : '片段已生成。这只是给用户打开的链接 —— 你读到的内容仅此文本，看不到也听不到片段，不要为了「看一眼」而重复调用本工具；判断一段证据是否成立要靠 video_find 的 evidence_refs 与 video_evidence_* 的数字。',
         stages: this.stages.snapshot(),
       }
     } finally { await rm(output, { force: true }); await source.cleanup() }
