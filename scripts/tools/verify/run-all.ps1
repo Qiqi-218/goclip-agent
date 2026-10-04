@@ -17,7 +17,7 @@ if (-not (Test-Path (Join-Path $plugin 'lib\types\runtime.js'))) {
   throw "找不到 $plugin\lib\types\runtime.js —— 先构建插件"
 }
 
-$suites = @('probe-runtime', 'probe-schema', 'probe-roundtrip', 'probe-evidence', 'probe-evidence-view', 'probe-multi', 'probe-find', 'probe-plan', 'probe-cloud-evidence', 'probe-precision')
+$suites = @('probe-runtime', 'probe-schema', 'probe-roundtrip', 'probe-evidence', 'probe-evidence-view', 'probe-empty-guard', 'probe-sentence-span', 'probe-multi', 'probe-find', 'probe-plan', 'probe-cloud-evidence', 'probe-precision')
 $totalBad = 0
 
 foreach ($s in $suites) {

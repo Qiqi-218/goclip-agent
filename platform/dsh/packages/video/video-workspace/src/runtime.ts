@@ -33,6 +33,18 @@ const EVIDENCE_TRANSCRIPT = 'transcript'
 const EVIDENCE_VISUAL = 'scene-description'
 
 /**
+ * Reasoning tokens above which an empty extraction answer means "did not finish" rather than "found nothing".
+ *
+ * Every model-backed call in a long session that returned content spent between 296 and
+ * 3531 reasoning tokens; the call that returned an empty transcript spent 16384. A model
+ * that genuinely finds no speech has nothing to work through and answers immediately, so
+ * a large reasoning spend attached to an empty array is the signature of work done in the
+ * reasoning channel and never written out. The value sits above every observed
+ * productive call so it cannot fire on a real answer.
+ */
+const EMPTY_ANSWER_REASONING_FLOOR = 6000
+
+/**
  * Offset used while renumbering clips.
  *
  * Above any ordinal a timeline realistically holds, so parking never lands on a number
@@ -756,8 +768,18 @@ export class VideoWorkspace {
       for (const segment of (JSON.parse(analysis.data) as { segments?: Data[] }).segments ?? []) {
         const start = Number(segment.start_us); const end = Number(segment.end_us)
         if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue
+        // 命中之后把区间收窄到那一句。
+        //
+        // 分析分段常常有几十秒到上百秒，而提问往往针对其中一句话
+        // （「他说『与其强请画毁不如售画修庙』是什么时候」）。只给整段的话，
+        // 调用方拿到 100 秒的窗口还得再想办法定位，实际发生的后果是它转而
+        // 让多模态模型重看整条视频 —— 一次 40 秒，一场会话里发生了 21 次。
+        // 段内文字是按句写的，按字数比例插值就能把答案落到句子级，
+        // 代价是纯本地字符串处理。
+        const narrowed = needle === '' ? null : this.narrowToSentence(segment, needle, start, end)
         consider({
-          start_us: start, end_us: end,
+          start_us: narrowed?.start_us ?? start,
+          end_us: narrowed?.end_us ?? end,
           text: this.segmentText(segment).slice(0, 400),
           segment,
           instruction: analysis.instruction,
@@ -1598,7 +1620,8 @@ export class VideoWorkspace {
         '2. 同一句话在画面上连续停留时，返回一整段起止，不要切成很多条。',
         '3. 画面里没有文字的时间段不要返回。',
         '4. 不要把对画面的描述写进 text —— 这里只要字面上的字。',
-      ].join('\n'), signal))
+        '5. 直接输出 JSON，不要先在脑子里过一遍全片 —— 那样回复会超长度上限，最后一条都留不下来。',
+      ].join('\n'), signal, this.emptyExtractionGuard('entries', '画面上没有文字')))
       const duration = Number((await this.probe(source.path, signal)).duration_us) || 0
       const entries = this.sanitizeRanges(answer.entries, duration)
         .map(entry => ({ ...entry, text: String(entry.text ?? '').trim() }))
@@ -1649,7 +1672,8 @@ export class VideoWorkspace {
         '2. 一行对应一句完整的话；同一句不要拆开。',
         '3. 逐字照抄原话，不要润色、不要翻译、不要补标点以外的内容。',
         '4. 没有说话的时间段不要返回。',
-      ].join('\n'), signal))
+        '5. 直接输出 JSON。「把整篇转写先在脑子里过一遍」这种做法会让回复超出长度上限，最终一个字都留不下来 —— 想到一句就写一句。',
+      ].join('\n'), signal, this.emptyExtractionGuard('lines', '视频里没有人说话')))
       const duration = Number((await this.probe(source.path, signal)).duration_us) || 0
       const lines = this.sanitizeRanges(answer.lines, duration)
         .map(line => ({ ...line, text: String(line.text ?? '').trim() }))
@@ -1699,7 +1723,8 @@ export class VideoWorkspace {
         '2. on_screen 列出这一刻画面上出现的人物、物体、地点等具体名词，供以后检索用。',
         '3. 画面发生明显变化时另起一段；一直没变就一整段。',
         '4. 一段描述覆盖的画面必须真的是同一段，不要合并前后不同的场景。',
-      ].join('\n'), signal))
+        '5. 直接输出 JSON，不要先在脑子里过一遍全片 —— 那样回复会超长度上限，最后一段都留不下来。',
+      ].join('\n'), signal, this.emptyExtractionGuard('scenes', '画面没有可描述的内容')))
       const duration = Number((await this.probe(source.path, signal)).duration_us) || 0
       const scenes = this.sanitizeRanges(answer.scenes, duration)
         .map(scene => ({
@@ -2505,6 +2530,90 @@ export class VideoWorkspace {
   async jobs(projectId?: string): Promise<Data[]> { const db = await this.open(); if (projectId === undefined) return db.prepare('SELECT * FROM jobs ORDER BY rowid DESC').all() as Data[]; return db.prepare('SELECT j.* FROM jobs j JOIN timelines t ON t.id=j.timeline_id WHERE t.project_id=? ORDER BY j.rowid DESC').all(projectId) as Data[] }
   /** Everything a query may legitimately match: what the segment shows, sounds like and is tagged. */
   private segmentText(segment: Data): string { const parts: string[] = []; for (const field of ['visual','audio','summary','highlight_reason','reason']) { const value = segment[field]; if (typeof value === 'string') parts.push(value) } const tags = segment.tags; if (Array.isArray(tags)) for (const tag of tags) if (typeof tag === 'string') parts.push(tag); return parts.join(' ').toLowerCase() }
+  /**
+   * Contract check for the three extraction tools, whose whole output is a list.
+   *
+   * An empty list is a legitimate answer — the video may really have no speech, no
+   * on-screen text, or nothing describable — but it is also the most likely shape of a
+   * failure. A model that works the task through in its reasoning channel and runs out of
+   * budget there leaves a perfectly valid `[]` behind, and every later step then treats
+   * "no evidence" as an established fact.
+   *
+   * The two cases are distinguishable by cost. A model that genuinely finds nothing has
+   * nothing to work through and answers immediately: the call that motivated this guard
+   * spent 16384 reasoning tokens to return an empty list, while every productive call in
+   * the same session stayed under 3600. An empty list that cost more than
+   * {@link EMPTY_ANSWER_REASONING_FLOOR} to produce is therefore reported as unfinished
+   * work, so `ask` retries with that explanation instead of storing it.
+   *
+   * @param field - the array field the task must fill.
+   * @param benign - what an empty result would mean if it were real, used in the complaint.
+   * @returns the validation hooks `ask` accepts.
+   */
+  private emptyExtractionGuard(field: string, benign: string): {
+    validate: (answer: Data) => string | null
+    reasoningTokens: () => number
+  } {
+    const spentNow = (): number => this.usage[0]?.reasoning_tokens ?? 0
+    return {
+      validate: (answer) => {
+        const value = answer[field]
+        if (!Array.isArray(value)) return `返回的 JSON 里没有 ${field} 数组`
+        if (value.length > 0) return null
+        const spent = spentNow()
+        if (spent < EMPTY_ANSWER_REASONING_FLOOR) return null
+        return `${field} 是空数组，但这次推理用了 ${spent} tokens（阈值 ${EMPTY_ANSWER_REASONING_FLOOR}）—— `
+          + `内容在推理过程里整理过却没写进 JSON，而不是「${benign}」。请直接逐条写进 ${field}，不要在推理里先整理全片。`
+      },
+      reasoningTokens: spentNow,
+    }
+  }
+
+  /**
+   * Narrow an analysis segment to the sentence that contains the query, with an interpolated span.
+   *
+   * An analysis segment is whatever the understanding pass chose to group — in practice
+   * 35 to 160 seconds. A creator's question is usually about one sentence inside it, so
+   * answering with the whole segment hands back a window too coarse to cut on. That is
+   * not a cosmetic problem: the observed consequence was the caller escalating to
+   * re-analysing the entire video (40 s and a full upload each time, 21 times in one
+   * session) to recover precision that the stored narration already implied.
+   *
+   * The span is interpolated by character count across the segment, so it is an estimate:
+   * it identifies which sentence and roughly where, not a speech boundary. Callers that
+   * need frame accuracy pass the result through the existing boundary refinement, which
+   * snaps to the real physical edges.
+   *
+   * Declines rather than guesses: a query that does not appear in this segment, or a
+   * segment with no sentence punctuation, returns null and the caller keeps the whole span.
+   *
+   * @param segment - one stored analysis segment.
+   * @param needle - the already-lowercased query text.
+   * @param startUs - the segment's start, used as the interpolation origin.
+   * @param endUs - the segment's end.
+   * @returns the containing sentence's span, or null when it cannot be located.
+   */
+  private narrowToSentence(segment: Data, needle: string, startUs: number, endUs: number): { start_us: number, end_us: number } | null {
+    const text = String(segment.audio ?? segment.visual ?? '')
+    if (text === '') return null
+    const strip = (value: string): string => value.replace(/[\s，。、；：！？""''（）《》「」…—\-.,;:!?"'()<>]/g, '').toLowerCase()
+    const wanted = strip(needle)
+    if (wanted === '') return null
+    const sentences = text.split(/(?<=[。！？；])/).map(part => part.trim()).filter(part => part !== '')
+    if (sentences.length < 2) return null
+    const total = sentences.reduce((sum, sentence) => sum + sentence.length, 0)
+    if (total === 0) return null
+    const span = endUs - startUs
+    let consumed = 0
+    for (const sentence of sentences) {
+      const from = startUs + Math.round(span * (consumed / total))
+      consumed += sentence.length
+      const to = startUs + Math.round(span * (consumed / total))
+      if (strip(sentence).includes(wanted)) return { start_us: from, end_us: to }
+    }
+    return null
+  }
+
   /** The stored duration of an asset, or undefined when the metadata lacks it. */
   private async durationOf(assetId: string): Promise<number | undefined> { const row = (await this.open()).prepare('SELECT meta FROM assets WHERE id=?').get(assetId) as { meta: string } | undefined; if (!row) return undefined; const meta = JSON.parse(row.meta) as { duration_us?: number }; return typeof meta.duration_us === 'number' && meta.duration_us > 0 ? meta.duration_us : undefined }
   /**
@@ -2748,7 +2857,21 @@ export class VideoWorkspace {
    * request refused for rate limiting. Each retry restates the task, so the model sees
    * its own bad answer and has the chance to correct it.
    */
-  private async ask(url: string, prompt: string, signal: AbortSignal): Promise<Data> {
+  private async ask(url: string, prompt: string, signal: AbortSignal, require?: {
+    /**
+     * Return a complaint when the parsed answer does not fulfil the task, or null when it does.
+     *
+     * Structural JSON validity is not the same as having done the work. A reply of
+     * `{"lines":[]}` parses perfectly and is also a claim that a 43-minute video with
+     * audible narration contains no speech; accepted silently it produces downstream
+     * behaviour that is worse than an outright failure, because every later step
+     * believes the evidence was gathered. The complaint text is fed back to the model
+     * as the reason for the retry, so it should name what was wrong.
+     */
+    validate?: (answer: Data) => string | null
+    /** What the model spent on reasoning this call, for the complaint when validation fails. */
+    reasoningTokens?: () => number
+  }): Promise<Data> {
     // 本次工具的用量从这里开始记，避免和上一次调用混在一起。
     this.usage = []
     this.stages.reset()
@@ -2760,7 +2883,12 @@ export class VideoWorkspace {
       const found = text === undefined ? undefined : firstJsonObject(text)
       if (found !== undefined) {
         try {
-          return JSON.parse(found) as Data
+          const answer = JSON.parse(found) as Data
+          const complaint = require?.validate?.(answer) ?? null
+          if (complaint === null) return answer
+          // 报了问题还要说清代价：模型不知道自己刚才烧掉了多少推理预算。
+          const spent = require?.reasoningTokens?.() ?? 0
+          lastProblem = spent > 0 ? `${complaint}（上一次回复用了 ${spent} 推理 tokens）` : complaint
         } catch (error) {
           lastProblem = `解析失败：${error instanceof Error ? error.message : String(error)}`
         }

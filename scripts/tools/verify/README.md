@@ -123,9 +123,22 @@ PATH="$SHIM:$PATH" bash /e/huabei/goclip-agentv2/setup.sh
 | --- | --- | --- |
 | `read-session-log.mjs` | 逐帧解压并列出含关键词的事件 | `node read-session-log.mjs <log> [关键词] [截断长度]` |
 | `dump-event.mjs` | 按事件类型导出（如 `tool/result`） | `node dump-event.mjs <log> tool/result <名称过滤> <截断长度>` |
+| `analyze-sessions.mjs` | 扫全部会话，列出每次模型调用的 text / reasoning token，按耗时排序 | `node analyze-sessions.mjs <sessions 目录>` |
 
 排查「工具结果里的元数据到底存了什么」时用得上：`tool/result` 的 `data.meta`
 就是界面卡片读的那份 `presentationMeta`。
+
+`analyze-sessions.mjs` 是找**成本异常**的入口。用它定位过一次真实事故：
+
+```
+video_evidence_transcript   text_tokens=8   reasoning_tokens=16384   192s
+video_understand            text_tokens=14142   reasoning_tokens=296   159s
+```
+
+转写 43 分钟视频时，模型把整篇带时间码的转写写进了**思考通道**，推理预算耗尽后
+结构化输出是空的（`lines: []`），还被如实存成「这条视频没有说话」。后续 21 次
+「重看整片」（838 秒）都是被这个空结果引出来的 —— 而同样的内容其实已经在
+`video_understand` 的 `audio` 字段里。
 
 ## 界面驱动（cdp_*）
 
