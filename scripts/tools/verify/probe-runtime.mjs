@@ -59,6 +59,22 @@ const config = {
 const { VideoWorkspace } = await import(RUNTIME)
 const vw = new VideoWorkspace(config)
 
+// ── 长视频分片：10 分钟以内保持一次调用，超过后按 5 分钟 + 8 秒重叠 ─────
+{
+  const short = vw.modelWindows(599 * 1e6)
+  record('短视频不分片（阈值 10 分钟）', short.length === 1 && short[0].startUs === 0 && short[0].endUs === 599 * 1e6,
+    `窗口=${JSON.stringify(short)}`)
+  const long = vw.modelWindows(720 * 1e6)
+  const expected = [[0, 300], [292, 592], [584, 720]]
+  record('长视频按 5 分钟、8 秒重叠分片', long.length === expected.length && long.every((w, i) => w.startUs === expected[i][0] * 1e6 && w.endUs === expected[i][1] * 1e6),
+    `窗口=${JSON.stringify(long.map(w => [w.startUs / 1e6, w.endUs / 1e6]))}`)
+  const merged = vw.dedupeRanges([
+    { start_us: 290 * 1e6, end_us: 300 * 1e6, text: '边界字幕' },
+    { start_us: 292 * 1e6, end_us: 300 * 1e6, text: '边界字幕' },
+  ], 'text')
+  record('重叠分片的相同文字只保留一条', merged.length === 1, `合并后 ${merged.length} 条`)
+}
+
 // ── 准备数据（绕过 OSS：直接写本地库）────────────────────────────────────────
 await vw.createProject('p1', '项目一')
 await vw.createProject('p2', '项目二')

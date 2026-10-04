@@ -211,7 +211,24 @@ CREATE TABLE IF NOT EXISTS evidence(
   created_at INTEGER NOT NULL,
   PRIMARY KEY (asset_id, kind)
 );
+-- Model-backed work is persisted per chunk.  A long video may finish eight chunks
+-- before one rate-limited request fails; retaining those eight lets the next call
+-- resume instead of paying to analyse the entire video again.
+CREATE TABLE IF NOT EXISTS model_chunks(
+  asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  operation TEXT NOT NULL,
+  input_key TEXT NOT NULL,
+  start_us INTEGER NOT NULL,
+  end_us INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  payload TEXT,
+  error TEXT,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (asset_id, operation, input_key, start_us, end_us),
+  CHECK (end_us > start_us)
+);
 CREATE INDEX IF NOT EXISTS evidence_by_kind ON evidence(kind);
+CREATE INDEX IF NOT EXISTS model_chunks_by_asset ON model_chunks(asset_id, operation, input_key);
 CREATE INDEX IF NOT EXISTS segments_by_timeline ON timeline_segments(timeline_id);
 -- A proposal is a plan the user has not approved yet. Keeping it out of
 -- timeline_segments is what makes "show me the plan first" enforceable rather than a
@@ -537,7 +554,7 @@ export class VideoWorkspace {
     const stored = db.prepare('SELECT data FROM analyses WHERE asset_id=? AND instruction=?').get(assetId, request) as { data: string } | undefined
     if (stored) {
       const previous = JSON.parse(stored.data) as Data & { oss_key?: string }
-      if (typeof previous.oss_key === 'string') {
+      if (typeof previous.oss_key === 'string' && previous.status !== 'partial') {
         // 走缓存也要说清跳过了什么，否则阶段列表看起来像少做了事。
         this.stages.reset()
         this.stages.skipped('下载素材', '复用已保存的分析，未重新下载')
@@ -550,15 +567,23 @@ export class VideoWorkspace {
     if (!asset.path.startsWith('oss://')) this.stages.skipped('下载素材', '素材就是本地文件，无需从 OSS 下载')
     const source = await this.stages.timed('下载素材', () => this.materialize(asset.path, signal))
     try {
-      // prepare 自己记录这一阶段：它最清楚是命中缓存还是真的跑了一次 ffmpeg。
-      const file = await this.prepare(source.path, signal)
-      const key = `${this.config.ossPrefix.replace(/\/$/,'')}/${projectId}/${assetId}/${randomUUID()}.mp4`
-      const url = await this.stages.timed('上传代理视频', () => this.uploadFile(file, key, 'video/mp4'))
       // is_highlight 是让「找高光」可行的关键：判断类词（高光/精彩）不会出现在任何
       // 片段的描述文本里，靠字面检索永远搜不到，所以必须由模型显式标注出来。
-      const data = await this.stages.timed('模型理解', () => this.ask(url, `分析此视频并${request}。只返回 JSON：{"summary":"","segments":[{"start_us":0,"end_us":1,"visual":"","audio":"","tags":[""],"is_highlight":false,"highlight_reason":"","confidence":0.0}]}。要求：segments 覆盖整段视频；is_highlight 标出这一段是否属于值得单独剪出来的高光，只给真正的高光段 true，普通叙述段 false；highlight_reason 只在 is_highlight 为 true 时填写，说明它为什么是高光，其余留空；不确定就留空或 false，不要编造。`, signal))
-      const segments = this.sanitizeRanges(data.segments, await this.durationOf(assetId)).map(segment => ({ ...segment, highlight_reason: this.blankToNull(segment.highlight_reason) }))
-      const record = { ...data, segments, instruction: request, oss_key: key }
+      const duration = (await this.durationOf(assetId)) ?? 0
+      this.usage = []
+      this.stages.reset()
+      const run = await this.askChunks({
+        projectId, assetId, sourcePath: source.path, durationUs: duration, operation: 'understand', input: { instruction: request }, signal,
+        prompt: window => `这是原视频第 ${round2(window.startUs / 1e6)} 到 ${round2(window.endUs / 1e6)} 秒的截取。分析此视频并${request}。只返回 JSON：{"summary":"","segments":[{"start_us":0,"end_us":1,"visual":"","audio":"","tags":[""],"is_highlight":false,"highlight_reason":"","confidence":0.0}]}。所有时间戳必须相对此截取开头；segments 覆盖这段截取；is_highlight 只标真正值得单独剪出的高光；不确定就留空或 false，不要编造。`,
+      })
+      const segments = this.dedupeRanges(run.chunks.flatMap(chunk => this.shiftRanges(chunk.data.segments, chunk.startUs, duration)))
+        .map(segment => ({ ...segment, highlight_reason: this.blankToNull(segment.highlight_reason) }))
+      const summaries = run.chunks.map(chunk => String(chunk.data.summary ?? '').trim()).filter(Boolean)
+      const record = {
+        summary: summaries.join('\n'), segments, instruction: request, oss_key: run.failed.length === 0 ? 'chunked' : undefined,
+        status: run.failed.length === 0 ? 'completed' : 'partial',
+        chunking: { enabled: run.chunked, completed_chunks: run.chunks.length, failed_chunks: run.failed },
+      }
       db.prepare('INSERT OR REPLACE INTO analyses (asset_id,instruction,data,created_at) VALUES (?,?,?,?)').run(assetId, request, JSON.stringify(record), Date.now())
       await this.stages.timed('保存与同步', () => this.manifest(projectId))
       return { asset_id: assetId, ...record, reused: false, stages: this.stages.snapshot() }
@@ -813,7 +838,7 @@ export class VideoWorkspace {
    * the same letters.
    */
   private relevance(segment: Data, needle: string, words: string[]): number { const confidence = typeof segment.confidence === 'number' ? segment.confidence : 0; if (HIGHLIGHT_QUERY_WORDS.includes(needle)) return segment.is_highlight === true ? 2000 + confidence : 0; const text = this.segmentText(segment); if (text === '') return 0; const rawTags = segment.tags; const tags = Array.isArray(rawTags) ? rawTags.filter((tag): tag is string => typeof tag === 'string').map(tag => tag.toLowerCase()) : []; if (tags.includes(needle)) return 1000 + confidence; const fields = ['visual','audio','summary','highlight_reason','reason'].map(field => segment[field]).filter((value): value is string => typeof value === 'string').map(value => value.toLowerCase()); if (fields.some(value => value === needle)) return 900 + confidence; if (text.includes(needle)) return 500 + confidence; const hits = words.filter(word => text.includes(word)).length; if (hits === 0) return 0; return 100 * (hits / words.length) + confidence }
-  async find(projectId: string, assetId: string, subject: string, signal: AbortSignal): Promise<Data> { const asset = await this.asset(projectId, assetId); this.stages.reset(); const source = await this.stages.timed('下载素材', () => this.materialize(asset.path, signal)); try { const file = await this.prepare(source.path, signal); const key = `${this.config.ossPrefix.replace(/\/$/,'')}/${projectId}/${assetId}/${randomUUID()}.mp4`; const result = await this.ask(await this.uploadFile(file, key, 'video/mp4'), `在这段视频里找出“${subject}”出现的时间段。\n只返回 JSON：{"matches":[{"start_us":0,"end_us":1,"reason":"","confidence":0.0}]}\n要求：\n1. 每个区间是一段连续的内容，起止都要给，时间用微秒；allow 近似，不要因为拿不准就省略。\n2. reason 用一句话说明这一段为什么符合“${subject}”，要写你实际看到的画面或听到的话。\n3. confidence 是 0 到 1 的小数，表示你有多确定这一段真的符合。\n4. 命中几处就返回几段，按出现顺序排列；确实没有就返回 {"matches":[]}，不要为了凑数编造区间。\n5. 若同一内容连续出现了十几秒以上，返回一整段而不是切成很多小段。`, signal); const duration = await this.durationOf(assetId)
+  async find(projectId: string, assetId: string, subject: string, signal: AbortSignal): Promise<Data> { const asset = await this.asset(projectId, assetId); this.stages.reset(); const source = await this.stages.timed('下载素材', () => this.materialize(asset.path, signal)); try { const duration = (await this.durationOf(assetId)) ?? 0; this.usage = []; const run = await this.askChunks({ projectId, assetId, sourcePath: source.path, durationUs: duration, operation: 'find', input: { subject }, signal, prompt: window => `这是原视频第 ${round2(window.startUs / 1e6)} 到 ${round2(window.endUs / 1e6)} 秒的截取。在这段视频里找出“${subject}”出现的时间段。\n只返回 JSON：{"matches":[{"start_us":0,"end_us":1,"reason":"","confidence":0.0}]}\n所有时间戳必须相对此截取开头。命中几处就返回几段；确实没有就返回 {"matches":[]}；不要编造。` }); const result: Data = { matches: this.dedupeRanges(run.chunks.flatMap(chunk => this.shiftRanges(chunk.data.matches, chunk.startUs, duration)), 'reason'), status: run.failed.length === 0 ? 'completed' : 'partial', chunking: { enabled: run.chunked, completed_chunks: run.chunks.length, failed_chunks: run.failed } }
       const cleaned = this.sanitizeRanges(result.matches, duration)
       // 模型给的是粗略区间；这里用录音自身的物理边界把它收敛到可剪的位置。
       const tolerance = (this.config.refineToleranceSeconds ?? 1.5) * 1e6
@@ -839,7 +864,7 @@ export class VideoWorkspace {
           boundary_check: { verified: confirmed.verified, note: confirmed.note ?? '未做二次核对', before_check_start_us: Number(confirmed.before?.start ?? fix.start_us), before_check_end_us: Number(confirmed.before?.end ?? fix.end_us) },
         })
       }
-      return { ...result, matches: refined, refine_tolerance_seconds: this.config.refineToleranceSeconds ?? 1.5, stages: this.stages.snapshot() } } finally { await source.cleanup() } }
+      return { ...result, matches: refined, refine_tolerance_seconds: this.config.refineToleranceSeconds ?? 1.5, note: run.failed.length > 0 ? '部分分片未完成，以下命中不覆盖失败时间段。' : null, stages: this.stages.snapshot() } } finally { await source.cleanup() } }
   async createTimeline(a: { id: string,project_id: string,asset_id: string,start_us: number,end_us: number,name?: string }): Promise<Data> { await this.assertRange(a.asset_id, a.start_us, a.end_us); await this.assertAssetInProject(a.project_id, a.asset_id); const db = await this.open(); db.prepare('INSERT INTO timelines (id,name,project_id,asset_id,start_us,end_us,revision) VALUES (?,?,?,?,?,?,1)').run(a.id, a.name ?? null, a.project_id, a.asset_id, a.start_us, a.end_us); db.prepare('INSERT INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted) VALUES (?,0,?,?,?,1.0,0)').run(a.id,a.asset_id,a.start_us,a.end_us); try { db.prepare('INSERT OR REPLACE INTO timeline_history (timeline_id,revision,clips,note,created_at) VALUES (?,?,?,?,?)').run(a.id, 1, JSON.stringify([{ ordinal: 0, asset_id: a.asset_id, start_us: a.start_us, end_us: a.end_us, speed: 1, muted: 0 }]), '创建', Date.now()) } catch { /* 记不上不影响创建 */ } await this.manifest(a.project_id); return this.timeline(a.id) }
   async timeline(id: string): Promise<Data> { const row = (await this.open()).prepare('SELECT * FROM timelines WHERE id=?').get(id) as Data | undefined; if (!row) throw new Error(`timeline not found: ${id}`); const segments = this.segmentsOf(id); return { ...row, segments, segment_count: segments.length, duration_us: segments.reduce((sum, s) => sum + (Number(s.end_us) - Number(s.start_us)) / (Number(s.speed) || 1), 0) } }
   /**
@@ -1588,26 +1613,31 @@ export class VideoWorkspace {
     this.stages.reset()
     const source = await this.stages.timed('准备素材', () => this.materialize(asset.path, signal))
     try {
-      const proxy = await this.prepare(source.path, signal)
-      const url = await this.stages.timed('上传素材', () => this.uploadFile(proxy, `${this.config.ossPrefix.replace(/\/$/, '')}/ocr-source-${randomUUID()}.mp4`, 'video/mp4'))
-      const answer = await this.stages.timed('模型读屏幕文字', () => this.ask(url, [
-        '逐段读出这段视频里出现在画面上的文字（字幕、标题、图表标签、界面文字都算）。',
+      const duration = Number((await this.probe(source.path, signal)).duration_us) || 0
+      this.usage = []
+      const run = await this.askChunks({
+        projectId, assetId, sourcePath: source.path, durationUs: duration, operation: 'ocr', input: {}, signal,
+        prompt: window => [
+        `这是原视频第 ${round2(window.startUs / 1e6)} 到 ${round2(window.endUs / 1e6)} 秒的截取。逐段读出画面上的文字（字幕、标题、图表标签、界面文字都算）。`,
         '只返回 JSON：{"entries":[{"start_us":0,"end_us":1,"text":""}]}。',
+        '时间戳必须相对此截取的开头。',
         '要求：',
         '1. text 只放真的出现在画面上的字，逐字照抄，不要改写、不要翻译。',
         '2. 同一句话在画面上连续停留时，返回一整段起止，不要切成很多条。',
         '3. 画面里没有文字的时间段不要返回。',
         '4. 不要把对画面的描述写进 text —— 这里只要字面上的字。',
-      ].join('\n'), signal))
-      const duration = Number((await this.probe(source.path, signal)).duration_us) || 0
-      const entries = this.sanitizeRanges(answer.entries, duration)
+      ].join('\n'),
+      })
+      const entries = this.dedupeRanges(run.chunks.flatMap(chunk => this.shiftRanges(chunk.data.entries, chunk.startUs, duration)), 'text')
         .map(entry => ({ ...entry, text: String(entry.text ?? '').trim() }))
         .filter(entry => entry.text !== '')
       const record = {
         entries,
         entry_count: entries.length,
         duration_us: duration,
-        note: entries.length === 0 ? '没有读出屏幕文字。若这段视频本来就没有字幕或图表，这是正确结果。' : null,
+        status: run.failed.length === 0 ? 'completed' : 'partial',
+        chunking: { enabled: run.chunked, completed_chunks: run.chunks.length, failed_chunks: run.failed },
+        note: run.failed.length > 0 ? '部分分片未完成，以下文字不覆盖失败时间段。' : entries.length === 0 ? '没有读出屏幕文字。若这段视频本来就没有字幕或图表，这是正确结果。' : null,
       }
       await this.saveEvidence(projectId, assetId, EVIDENCE_OCR, record, duration)
       return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
@@ -1639,26 +1669,31 @@ export class VideoWorkspace {
     this.stages.reset()
     const source = await this.stages.timed('准备素材', () => this.materialize(asset.path, signal))
     try {
-      const proxy = await this.prepare(source.path, signal)
-      const url = await this.stages.timed('上传素材', () => this.uploadFile(proxy, `${this.config.ossPrefix.replace(/\/$/, '')}/asr-source-${randomUUID()}.mp4`, 'video/mp4'))
-      const answer = await this.stages.timed('模型转写语音', () => this.ask(url, [
-        '把这段视频里**说出来的话**逐句转写出来，标明每句的起止时间。',
+      const duration = Number((await this.probe(source.path, signal)).duration_us) || 0
+      this.usage = []
+      const run = await this.askChunks({
+        projectId, assetId, sourcePath: source.path, durationUs: duration, operation: 'transcript', input: {}, signal,
+        prompt: window => [
+        `这是原视频第 ${round2(window.startUs / 1e6)} 到 ${round2(window.endUs / 1e6)} 秒的截取。把这段视频里**说出来的话**逐句转写出来，标明每句的起止时间。`,
         '只返回 JSON：{"lines":[{"start_us":0,"end_us":1,"text":""}]}。',
+        '时间戳必须相对此截取的开头。',
         '要求：',
         '1. 只转写真的说出来的话。听不清、被音乐盖住、或不是中文的部分宁可不写，**不要根据画面猜**。',
         '2. 一行对应一句完整的话；同一句不要拆开。',
         '3. 逐字照抄原话，不要润色、不要翻译、不要补标点以外的内容。',
         '4. 没有说话的时间段不要返回。',
-      ].join('\n'), signal))
-      const duration = Number((await this.probe(source.path, signal)).duration_us) || 0
-      const lines = this.sanitizeRanges(answer.lines, duration)
+      ].join('\n'),
+      })
+      const lines = this.dedupeRanges(run.chunks.flatMap(chunk => this.shiftRanges(chunk.data.lines, chunk.startUs, duration)), 'text')
         .map(line => ({ ...line, text: String(line.text ?? '').trim() }))
         .filter(line => line.text !== '')
       const record = {
         lines,
         line_count: lines.length,
         duration_us: duration,
-        note: lines.length === 0 ? '没有转写出说话内容。若这段视频本来就没有人声，这是正确结果。' : null,
+        status: run.failed.length === 0 ? 'completed' : 'partial',
+        chunking: { enabled: run.chunked, completed_chunks: run.chunks.length, failed_chunks: run.failed },
+        note: run.failed.length > 0 ? '部分分片未完成，以下转写不覆盖失败时间段。' : lines.length === 0 ? '没有转写出说话内容。若这段视频本来就没有人声，这是正确结果。' : null,
       }
       await this.saveEvidence(projectId, assetId, EVIDENCE_TRANSCRIPT, record, duration)
       return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
@@ -1689,19 +1724,22 @@ export class VideoWorkspace {
     this.stages.reset()
     const source = await this.stages.timed('准备素材', () => this.materialize(asset.path, signal))
     try {
-      const proxy = await this.prepare(source.path, signal)
-      const url = await this.stages.timed('上传素材', () => this.uploadFile(proxy, `${this.config.ossPrefix.replace(/\/$/, '')}/visual-source-${randomUUID()}.mp4`, 'video/mp4'))
-      const answer = await this.stages.timed('模型描述画面', () => this.ask(url, [
-        '按时间顺序描述这段视频里**画面上发生了什么**，每段标明起止时间。',
+      const duration = Number((await this.probe(source.path, signal)).duration_us) || 0
+      this.usage = []
+      const run = await this.askChunks({
+        projectId, assetId, sourcePath: source.path, durationUs: duration, operation: 'visual', input: {}, signal,
+        prompt: window => [
+        `这是原视频第 ${round2(window.startUs / 1e6)} 到 ${round2(window.endUs / 1e6)} 秒的截取。按时间顺序描述画面上发生了什么。`,
         '只返回 JSON：{"scenes":[{"start_us":0,"end_us":1,"description":"","on_screen":[""]}]}。',
+        '时间戳必须相对此截取的开头。',
         '要求：',
         '1. description 写**看得见的东西**：谁、在哪里、在做什么、画面怎么变化。不要写情绪、评价或推测。',
         '2. on_screen 列出这一刻画面上出现的人物、物体、地点等具体名词，供以后检索用。',
         '3. 画面发生明显变化时另起一段；一直没变就一整段。',
         '4. 一段描述覆盖的画面必须真的是同一段，不要合并前后不同的场景。',
-      ].join('\n'), signal))
-      const duration = Number((await this.probe(source.path, signal)).duration_us) || 0
-      const scenes = this.sanitizeRanges(answer.scenes, duration)
+      ].join('\n'),
+      })
+      const scenes = this.dedupeRanges(run.chunks.flatMap(chunk => this.shiftRanges(chunk.data.scenes, chunk.startUs, duration)), 'description')
         .map(scene => ({
           ...scene,
           description: String(scene.description ?? '').trim(),
@@ -1712,7 +1750,9 @@ export class VideoWorkspace {
         scenes,
         scene_count: scenes.length,
         duration_us: duration,
-        note: scenes.length === 0 ? '没有描述出画面内容。' : null,
+        status: run.failed.length === 0 ? 'completed' : 'partial',
+        chunking: { enabled: run.chunked, completed_chunks: run.chunks.length, failed_chunks: run.failed },
+        note: run.failed.length > 0 ? '部分分片未完成，以下画面描述不覆盖失败时间段。' : scenes.length === 0 ? '没有描述出画面内容。' : null,
       }
       await this.saveEvidence(projectId, assetId, EVIDENCE_VISUAL, record, duration)
       return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
@@ -1902,8 +1942,6 @@ export class VideoWorkspace {
     this.stages.reset()
     const source = await this.stages.timed('准备素材', () => this.materialize(asset.path, signal))
     try {
-      const proxy = await this.prepare(source.path, signal)
-      const url = await this.stages.timed('上传素材', () => this.uploadFile(proxy, `${this.config.ossPrefix.replace(/\/$/, '')}/similar-source-${randomUUID()}.mp4`, 'video/mp4'))
       // 参照物就是证据本身，写进提示词里让模型对照 —— 而不是让它凭印象判断"像不像"。
       const reference = [
         spoken.length === 0 ? '' : `这一段说的话：${spoken.join(' / ')}`,
@@ -1911,8 +1949,11 @@ export class VideoWorkspace {
         scenes.length === 0 ? '' : `这一段画面：${scenes.join(' / ')}`,
         passages.length === 0 ? '' : `这一段的分段描述：${passages.join(' / ')}`,
       ].filter(line => line !== '').join('\n')
-      const answer = await this.stages.timed('模型找相似片段', () => this.ask(url, [
-        `视频里第 ${round2(start / 1e6)} 秒到第 ${round2(end / 1e6)} 秒这一段，内容是这样的：`,
+      this.usage = []
+      const run = await this.askChunks({
+        projectId: a.project_id, assetId: a.asset_id, sourcePath: source.path, durationUs: duration ?? 0, operation: 'similar', input: { start, end, reference }, signal,
+        prompt: window => [
+        `这是原视频第 ${round2(window.startUs / 1e6)} 到 ${round2(window.endUs / 1e6)} 秒的截取。原视频第 ${round2(start / 1e6)} 秒到第 ${round2(end / 1e6)} 秒这一段，内容是这样的：`,
         reference,
         '',
         '请找出这段视频里**其他内容与之相似**的时间段（同一个人、同一类画面、同一类情节、在讲同一件事都算）。',
@@ -1921,11 +1962,12 @@ export class VideoWorkspace {
         '1. **不要把上面那一段本身再报一次** —— 它已经是参照物了。',
         '2. reason 写清"像在哪里"，要具体到画面或话，不要只写"很相似"。',
         '3. 确实没有相似的就返回 {"matches":[]}，不要为了凑数把不相干的段落报进来。',
-        `4. 区间不要越过素材边界（0 到 ${duration === undefined ? '末尾' : round2(duration / 1e6) + ' 秒'}）。`,
-      ].join('\n'), signal))
+        '4. 时间戳必须相对此截取开头；确实没有就返回 {"matches":[]}。',
+      ].join('\n'),
+      })
       // 先按区间筛掉参照物本身，再补上清洗后的 reason。
       // 顺序反过来的话，展开 Data 会把区间字段收窄掉，取不到 start_us/end_us。
-      const matches = this.sanitizeRanges(answer.matches, duration)
+      const matches = this.dedupeRanges(run.chunks.flatMap(chunk => this.shiftRanges(chunk.data.matches, chunk.startUs, duration ?? 0)), 'reason')
         // 参照区间自己不算答案：它与自己必然相似，报回来只是浪费注意力。
         .filter(match => Number(match.end_us) <= start || Number(match.start_us) >= end)
         .map(match => ({ ...match, reason: String(match.reason ?? '').trim() }))
@@ -1935,8 +1977,12 @@ export class VideoWorkspace {
         reference_evidence: evidence,
         matches,
         match_count: matches.length,
+        status: run.failed.length === 0 ? 'completed' : 'partial',
+        chunking: { enabled: run.chunked, completed_chunks: run.chunks.length, failed_chunks: run.failed },
         stages: this.stages.snapshot(),
-        note: matches.length === 0
+        note: run.failed.length > 0
+          ? '部分分片未完成，以下相似片段不覆盖失败时间段。'
+          : matches.length === 0
           ? '没有找到与这一段相似的其它片段。'
           : '每条的 reason 说明它像在哪里；参照区间本身已从结果里剔除。',
       }
@@ -2748,10 +2794,12 @@ export class VideoWorkspace {
    * request refused for rate limiting. Each retry restates the task, so the model sees
    * its own bad answer and has the chance to correct it.
    */
-  private async ask(url: string, prompt: string, signal: AbortSignal): Promise<Data> {
+  private async ask(url: string, prompt: string, signal: AbortSignal, reset = true): Promise<Data> {
     // 本次工具的用量从这里开始记，避免和上一次调用混在一起。
-    this.usage = []
-    this.stages.reset()
+    if (reset) {
+      this.usage = []
+      this.stages.reset()
+    }
     const content: Data[] = [{ type: 'video_url', video_url: { url } }, { type: 'text', text: prompt }]
     let lastProblem = ''
     for (let attempt = 1; attempt <= Math.max(1, this.config.modelAttempts ?? 3); attempt++) {
@@ -2767,11 +2815,106 @@ export class VideoWorkspace {
       } else {
         lastProblem = text === undefined || text.trim() === '' ? '回复为空' : '回复里找不到完整 JSON 对象'
       }
-      console.warn(`video-workspace: 第 ${attempt}/${this.config.modelAttempts ?? 3} 次模型回复不可用（${lastProblem}），重试并要求只输出 JSON`)
-      content.push({ role: 'assistant', content: text ?? '' })
-      content.push({ role: 'user', content: `上一次回复不可用：${lastProblem}。请只输出一个完整的 JSON 对象，不要任何解释、不要 Markdown 代码块。字段与结构必须与要求一致。` })
+      // Do not append the failed response to the next attempt.  On a long multimodal
+      // request that turns a recoverable malformed reply into an ever-growing context.
+      console.warn(`video-workspace: 第 ${attempt}/${this.config.modelAttempts ?? 3} 次模型回复不可用（${lastProblem}），使用干净上下文重试`)
     }
     throw new Error(`模型连续 ${this.config.modelAttempts ?? 3} 次没有给出可用的 JSON（最后的问题：${lastProblem}）。可以把指令说得更具体，或缩小分析范围。`)
+  }
+
+  /** Windows are half-open in source time; adjacent windows retain a small overlap. */
+  private modelWindows(durationUs: number): Array<{ startUs: number, endUs: number }> {
+    const threshold = Math.max(1, this.config.modelChunkThresholdSeconds ?? 600) * 1e6
+    if (durationUs <= threshold) return [{ startUs: 0, endUs: durationUs }]
+    const length = Math.max(1, this.config.modelChunkSeconds ?? 300) * 1e6
+    const overlap = Math.min(Math.max(0, this.config.modelChunkOverlapSeconds ?? 8) * 1e6, length - 1)
+    const step = length - overlap
+    const windows: Array<{ startUs: number, endUs: number }> = []
+    for (let startUs = 0; startUs < durationUs; startUs += step) {
+      const endUs = Math.min(durationUs, startUs + length)
+      windows.push({ startUs, endUs })
+      if (endUs === durationUs) break
+    }
+    return windows
+  }
+
+  private modelInputKey(value: unknown): string {
+    return createHash('sha256').update(JSON.stringify(value)).digest('hex')
+  }
+
+  /**
+   * Run a video prompt once per source-time window and retain every settled window.
+   * A saved failure is deliberately retried on the next invocation; a saved success is
+   * never sent to the provider again for the same operation/input/window.
+   */
+  private async askChunks(a: {
+    projectId: string
+    assetId: string
+    sourcePath: string
+    durationUs: number
+    operation: string
+    input: unknown
+    prompt: (window: { startUs: number, endUs: number }) => string
+    signal: AbortSignal
+  }): Promise<{ chunks: Array<{ startUs: number, endUs: number, data: Data }>, failed: Array<{ start_us: number, end_us: number, error: string }>, chunked: boolean }> {
+    const windows = this.modelWindows(a.durationUs)
+    const inputKey = this.modelInputKey(a.input)
+    const db = await this.open()
+    const read = db.prepare('SELECT status,payload,error FROM model_chunks WHERE asset_id=? AND operation=? AND input_key=? AND start_us=? AND end_us=?')
+    const write = db.prepare('INSERT OR REPLACE INTO model_chunks (asset_id,operation,input_key,start_us,end_us,status,payload,error,updated_at) VALUES (?,?,?,?,?,?,?,?,?)')
+    const chunks: Array<{ startUs: number, endUs: number, data: Data }> = []
+    const failed: Array<{ start_us: number, end_us: number, error: string }> = []
+    for (const window of windows) {
+      const cached = read.get(a.assetId, a.operation, inputKey, window.startUs, window.endUs) as { status: string, payload: string | null, error: string | null } | undefined
+      if (cached?.status === 'completed' && cached.payload !== null) {
+        try {
+          chunks.push({ ...window, data: JSON.parse(cached.payload) as Data })
+          this.stages.skipped(`模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`, '复用已完成分片')
+          continue
+        } catch { /* damaged cache is recomputed below */ }
+      }
+      try {
+        const proxy = await this.prepare(a.sourcePath, a.signal, { startSeconds: window.startUs / 1e6, endSeconds: window.endUs / 1e6, fps: 1 })
+        const key = `${this.config.ossPrefix.replace(/\/$/, '')}/chunks/${a.assetId}/${a.operation}-${window.startUs}-${window.endUs}-${randomUUID()}.mp4`
+        const url = await this.stages.timed(`上传模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`, () => this.uploadFile(proxy, key, 'video/mp4'))
+        const data = await this.stages.timed(`模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`, () => this.ask(url, a.prompt(window), a.signal, false))
+        write.run(a.assetId, a.operation, inputKey, window.startUs, window.endUs, 'completed', JSON.stringify(data), null, Date.now())
+        chunks.push({ ...window, data })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        write.run(a.assetId, a.operation, inputKey, window.startUs, window.endUs, 'failed', null, message, Date.now())
+        failed.push({ start_us: window.startUs, end_us: window.endUs, error: message })
+      }
+    }
+    await this.manifest(a.projectId)
+    return { chunks, failed, chunked: windows.length > 1 }
+  }
+
+  /** Move ranges emitted relative to one proxy back onto the source-video axis. */
+  private shiftRanges(items: unknown, offsetUs: number, durationUs: number): Data[] {
+    if (!Array.isArray(items)) return []
+    return this.sanitizeRanges(items.map(item => {
+      if (typeof item !== 'object' || item === null) return item
+      const row = item as Data
+      return { ...row, start_us: Number(row.start_us) + offsetUs, end_us: Number(row.end_us) + offsetUs }
+    }), durationUs)
+  }
+
+  /** Keep one copy of overlap material, preferring the first completed window. */
+  private dedupeRanges(items: Data[], textField?: string): Data[] {
+    const kept: Data[] = []
+    for (const item of [...items].sort((a, b) => Number(a.start_us) - Number(b.start_us) || Number(a.end_us) - Number(b.end_us))) {
+      const start = Number(item.start_us); const end = Number(item.end_us)
+      const text = textField === undefined ? '' : String(item[textField] ?? '').trim().toLowerCase()
+      const duplicate = kept.some(previous => {
+        const overlap = Math.max(0, Math.min(end, Number(previous.end_us)) - Math.max(start, Number(previous.start_us)))
+        const shortest = Math.min(end - start, Number(previous.end_us) - Number(previous.start_us))
+        const sameText = textField === undefined || text !== '' && text === String(previous[textField] ?? '').trim().toLowerCase()
+        return sameText && shortest > 0 && overlap / shortest >= 0.7
+      })
+      if (!duplicate) kept.push(item)
+    }
+    return kept
   }
 
   /**
@@ -2959,7 +3102,11 @@ export class VideoWorkspace {
   private async cachedEvidence(assetId: string, kind: string): Promise<Data | undefined> {
     const row = (await this.open()).prepare('SELECT payload FROM evidence WHERE asset_id=? AND kind=?').get(assetId, kind) as { payload: string } | undefined
     if (row === undefined) return undefined
-    return { asset_id: assetId, cached: true, ...(JSON.parse(row.payload) as Data) }
+    const payload = JSON.parse(row.payload) as Data
+    // Partial model evidence is useful to show, but not a terminal cache hit: invoking
+    // the same tool again must resume only the failed windows.
+    if (payload.status === 'partial') return undefined
+    return { asset_id: assetId, cached: true, ...payload }
   }
 
   /** Store one evidence row and re-upload the project manifest so OSS carries it too. */
@@ -2996,7 +3143,7 @@ export class VideoWorkspace {
     return next
   }
 
-  private async uploadManifest(projectId: string): Promise<void> { const db = await this.open(); const project = db.prepare('SELECT * FROM projects WHERE id=?').get(projectId) as Data | undefined; if (!project) return; const assets = db.prepare('SELECT * FROM assets WHERE project_id=?').all(projectId); const timelines = db.prepare('SELECT * FROM timelines WHERE project_id=?').all(projectId); const jobs = db.prepare('SELECT j.* FROM jobs j JOIN timelines t ON t.id=j.timeline_id WHERE t.project_id=?').all(projectId); const analyses = db.prepare('SELECT a.id asset_id,an.instruction,an.data,an.created_at FROM assets a JOIN analyses an ON an.asset_id=a.id WHERE a.project_id=?').all(projectId); const evidence = db.prepare('SELECT e.* FROM evidence e JOIN assets a ON a.id=e.asset_id WHERE a.project_id=?').all(projectId); const segments = db.prepare('SELECT s.timeline_id, s.ordinal, s.asset_id, s.start_us, s.end_us, s.speed, s.muted FROM timeline_segments s JOIN timelines t ON t.id=s.timeline_id WHERE t.project_id=? ORDER BY s.timeline_id, s.ordinal').all(projectId); const proposals = db.prepare('SELECT * FROM proposals WHERE project_id=?').all(projectId); const prefix = this.config.ossProjectPrefix.replace(/\/$/,''); const key = `${prefix}/${projectId}/manifest.json`; await this.uploadBytes(Buffer.from(JSON.stringify({ version: 5, project, assets, timelines, jobs, analyses, evidence, segments, proposals }, null, 2)), key, 'application/json'); const ids = (db.prepare('SELECT id FROM projects ORDER BY id').all() as Array<{ id: string }>).map(row => row.id); await this.uploadBytes(Buffer.from(JSON.stringify({ version: 5, projects: ids }, null, 2)), `${prefix}/index.json`, 'application/json') }
+  private async uploadManifest(projectId: string): Promise<void> { const db = await this.open(); const project = db.prepare('SELECT * FROM projects WHERE id=?').get(projectId) as Data | undefined; if (!project) return; const assets = db.prepare('SELECT * FROM assets WHERE project_id=?').all(projectId); const timelines = db.prepare('SELECT * FROM timelines WHERE project_id=?').all(projectId); const jobs = db.prepare('SELECT j.* FROM jobs j JOIN timelines t ON t.id=j.timeline_id WHERE t.project_id=?').all(projectId); const analyses = db.prepare('SELECT a.id asset_id,an.instruction,an.data,an.created_at FROM assets a JOIN analyses an ON an.asset_id=a.id WHERE a.project_id=?').all(projectId); const evidence = db.prepare('SELECT e.* FROM evidence e JOIN assets a ON a.id=e.asset_id WHERE a.project_id=?').all(projectId); const chunks = db.prepare('SELECT c.* FROM model_chunks c JOIN assets a ON a.id=c.asset_id WHERE a.project_id=?').all(projectId); const segments = db.prepare('SELECT s.timeline_id, s.ordinal, s.asset_id, s.start_us, s.end_us, s.speed, s.muted FROM timeline_segments s JOIN timelines t ON t.id=s.timeline_id WHERE t.project_id=? ORDER BY s.timeline_id, s.ordinal').all(projectId); const proposals = db.prepare('SELECT * FROM proposals WHERE project_id=?').all(projectId); const prefix = this.config.ossProjectPrefix.replace(/\/$/,''); const key = `${prefix}/${projectId}/manifest.json`; await this.uploadBytes(Buffer.from(JSON.stringify({ version: 6, project, assets, timelines, jobs, analyses, evidence, chunks, segments, proposals }, null, 2)), key, 'application/json'); const ids = (db.prepare('SELECT id FROM projects ORDER BY id').all() as Array<{ id: string }>).map(row => row.id); await this.uploadBytes(Buffer.from(JSON.stringify({ version: 6, projects: ids }, null, 2)), `${prefix}/index.json`, 'application/json') }
   /**
    * Rebuild the local index from the OSS manifest, which owns the data.
    *
@@ -3024,6 +3171,7 @@ export class VideoWorkspace {
           jobs?: Array<{ id: string, timeline_id: string, status: string, output?: string | null, detail?: string | null }>
           analyses?: Array<{ asset_id: string, instruction?: string, data: string, created_at?: number }>
           evidence?: Array<{ asset_id: string, kind: string, duration_us: number, payload: string, provider: string, provider_version: string, created_at: number }>
+          chunks?: Array<{ asset_id: string, operation: string, input_key: string, start_us: number, end_us: number, status: string, payload?: string | null, error?: string | null, updated_at: number }>
           segments?: Array<{ timeline_id: string, ordinal: number, asset_id: string, start_us: number, end_us: number, speed: number, muted: number }>
           proposals?: Array<{ id: string, project_id: string, timeline_id: string | null, status: string, revision: number, items: string, notes: string | null, created_at: number, updated_at: number }>
         }
@@ -3074,6 +3222,11 @@ export class VideoWorkspace {
           // 证据是对素材的派生，重算即可；恢复只把已有的搬回来，不校验内容。
           if (!db.prepare('SELECT 1 FROM assets WHERE id=?').get(row.asset_id)) { skipped++; continue }
           db.prepare('INSERT OR IGNORE INTO evidence (asset_id,kind,duration_us,payload,provider,provider_version,created_at) VALUES (?,?,?,?,?,?,?)').run(row.asset_id, row.kind, row.duration_us, row.payload, row.provider, row.provider_version, row.created_at)
+        }
+        for (const row of manifest.chunks ?? []) {
+          if (!db.prepare('SELECT 1 FROM assets WHERE id=?').get(row.asset_id) || row.start_us >= row.end_us) { skipped++; continue }
+          db.prepare('INSERT OR IGNORE INTO model_chunks (asset_id,operation,input_key,start_us,end_us,status,payload,error,updated_at) VALUES (?,?,?,?,?,?,?,?,?)')
+            .run(row.asset_id, row.operation, row.input_key, row.start_us, row.end_us, row.status, row.payload ?? null, row.error ?? null, row.updated_at)
         }
       }
       if (skipped > 0) console.warn(`video-workspace: OSS 恢复时跳过了 ${skipped} 行不满足约束的数据`)

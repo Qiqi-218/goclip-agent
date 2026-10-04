@@ -38,3 +38,7 @@
         reasoningEffort: medium
         # 单个模型请求的尝试次数（含首次）。覆盖限流与 5xx；非 429 的 4xx 不重试。
         modelAttempts: 3
+        # 长视频由模型分片处理；短于 10 分钟仍保持一次调用。
+        modelChunkThresholdSeconds: 600
+        modelChunkSeconds: 300
+        modelChunkOverlapSeconds: 8

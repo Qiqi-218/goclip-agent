@@ -86,6 +86,12 @@ export interface Config {
    * problem and is not retried.
    */
   modelAttempts: number
+  /** Videos longer than this are split before being sent to the multimodal model. */
+  modelChunkThresholdSeconds: number
+  /** Duration of one model-visible video chunk. */
+  modelChunkSeconds: number
+  /** Context retained on both sides of adjacent chunks. */
+  modelChunkOverlapSeconds: number
   /** Sample rate used to measure loudness; 8 kHz mono is enough and keeps the decode small. */
   acousticSampleRate: number
   /** Loudness window length in milliseconds; one window becomes one position on the timeline. */
@@ -199,6 +205,9 @@ export const Config: z<Config> = z.object({
   maxOutputTokens: z.natural().default(32_768),
   reasoningEffort: z.string(),
   modelAttempts: z.natural().default(3),
+  modelChunkThresholdSeconds: z.natural().default(600),
+  modelChunkSeconds: z.natural().default(300),
+  modelChunkOverlapSeconds: z.natural().default(8),
   acousticSampleRate: z.natural().default(8000),
   acousticWindowMs: z.natural().default(1000),
   acousticPeakLimit: z.natural().default(20),
