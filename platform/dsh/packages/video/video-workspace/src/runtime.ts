@@ -3147,11 +3147,6 @@ export class VideoWorkspace {
   private safeFilename(name: string): string { const leaf = basename(name.trim()).replace(/[^\w.\-]+/g, '_').replace(/^\.+/, ''); return leaf === '' ? 'output.mp4' : leaf.slice(0, 120) }
   private async asset(projectId: string, id: string): Promise<{ path: string }> { const row = (await this.open()).prepare('SELECT path FROM assets WHERE id=? AND project_id=?').get(id,projectId) as { path: string } | undefined; if (!row) throw new Error(`asset not found: ${id}`); return row }
   /**
-   * A timeline names its project and its asset in separate columns, so two valid
-   * foreign keys still permit a cross-project reference. This is the check that
-   * keeps a timeline describing the asset its own project holds.
-   */
-  /**
    * A timeline range has to be non-empty and inside the asset it points at.
    *
    * Only the non-empty half is a schema constraint; the upper bound is checked here
@@ -3696,12 +3691,6 @@ export class VideoWorkspace {
   private async fetchSigned(url: string, init: RequestInit = {}): Promise<Response> { const timeout = AbortSignal.timeout(this.config.requestTimeoutMs ?? 120_000); const signal = init.signal === undefined || init.signal === null ? timeout : AbortSignal.any([init.signal as AbortSignal, timeout]); return fetch(url, { ...init, signal }) }
   private async materialize(ref: string, signal: AbortSignal): Promise<{ path: string,cleanup: () => Promise<void> }> { if (!ref.startsWith('oss://')) return { path: ref, cleanup: async () => undefined }; const key = ref.slice('oss://'.length); const path = join(this.config.dataDir,'tmp',`${randomUUID()}-${basename(key)}`); await mkdir(dirname(path),{recursive:true}); const response = await this.fetchSigned(this.signedUrl(key), { signal }); if (!response.ok) throw new Error(`OSS download failed: ${response.status}`); await this.writeStreamTo(response, path); return { path, cleanup: () => rm(path, { force: true }) } }
   /**
-   * Write a response body to disk a chunk at a time.
-   *
-   * Buffering the whole body would put an entire video in the heap, which is the same
-   * failure the import size bound exists to prevent.
-   */
-  /**
    * Write a response body to a file, refusing a short download.
    *
    * A body that ends early is the dangerous case: the write succeeds, the file looks
@@ -3751,7 +3740,6 @@ export class VideoWorkspace {
    * @returns The signed URL.
    */
   private signedUrl(key: string, method = 'GET'): string { const expires = String(Math.floor(Date.now() / 1000) + this.config.signedUrlSeconds); return `${this.objectUrl(key)}?OSSAccessKeyId=${encodeURIComponent(this.credentials().id)}&Expires=${expires}&Signature=${encodeURIComponent(this.signature(method, key, expires))}` }
-    /** Stream a file to OSS instead of holding it in memory. */
   /**
    * Stream a file to OSS instead of holding it in memory.
    *
@@ -4192,7 +4180,6 @@ export class VideoWorkspace {
     }
   }
 
-  /** The stage timings of the invocation that just finished. */
   /** The stage timings of the invocation that just finished. */
   lastStages(): StageTiming[] { return this.stages.snapshot() }
   /** Wait before the next attempt, unless the caller cancels first. */
