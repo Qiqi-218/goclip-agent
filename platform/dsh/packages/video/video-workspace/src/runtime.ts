@@ -1752,16 +1752,19 @@ export class VideoWorkspace {
     const source = await this.stages.timed('准备素材', () => this.materialize(asset.path, signal))
     try {
       const duration = Number((await this.probe(source.path, signal)).duration_us) || 0
-      const items = await this.stages.timed('读屏幕文字', () => this.readOnScreenText(source.path, duration, signal))
-      const entries = this.sanitizeRanges(items, duration)
+      const ocr = await this.stages.timed('读屏幕文字', () => this.readOnScreenText(source.path, duration, signal))
+      const entries = this.sanitizeRanges(ocr.items, duration)
         .map(entry => ({ ...entry, text: String(entry.text ?? '').trim() }))
         .filter(entry => entry.text !== '')
       const record = {
         entries,
         entry_count: entries.length,
         duration_us: duration,
-        status: 'completed',
-        note: entries.length === 0 ? '没有读出屏幕文字。若这段视频本来就没有字幕或图表，这是正确结果。' : null,
+        status: ocr.failed_frames.length === 0 ? 'completed' : 'partial',
+        failed_frames: ocr.failed_frames.length === 0 ? null : ocr.failed_frames,
+        note: ocr.failed_frames.length > 0
+          ? `有 ${ocr.failed_frames.length} 帧 OCR 失败，结果不覆盖这些帧对应的时间点。`
+          : entries.length === 0 ? '没有读出屏幕文字。若这段视频本来就没有字幕或图表，这是正确结果。' : null,
       }
       await this.saveEvidence(projectId, assetId, EVIDENCE_OCR, record, duration, EVIDENCE_PROVIDER_VERSION)
       return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
@@ -3230,7 +3233,7 @@ export class VideoWorkspace {
    * @param signal - cancellation for the frame extraction and every read.
    * @returns Text pieces with their times, in asset order.
    */
-  private async readOnScreenText(path: string, durationUs: number, signal: AbortSignal): Promise<Data[]> {
+  private async readOnScreenText(path: string, durationUs: number, signal: AbortSignal): Promise<{ items: Data[], failed_frames: number[] }> {
     const interval = Math.max(1, this.config.ocrSampleSeconds)
     const keys = await this.hashFile(path)
     const frameDir = join(this.config.dataDir, 'tmp', `frames-${keys}-${interval}`)
@@ -3249,12 +3252,13 @@ export class VideoWorkspace {
     } else {
       this.stages.skipped('抽取画面帧 · 复用缓存', `同一素材的 ${names.length} 帧已存在`)
     }
-    if (names.length === 0) return []
+    if (names.length === 0) return { items: [], failed_frames: [] }
 
     // 逐帧读取，并发受配置约束。
     // 帧之间互不依赖，所以并发是这里唯一能压缩墙钟时间的杠杆：
     // 实测同一批 60 帧，并发 1 要 45.5s，并发 16 只要 5.7s。
     const texts: string[] = new Array<string>(names.length).fill('')
+    const failedFrames: number[] = []
     let cursor = 0
     const worker = async (): Promise<void> => {
       for (;;) {
@@ -3269,6 +3273,7 @@ export class VideoWorkspace {
           // 单帧失败不该让整条证据消失：其余帧仍然有用，缺失的部分由调用方从覆盖
           // 范围看出来。取消是例外，必须立刻停。
           if (signal.aborted) throw error
+          failedFrames.push(index)
           console.warn(`video-workspace: 第 ${index + 1}/${names.length} 帧读取失败（${error instanceof Error ? error.message : String(error)}）`)
         }
       }
@@ -3356,7 +3361,7 @@ export class VideoWorkspace {
       emit()
     }
     entries.sort((a, b) => Number(a.start_us) - Number(b.start_us))
-    return entries
+    return { items: entries, failed_frames: failedFrames.sort((a, b) => a - b) }
   }
 
   /**
