@@ -45,6 +45,62 @@ const EVIDENCE_VISUAL = 'scene-description'
 const EMPTY_ANSWER_REASONING_FLOOR = 6000
 
 /**
+ * Which production method wrote an evidence row.
+ *
+ * Stored in `evidence.provider_version` and compared on read, so changing how an
+ * extraction is produced makes previously cached rows miss instead of silently
+ * outliving the fix. Bump it whenever a change would alter the stored output.
+ *
+ * v2 covers windowed extraction plus the reasoning-channel setting: the same asset
+ * extracted before it is not the same data as one extracted after.
+ */
+const EVIDENCE_PROVIDER_VERSION = 'omni-v2-windowed'
+
+/**
+ * Frame rate for a trimmed window's proxy, against the 1 fps used for a whole asset.
+ *
+ * A window is a fraction of the asset, so the upload it costs is a fraction too and the
+ * same budget buys a finer read. Speech boundaries land more accurately, which is the
+ * whole reason a window exists.
+ */
+const WINDOW_PROXY_FPS = 3
+
+/**
+ * Shortest trailing window worth asking about, in seconds.
+ *
+ * An extraction over a few seconds of media tends to answer with nothing at all —
+ * measured: a 3-minute asset returned an empty list while 8 and 15 minutes returned 88
+ * and 161 lines. A remainder below this is folded into the window before it.
+ */
+const MIN_WINDOW_SECONDS = 120
+
+/**
+ * Shortest normalized text that may absorb another reading of the same on-screen text.
+ *
+ * Chinese captions share single characters constantly - 西 appears in 跟着老西儿游山西 and in
+ * 西方三圣 - so containment alone merges unrelated captions, which is how entries reading
+ * just 西 and 小 got into the results. Four characters is above any single word that two
+ * different captions would share and below every spelling of the station mark observed.
+ */
+const CAPTION_GROUP_MIN_LENGTH = 4
+
+/**
+ * Every evidence kind the plugin can compute, in the order a caller usually wants them.
+ *
+ * Listed once so that "what is missing" is answered by comparing against a fixed set rather
+ * than by whatever rows happen to exist: a kind that was never computed and a kind that was
+ * computed and came back empty would otherwise look the same.
+ */
+const ALL_EVIDENCE_KINDS = [
+  EVIDENCE_TRANSCRIPT,
+  EVIDENCE_OCR,
+  EVIDENCE_VISUAL,
+  EVIDENCE_SHOTS,
+  EVIDENCE_TIMING,
+  EVIDENCE_ACOUSTIC,
+] as const
+
+/**
  * Offset used while renumbering clips.
  *
  * Above any ordinal a timeline realistically holds, so parking never lands on a number
@@ -573,7 +629,10 @@ export class VideoWorkspace {
       const record = { ...data, segments, instruction: request, oss_key: key }
       db.prepare('INSERT OR REPLACE INTO analyses (asset_id,instruction,data,created_at) VALUES (?,?,?,?)').run(assetId, request, JSON.stringify(record), Date.now())
       await this.stages.timed('保存与同步', () => this.manifest(projectId))
-      return { asset_id: assetId, ...record, reused: false, stages: this.stages.snapshot() }
+      // 覆盖区间随理解结果一起返回，理由：调用方在决定「要定位某句话」之前就该知道
+      // 语音转写覆盖到哪。实测那次会话里，转写标记为「有」而实际只到 1644s，
+      // 模型为 12 句落在那之后的话去重看整片，花了 94.5 秒找一个不存在的东西。
+      return { asset_id: assetId, ...record, reused: false, evidence_coverage: await this.evidenceCoverage(assetId), stages: this.stages.snapshot() }
       // 代理视频是缓存，留着给下次复用；只有下载来的源文件要清掉。
     } finally { await source.cleanup() }
   }
@@ -623,7 +682,7 @@ export class VideoWorkspace {
    * @returns The matching spans plus which evidence was consulted and which filters were
    * unavailable because the asset has not been analysed for them.
    */
-  async findSpans(projectId: string, assetId: string, filters: { text?: string, min_seconds?: number, max_seconds?: number, min_dbfs?: number, min_cuts?: number, has_silence?: boolean, highlight_only?: boolean, limit?: number }): Promise<Data> {
+  async findSpans(projectId: string, assetId: string, filters: { text?: string, texts?: string[], min_seconds?: number, max_seconds?: number, min_dbfs?: number, min_cuts?: number, has_silence?: boolean, highlight_only?: boolean, split_sentences?: boolean, limit?: number }): Promise<Data> {
     await this.asset(projectId, assetId)
     const db = await this.open()
     const analyses = db.prepare('SELECT instruction, data FROM analyses WHERE asset_id=?').all(assetId) as Array<{ instruction: string, data: string }>
@@ -655,7 +714,13 @@ export class VideoWorkspace {
     const silenceIn = (a: number, b: number): number => silences.filter(span => span.startUs < b && span.endUs > a).reduce((sum, span) => sum + Math.min(span.endUs, b) - Math.max(span.startUs, a), 0)
 
     const needle = (filters.text ?? '').trim().toLowerCase()
-    const words = needle === '' ? [] : needle.split(/\s+/).filter(word => word !== '')
+    // 一次可以问多个锚点。定位一句原话时，调用方手上常有两三句，
+    // 而每次只能问一个的话，它就得拆成多次调用 —— 实测那场会话里它没拆，
+    // 而是转去重看整条视频。空串在下面按「没有文字条件」处理。
+    const needles = [needle, ...(filters.texts ?? []).map(value => value.trim().toLowerCase())]
+      .filter(value => value !== '')
+    // 收窄仍然只按单个锚点做：它要把命中段收到那一句，而「哪一句」必须唯一。
+    const narrowNeedle = needle !== '' ? needle : (needles[0] ?? '')
     // 键里带上指令：同一素材的多份分析会对同一段给出不同切法，那是有用的差异，
     // 不是重复。只有同一份分析内部出现完全相同的区间才算重复。
     const seen = new Set<string>()
@@ -674,12 +739,21 @@ export class VideoWorkspace {
       if (filters.has_silence === false && quietUs > 0) return
       if (filters.highlight_only === true && span.is_highlight !== true) return
       let score = span.confidence
-      if (needle !== '') {
+      // 多个锚点各自打分：一次定位请求里常引用两三句原话，
+      // 只收一个查询词的话，调用方要么拆成多次调用，要么放弃本地检索
+      // —— 实测那场会话里它选了后者，转而去重看整条视频 21 次（838 秒）。
+      let matchedNeedle: string | null = null
+      if (needles.length > 0) {
+        const target = span.segment ?? { visual: span.text, is_highlight: span.is_highlight }
+        let best = 0
+        for (const needle of needles) {
+          const candidate = this.relevance(target, needle, needle.split(/\s+/).filter(word => word !== ''))
+          if (candidate > best) { best = candidate; matchedNeedle = needle }
+        }
         // 用原始段打分：relevance 会区分「标签精确命中」「字段等于查询」「正文包含」，
         // 把它们压成一段文本再 includes 会让每一段都命中同一个词。
-        const scoreFromText = this.relevance(span.segment ?? { visual: span.text, is_highlight: span.is_highlight }, needle, words)
-        if (scoreFromText <= 0) return
-        score += scoreFromText
+        if (best <= 0) return
+        score += best
       } else if (span.is_highlight === true) score += 1
       seen.add(key)
       const refs: Data[] = []
@@ -696,6 +770,9 @@ export class VideoWorkspace {
           start_us: span.start_us, end_us: span.end_us, seconds: round2(seconds),
           text: span.text, from_instruction: span.instruction, is_highlight: span.is_highlight,
           peak_dbfs: peak ?? null, cuts: cuts ?? null, silence_seconds: round2(quietUs / 1e6),
+          // 一次问了多个锚点时，要说清这条命中的是哪一个：
+          // 否则调用方拿到一堆区间却不知道哪句对应哪个。
+          matched_text: matchedNeedle,
           evidence_refs: refs,
         },
       })
@@ -776,7 +853,7 @@ export class VideoWorkspace {
         // 让多模态模型重看整条视频 —— 一次 40 秒，一场会话里发生了 21 次。
         // 段内文字是按句写的，按字数比例插值就能把答案落到句子级，
         // 代价是纯本地字符串处理。
-        const narrowed = needle === '' ? null : this.narrowToSentence(segment, needle, start, end)
+        const narrowed = narrowNeedle === '' ? null : this.narrowToSentence(segment, narrowNeedle, start, end)
         consider({
           start_us: narrowed?.start_us ?? start,
           end_us: narrowed?.end_us ?? end,
@@ -789,7 +866,7 @@ export class VideoWorkspace {
       }
     }
     // 响度证据在没有任何分析时仍然有用：它自己就能回答"哪些段落最响"。
-    if (levels.length > 0 && found.length === 0 && needle === '' && filters.highlight_only !== true) {
+    if (levels.length > 0 && found.length === 0 && needles.length === 0 && filters.highlight_only !== true) {
       for (const span of loudSpans(summarize(levels, windowUs, 0), 2)) {
         consider({ start_us: span.startUs, end_us: span.endUs, text: '', instruction: null, is_highlight: null, confidence: 0 })
       }
@@ -810,6 +887,15 @@ export class VideoWorkspace {
         overlaps_stronger_matches: covering.length,
         overlap_seconds: round2(overlapUs / 1e6),
         overlap_note: covering.length === 0 ? null : `与排在前面的 ${covering.length} 条有重叠（共 ${round2(overlapUs / 1e6)} 秒）。同一内容常被多份分析各报一次，选一条即可，不要重复剪进去。`,
+        // 分段内部的按句拆分：只在调用方要求时给出。
+        //
+        // 分段常常是 60–180 秒、text 是多句复述，而提问往往针对其中一句。
+        // 实测那次会话里，模型要「视频结尾这几句逐句的起止时间」—— 结尾落在
+        // 1640s 之后，那里没有音轨、也就没有句子级转写，它只拿到一个 17 秒的分段，
+        // 于是升级去重看整片（44.7 秒）。而分段里的复述本来就分了句，
+        // 按字数比例插值就能给出逐句的大致位置，代价是零。
+        // 这是估算而非真实边界，所以由调用方显式索取，不默认塞进每条结果。
+        sentences: filters.split_sentences === true ? this.splitSpanIntoSentences(entry.item.text, start, end) : undefined,
       }
     })
     return {
@@ -822,6 +908,10 @@ export class VideoWorkspace {
       matches: items,
       evidence_available: { [EVIDENCE_ACOUSTIC]: acoustic !== undefined, [EVIDENCE_SHOTS]: shots !== undefined, [EVIDENCE_TIMING]: timing !== undefined, [EVIDENCE_TRANSCRIPT]: asrRow !== undefined, [EVIDENCE_OCR]: ocrRow !== undefined, [EVIDENCE_VISUAL]: visualRow !== undefined },
       evidence_missing: missing,
+      // 覆盖区间：vidence_available 只说明「算没算过」，而调用方真正要知道的是
+      // 「这一类证据覆盖到哪」—— 实测那条素材的转写标记为 true，却在 1644s 之后再
+      // 也答不出任何东西，因为音频流到那里就结束了。
+      evidence_coverage: await this.evidenceCoverage(assetId),
       note: items.length === 0 ? '没有段落满足全部条件。可以放宽条件，或先用 video_evidence_* 把缺的证据算出来。' : '每条的 evidence_refs 说明了它为什么被选中，可以据此向用户解释。',
     }
   }
@@ -1127,6 +1217,14 @@ export class VideoWorkspace {
     // 但它必须也落在容差内 —— 一句话可能离模型给的区间很远，那时硬吸会把区间拉到别的
     // 内容上，宁可退回最近的物理边界。两类都太远时返回 undefined，区间保持原样。
     const SPEECH_BOUNDARIES = new Set([EVIDENCE_TRANSCRIPT, EVIDENCE_OCR])
+    // 两者等距时谁更该赢：屏幕文字优先。
+    //
+    // 语音边界是听出来的，转写本身还带同音字与断句误差；屏幕文字是画面上逐字
+    // 可见的，起止就是那几个字出现与消失的时刻 —— 同样的距离上它是更硬的证据。
+    // 不排优先序的话胜者取决于 push 顺序（`[TRANSCRIPT, OCR]`），那是个实现细节，
+    // 不该决定用户看到的剪辑点。实测过一处等距场景：两者都在 5.0s，先注册的
+    // 转写赢了，而画面上那几个字明明就在同一刻。
+    const SOURCE_RANK = (source: string): number => source === EVIDENCE_OCR ? 2 : 1
     const nearest = (at: number): { at: number, source: string, distance: number } | undefined => {
       let bestPhysical: { at: number, source: string, distance: number } | undefined
       let bestSpeech: { at: number, source: string, distance: number } | undefined
@@ -1135,7 +1233,11 @@ export class VideoWorkspace {
         if (distance > toleranceUs) continue
         const candidate = { at: boundary.at, source: boundary.source, distance }
         if (SPEECH_BOUNDARIES.has(boundary.source)) {
-          if (bestSpeech === undefined || distance < bestSpeech.distance) bestSpeech = candidate
+          if (bestSpeech === undefined
+            || distance < bestSpeech.distance
+            || (distance === bestSpeech.distance && SOURCE_RANK(boundary.source) > SOURCE_RANK(bestSpeech.source))) {
+            bestSpeech = candidate
+          }
         } else if (bestPhysical === undefined || distance < bestPhysical.distance) bestPhysical = candidate
       }
       return bestSpeech ?? bestPhysical
@@ -1558,7 +1660,7 @@ export class VideoWorkspace {
       const key = `${this.config.ossPrefix.replace(/\/$/,'')}/verify/${randomUUID()}.mp4`
       const url = await this.stages.timed('上传核对片段', () => this.uploadFile(file, key, 'video/mp4'))
       const prompt = `这是一段视频的截取，原素材的第 ${round2(windowStart)} 秒到第 ${round2(windowEnd)} 秒。请只回答：其中目标内容真正开始和结束的时刻，用相对这段截取的时间（秒，可带一位小数）。只返回 JSON：{"start_seconds":0.0,"end_seconds":1.0,"found":true}。如果这段里根本没有目标内容，found 填 false。`
-      const answer = await this.stages.timed('模型二次核对', () => this.ask(url, prompt, signal))
+      const answer = await this.stages.timed('模型二次核对', () => this.ask(url, prompt, signal, { model: this.config.verifyModel }))
       if (answer.found === false) return { start: candidate.start, end: candidate.end, before: candidate, verified: false, note: '二次核对说这段里没有目标内容，保留原区间。' }
       const startSeconds = Number(answer.start_seconds); const endSeconds = Number(answer.end_seconds)
       if (!Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || endSeconds <= startSeconds) {
@@ -1601,37 +1703,29 @@ export class VideoWorkspace {
    * only ever be found approximately. It is also what makes burned-in subtitles searchable
    * without a separate speech service.
    *
-   * The whole proxy is handed to the model in one call rather than one frame at a time.
-   * Asking per frame would be one call per frame — hundreds of calls on a long video — and
-   * the model reads a low-rate proxy well enough to catch text that stays on screen for
-   * more than a second, which is what subtitles and titles do.
+   * The picture is sampled rather than watched: frames are taken every
+   * {@link Config.ocrSampleSeconds} and each is read on its own by {@link Config.ocrModel}.
+   * The comment this replaces argued that per-frame reading would be "one call per frame —
+   * hundreds of calls on a long video", and that is true; what it missed is that each of
+   * those calls is cheap and independent, while one call that watches the whole video is
+   * neither. Measured on the 43-minute asset, watching took 458.8s; reading costs about
+   * 95ms per frame at concurrency 16.
    *
    * @param projectId - project owning the asset.
    * @param assetId - asset to read.
-   * @param signal - cancellation for the transcode, upload and model call.
+   * @param signal - cancellation for the frame extraction and every read.
    * @returns Per-entry text with the second it appeared at.
    */
   async ocrEvidence(projectId: string, assetId: string, signal: AbortSignal): Promise<Data> {
-    const cached = await this.cachedEvidence(assetId, EVIDENCE_OCR)
+    const cached = await this.cachedEvidence(assetId, EVIDENCE_OCR, EVIDENCE_PROVIDER_VERSION)
     if (cached !== undefined) return cached
     const asset = await this.asset(projectId, assetId)
     this.stages.reset()
     const source = await this.stages.timed('准备素材', () => this.materialize(asset.path, signal))
     try {
-      const proxy = await this.prepare(source.path, signal)
-      const url = await this.stages.timed('上传素材', () => this.uploadFile(proxy, `${this.config.ossPrefix.replace(/\/$/, '')}/ocr-source-${randomUUID()}.mp4`, 'video/mp4'))
-      const answer = await this.stages.timed('模型读屏幕文字', () => this.ask(url, [
-        '逐段读出这段视频里出现在画面上的文字（字幕、标题、图表标签、界面文字都算）。',
-        '只返回 JSON：{"entries":[{"start_us":0,"end_us":1,"text":""}]}。',
-        '要求：',
-        '1. text 只放真的出现在画面上的字，逐字照抄，不要改写、不要翻译。',
-        '2. 同一句话在画面上连续停留时，返回一整段起止，不要切成很多条。',
-        '3. 画面里没有文字的时间段不要返回。',
-        '4. 不要把对画面的描述写进 text —— 这里只要字面上的字。',
-        '5. 直接输出 JSON，不要先在脑子里过一遍全片 —— 那样回复会超长度上限，最后一条都留不下来。',
-      ].join('\n'), signal, this.emptyExtractionGuard('entries', '画面上没有文字')))
       const duration = Number((await this.probe(source.path, signal)).duration_us) || 0
-      const entries = this.sanitizeRanges(answer.entries, duration)
+      const items = await this.stages.timed('读屏幕文字', () => this.readOnScreenText(source.path, duration, signal))
+      const entries = this.sanitizeRanges(items, duration)
         .map(entry => ({ ...entry, text: String(entry.text ?? '').trim() }))
         .filter(entry => entry.text !== '')
       const record = {
@@ -1640,7 +1734,7 @@ export class VideoWorkspace {
         duration_us: duration,
         note: entries.length === 0 ? '没有读出屏幕文字。若这段视频本来就没有字幕或图表，这是正确结果。' : null,
       }
-      await this.saveEvidence(projectId, assetId, EVIDENCE_OCR, record, duration)
+      await this.saveEvidence(projectId, assetId, EVIDENCE_OCR, record, duration, EVIDENCE_PROVIDER_VERSION)
       return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
     } finally { await source.cleanup() }
   }
@@ -1664,26 +1758,24 @@ export class VideoWorkspace {
    * @returns Spoken lines with their times.
    */
   async transcriptEvidence(projectId: string, assetId: string, signal: AbortSignal): Promise<Data> {
-    const cached = await this.cachedEvidence(assetId, EVIDENCE_TRANSCRIPT)
+    const cached = await this.cachedEvidence(assetId, EVIDENCE_TRANSCRIPT, EVIDENCE_PROVIDER_VERSION)
     if (cached !== undefined) return cached
     const asset = await this.asset(projectId, assetId)
     this.stages.reset()
     const source = await this.stages.timed('准备素材', () => this.materialize(asset.path, signal))
     try {
-      const proxy = await this.prepare(source.path, signal)
-      const url = await this.stages.timed('上传素材', () => this.uploadFile(proxy, `${this.config.ossPrefix.replace(/\/$/, '')}/asr-source-${randomUUID()}.mp4`, 'video/mp4'))
-      const answer = await this.stages.timed('模型转写语音', () => this.ask(url, [
-        '把这段视频里**说出来的话**逐句转写出来，标明每句的起止时间。',
-        '只返回 JSON：{"lines":[{"start_us":0,"end_us":1,"text":""}]}。',
-        '要求：',
-        '1. 只转写真的说出来的话。听不清、被音乐盖住、或不是中文的部分宁可不写，**不要根据画面猜**。',
-        '2. 一行对应一句完整的话；同一句不要拆开。',
-        '3. 逐字照抄原话，不要润色、不要翻译、不要补标点以外的内容。',
-        '4. 没有说话的时间段不要返回。',
-        '5. 直接输出 JSON。「把整篇转写先在脑子里过一遍」这种做法会让回复超出长度上限，最终一个字都留不下来 —— 想到一句就写一句。',
-      ].join('\n'), signal, this.emptyExtractionGuard('lines', '视频里没有人说话')))
       const duration = Number((await this.probe(source.path, signal)).duration_us) || 0
-      const lines = this.sanitizeRanges(answer.lines, duration)
+      // 把音频单独交给识别模型，而不是把整段视频交给多模态模型。
+      //
+      // 后者是这条链路上代价最高的一次失败：43 分钟素材花了 192 秒，思考通道吃掉
+      // 16384 token 后结构化输出为空，还被存成「这段视频没有人声」，随后引出 21 次
+      // 整片重看（838 秒）。分窗也没救回来 —— 三种窗口尺寸都拿不到完整覆盖。
+      // 换成识别模型后同一条素材 41 秒跑完，且专有名词全对。
+      const audio = await this.stages.timed('提取音轨', () => this.extractAudio(source.path, signal))
+      const key = `${this.config.ossPrefix.replace(/\/$/, '')}/asr-source-${randomUUID()}.m4a`
+      const url = await this.stages.timed('上传音频', () => this.uploadFile(audio, key, 'audio/mp4'))
+      const sentences = await this.stages.timed('语音识别', () => this.recognizeSpeech(url, signal))
+      const lines = this.sanitizeRanges(sentences, duration)
         .map(line => ({ ...line, text: String(line.text ?? '').trim() }))
         .filter(line => line.text !== '')
       const record = {
@@ -1692,7 +1784,7 @@ export class VideoWorkspace {
         duration_us: duration,
         note: lines.length === 0 ? '没有转写出说话内容。若这段视频本来就没有人声，这是正确结果。' : null,
       }
-      await this.saveEvidence(projectId, assetId, EVIDENCE_TRANSCRIPT, record, duration)
+      await this.saveEvidence(projectId, assetId, EVIDENCE_TRANSCRIPT, record, duration, EVIDENCE_PROVIDER_VERSION)
       return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
     } finally { await source.cleanup() }
   }
@@ -1715,26 +1807,36 @@ export class VideoWorkspace {
    * @returns Scene descriptions with their times.
    */
   async visualEvidence(projectId: string, assetId: string, signal: AbortSignal): Promise<Data> {
-    const cached = await this.cachedEvidence(assetId, EVIDENCE_VISUAL)
+    const cached = await this.cachedEvidence(assetId, EVIDENCE_VISUAL, EVIDENCE_PROVIDER_VERSION)
     if (cached !== undefined) return cached
     const asset = await this.asset(projectId, assetId)
     this.stages.reset()
     const source = await this.stages.timed('准备素材', () => this.materialize(asset.path, signal))
     try {
-      const proxy = await this.prepare(source.path, signal)
-      const url = await this.stages.timed('上传素材', () => this.uploadFile(proxy, `${this.config.ossPrefix.replace(/\/$/, '')}/visual-source-${randomUUID()}.mp4`, 'video/mp4'))
-      const answer = await this.stages.timed('模型描述画面', () => this.ask(url, [
-        '按时间顺序描述这段视频里**画面上发生了什么**，每段标明起止时间。',
-        '只返回 JSON：{"scenes":[{"start_us":0,"end_us":1,"description":"","on_screen":[""]}]}。',
-        '要求：',
-        '1. description 写**看得见的东西**：谁、在哪里、在做什么、画面怎么变化。不要写情绪、评价或推测。',
-        '2. on_screen 列出这一刻画面上出现的人物、物体、地点等具体名词，供以后检索用。',
-        '3. 画面发生明显变化时另起一段；一直没变就一整段。',
-        '4. 一段描述覆盖的画面必须真的是同一段，不要合并前后不同的场景。',
-        '5. 直接输出 JSON，不要先在脑子里过一遍全片 —— 那样回复会超长度上限，最后一段都留不下来。',
-      ].join('\n'), signal, this.emptyExtractionGuard('scenes', '画面没有可描述的内容')))
       const duration = Number((await this.probe(source.path, signal)).duration_us) || 0
-      const scenes = this.sanitizeRanges(answer.scenes, duration)
+      const { items, failedWindows } = await this.extractInWindows({
+        path: source.path,
+        durationUs: duration,
+        field: 'scenes',
+        benign: '画面没有可描述的内容',
+        stage: '模型描述画面',
+        keyPrefix: 'visual-window',
+        // 描述画面只需要「看」，不需要「听」，所以用它自己的模型，
+        // 不为一个用不到的能力付费。
+        model: this.config.visionModel,
+        signal,
+        prompt: [
+          '按时间顺序描述这段视频里**画面上发生了什么**，每段标明起止时间。',
+          '只返回 JSON：{"scenes":[{"start_us":0,"end_us":1,"description":"","on_screen":[""]}]}。',
+          '要求：',
+          '1. description 写**看得见的东西**：谁、在哪里、在做什么、画面怎么变化。不要写情绪、评价或推测。',
+          '2. on_screen 列出这一刻画面上出现的人物、物体、地点等具体名词，供以后检索用。',
+          '3. 画面发生明显变化时另起一段；一直没变就一整段。',
+          '4. 一段描述覆盖的画面必须真的是同一段，不要合并前后不同的场景。',
+          '5. 直接输出 JSON，不要先在脑子里过一遍全片 —— 那样回复会超长度上限，最后一段都留不下来。',
+        ].join('\n'),
+      })
+      const scenes = this.sanitizeRanges(items, duration)
         .map(scene => ({
           ...scene,
           description: String(scene.description ?? '').trim(),
@@ -1746,8 +1848,9 @@ export class VideoWorkspace {
         scene_count: scenes.length,
         duration_us: duration,
         note: scenes.length === 0 ? '没有描述出画面内容。' : null,
+        failed_windows: failedWindows.length === 0 ? null : failedWindows.map(index => index + 1),
       }
-      await this.saveEvidence(projectId, assetId, EVIDENCE_VISUAL, record, duration)
+      await this.saveEvidence(projectId, assetId, EVIDENCE_VISUAL, record, duration, EVIDENCE_PROVIDER_VERSION)
       return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
     } finally { await source.cleanup() }
   }
@@ -2284,7 +2387,7 @@ export class VideoWorkspace {
     try {
       // 关键帧判断看的是全片最差的那一段：只要有一段需要重编码，整条成片就统一重编码，
       // 否则拼接处会撞上参数不一致。
-      const cuts: Array<{ path: string, gap: number }> = []
+      const cuts: Array<{ path: string, gap: number, audioEndSeconds: number }> = []
       let worstGap = 0
       const parts: string[] = []
       const profiles: Array<{ width: number, height: number, fps: string }> = []
@@ -2294,7 +2397,10 @@ export class VideoWorkspace {
         cleanup.push(source.cleanup)
         const gap = await this.stages.timed(`检查第 ${index + 1} 段关键帧`, () => this.keyframeGap(source.path, clip.start_us / 1e6, signal))
         worstGap = Math.max(worstGap, gap)
-        cuts.push({ path: source.path, gap })
+        // 音频流的结束位置按素材探一次即可，不必每段都问。
+        // 它决定切到某一段时要不要补静音（见下面切段的注释）。
+        const audioEndSeconds = await this.audioEndSeconds(source.path, signal)
+        cuts.push({ path: source.path, gap, audioEndSeconds })
         parts.push(source.path)
         // 顺便记下每段的画面规格。concat demuxer 配 -c copy 要求所有段完全一致：
         // 宽高或帧率不同的段被直接拼接时，ffmpeg 不会报错，而是产出一个时长与声明
@@ -2380,9 +2486,38 @@ export class VideoWorkspace {
         const gain = gains[index] ?? 0
         if (clip.muted !== 1 && Math.abs(gain) > 0.1) audioFilters.push(`volume=${gain.toFixed(2)}dB`)
         const args = ['-nostdin', '-y', '-ss', String(clip.start_us / 1e6), '-to', String(clip.end_us / 1e6), '-i', source.path]
+        // 这一段的起点之后源文件已经没有音频时，补一段等长静音。
+        //
+        // 音频流可以比容器短得多：实测那条 43 分钟素材，容器与视频流都是 2584.1s，
+        // 音频流只到 1644.989s。切到音频结束之后的片段时，AAC 编码器一帧样本都拿不到，
+        // 报 `Input buffer exhausted` 然后以 69 退出（Conversion failed!）。
+        // 一次真实的 33 分钟会话里渲染因此断在第 10 段（1807–1818s），前 9 段已经产出，
+        // 用户看到的是「渲染到一半失败」，还被归因成剪辑方案有问题。
+        //
+        // 不能改用 `-an`：`concat` 拼段要求所有段的流结构一致，少一条音轨会让拼接失败
+        // 或产出时长错误的文件。所以是**补静音**而不是去掉音频。
+        // 受控对照（同一文件、只改这一处）：
+        //   -c:a aac             → 退出码 69，Conversion failed!
+        //   anullsrc + -shortest → 退出码 0，h264+aac 48kHz 立体声，时长 11.000s 精确
+        const clipHasAudio = (clip.start_us / 1e6) < source.audioEndSeconds
+        if (!clipHasAudio) {
+          const seconds = Math.max(0.1, (clip.end_us - clip.start_us) / 1e6)
+          args.push('-f', 'lavfi', '-t', String(seconds), '-i', 'anullsrc=r=48000:cl=stereo')
+          args.push('-map', '0:v:0', '-map', '1:a:0')
+        }
         if (videoFilters.length > 0) args.push('-vf', videoFilters.join(','))
         if (audioFilters.length > 0) args.push('-af', audioFilters.join(','))
-        args.push(...codec, piece)
+        // 补了静音就不能再 `-c copy`。
+        //
+        // 不需要归一化时 `codec` 是 `-c copy`，它会把两条流都原样拷进容器；
+        // 而 `anullsrc` 产出的是 pcm_u8，MP4 不支持这个编码，于是
+        //   Could not find tag for codec pcm_u8 in stream #1
+        //   Could not write header (incorrect codec parameters ?): Invalid argument
+        // 连文件头都写不出来。视频那条本来就该 copy（省一次重编码），
+        // 所以只强制音频这一条走 AAC。
+        args.push(...(clipHasAudio ? codec : ['-c:v', 'copy', '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '128k']))
+        if (!clipHasAudio) args.push('-shortest')
+        args.push(piece)
         await this.stages.timed(`切第 ${index + 1}/${clips.length} 段`, () => this.run('ffmpeg', args, signal))
         pieces.push(piece)
       }
@@ -2556,14 +2691,20 @@ export class VideoWorkspace {
    *
    * @param field - the array field the task must fill.
    * @param benign - what an empty result would mean if it were real, used in the complaint.
+   * @param model - which model answers, when seeing a scene is a different job from the default.
    * @returns the validation hooks `ask` accepts.
    */
-  private emptyExtractionGuard(field: string, benign: string): {
+  private emptyExtractionGuard(field: string, benign: string, model?: string): {
     validate: (answer: Data) => string | null
     reasoningTokens: () => number
+    thinking: 'off'
+    model?: string
   } {
     const spentNow = (): number => this.usage[0]?.reasoning_tokens ?? 0
     return {
+      // 提取类任务不需要推理通道，这里一并关掉；守卫则作为「万一还是没做完」的兜底。
+      thinking: 'off',
+      ...(model === undefined ? {} : { model }),
       validate: (answer) => {
         const value = answer[field]
         if (!Array.isArray(value)) return `返回的 JSON 里没有 ${field} 数组`
@@ -2575,6 +2716,271 @@ export class VideoWorkspace {
       },
       reasoningTokens: spentNow,
     }
+  }
+
+  /**
+   * Cover media of any length by running an extraction over successive windows and merging the answers.
+   *
+   * A single extraction call has to return its whole answer inside one reply, and that
+   * reply shares `maxOutputTokens` with the reasoning channel. Measured against the
+   * deployment endpoint on a 43-minute narrated documentary, one call covered eight to
+   * fifteen minutes and failed at forty-three — not because the media was long but
+   * because the answer was: the reply stopped mid-JSON around 21335 characters and no
+   * result survived. The ceiling is on the size of the answer, so the fix is to bound the
+   * answer, which is what windowing does.
+   *
+   * Each window is trimmed, uploaded and extracted on its own, and the timestamps it
+   * returns are shifted by the window's offset so the merged list is expressed in the
+   * original asset's time. A window that fails does not discard the windows already
+   * collected: the caller gets the coverage that succeeded plus a note naming the gaps,
+   * because partial evidence a creator can use beats an exception that costs the whole run.
+   *
+   * @param options - the source to read, the prompt to ask, and where to accumulate.
+   * @returns The merged list, in asset time, and the windows that produced no answer.
+   */
+  private async extractInWindows(options: {
+    /** Local path of the full-resolution source, used as the trim input. */
+    path: string
+    /** Total length of the asset in microseconds. */
+    durationUs: number
+    /** `lines`, `entries` or `scenes` — the array field the prompt must fill. */
+    field: string
+    /** The task, asked once per window. */
+    prompt: string
+    /** What an empty result would mean if it were real, used by the retry complaint. */
+    benign: string
+    /** Label for the per-window stage timing. */
+    stage: string
+    /** Upload key prefix, so windows of different kinds do not collide. */
+    keyPrefix: string
+    /** Which model answers, when this extraction needs a different one from the default. */
+    model?: string
+    signal: AbortSignal
+  }): Promise<{ items: Data[], failedWindows: number[] }> {
+    // 非有限值退化成「不切窗」，而不是让 NaN 传染下去。
+    //
+    // 写错成 Math.max(1, undefined) 会得到 NaN，于是 `durationUs <= chunkUs` 为假
+    // （NaN 的任何比较都是假）、循环的边界也是 NaN —— 结果是既不走单窗路径也进不了
+    // 窗口循环，一次提取都不会发生，而症状只是「结果为空」。这个坑真的踩过一次：
+    // 探针里手写的配置少写一个字段，三个断言一起变红却看不出原因。
+    // 配置缺失应该在加载时报错，但在那之前，退化成整条处理远好过静默什么都不做。
+    const configured = Number(this.config.extractionChunkSeconds)
+    const chunkUs = Number.isFinite(configured) && configured > 0 ? configured * 1_000_000 : options.durationUs
+    // 装得进一次回答就不要切窗。
+    //
+    // 切窗不是免费的：每个窗口都要重新生成代理并上传。素材本来就在一窗之内时，
+    // 这些开销换不到任何东西，而且实测短素材本来也不会触发长度上限
+    // （3 分钟返回空、8 分钟 88 句、15 分钟 161 句、43 分钟失败）。所以只有超过
+    // 一窗的素材才分块，其余保持「整条代理 + 一次调用」的原路径不变。
+    if (options.durationUs <= chunkUs) {
+      const answer = await this.stages.timed(options.stage, async () => {
+        const proxy = await this.prepare(options.path, options.signal)
+        const key = `${this.config.ossPrefix.replace(/\/$/, '')}/${options.keyPrefix}-${randomUUID()}.mp4`
+        const url = await this.uploadFile(proxy, key, 'video/mp4')
+        return this.ask(url, options.prompt, options.signal, this.emptyExtractionGuard(options.field, options.benign, options.model))
+      })
+      const kept = (Array.isArray(answer[options.field]) ? answer[options.field] as Data[] : [])
+        .filter(item => Number.isFinite(Number(item.start_us)) && Number.isFinite(Number(item.end_us)))
+      return { items: kept, failedWindows: [] }
+    }
+    const windows = Math.max(1, Math.ceil(options.durationUs / chunkUs))
+    // 最后一窗可能只剩几秒（43 分钟按 15 分钟切，末窗不足 1 分钟）。
+    // 太短的一窗模型会倾向于什么都不说 —— 实测 3 分钟的素材返回 0 句 ——
+    // 所以把过短的末窗并进前一窗，宁可让那一窗略超上限，也不要丢内容。
+    const starts: number[] = []
+    for (let index = 0; index < windows; index++) starts.push(index * chunkUs)
+    if (starts.length > 1) {
+      const last = starts[starts.length - 1] as number
+      const lastSeconds = (options.durationUs - last) / 1e6
+      if (lastSeconds < MIN_WINDOW_SECONDS) starts.pop()
+    }
+    const items: Data[] = []
+    const failedWindows: number[] = []
+    const total = starts.length
+    for (let index = 0; index < total; index++) {
+      const fromUs = starts[index] as number
+      const toUs = index + 1 < total ? (starts[index + 1] as number) : options.durationUs
+      const from = fromUs / 1e6
+      const seconds = Math.max(1, (toUs - fromUs) / 1e6)
+      const label = total === 1 ? options.stage : `${options.stage} ${index + 1}/${total}`
+      try {
+        const answer = await this.stages.timed(label, async () => {
+          const trimmed = await this.prepare(options.path, options.signal, { startSeconds: from, endSeconds: from + seconds, fps: WINDOW_PROXY_FPS })
+          const key = `${this.config.ossPrefix.replace(/\/$/, '')}/${options.keyPrefix}-${randomUUID()}.mp4`
+          const url = await this.uploadFile(trimmed, key, 'video/mp4')
+          return this.ask(url, options.prompt, options.signal, this.emptyExtractionGuard(options.field, options.benign, options.model))
+        })
+        // 模型给的时间是相对它看到的那段素材开头，也就是窗口起点 fromUs，
+        // 必须平移回素材时间轴：不偏移的话第二窗会比第一窗还早，
+        // 选中它就会剪到完全错误的片段。
+        const produced = (Array.isArray(answer[options.field]) ? answer[options.field] as Data[] : [])
+          .filter(item => Number.isFinite(Number(item.start_us)) && Number.isFinite(Number(item.end_us)))
+        // 一条都没产出时按缺口记，不要当成「这个窗口本来就没内容」。
+        //
+        // 实测踩过：一个覆盖 25–30 分钟的窗口返回 0 条，被静默跳过，最终转写只有
+        // 前 15 分钟而 failed_windows 是 null —— 界面和调用方都以为整条素材都转好了。
+        // 空结果在这类任务里本来就是可疑的（守卫就是为此存在），窗口级同样如此。
+        if (produced.length === 0) {
+          failedWindows.push(index)
+          console.warn(`video-workspace: ${label} 没有产出任何条目，按缺口记录（区间 ${from.toFixed(0)}–${(from + seconds).toFixed(0)}s）`)
+        }
+        for (const item of produced) {
+          const start = Number(item.start_us)
+          const end = Number(item.end_us)
+          items.push({ ...item, start_us: Math.round(start + fromUs), end_us: Math.round(end + fromUs) })
+        }
+      } catch (error) {
+        failedWindows.push(index)
+        console.warn(`video-workspace: ${label} 失败，保留其余窗口的结果（${error instanceof Error ? error.message : String(error)}）`)
+      }
+    }
+    return { items, failedWindows }
+  }
+
+  /**
+   * Pull the audio out of a source file into a small standalone track.
+   *
+   * Speech recognition reads only the audio, so sending the picture as well would upload
+   * tens of megabytes that no step looks at. Measured on the 43-minute asset: the source is
+   * 70 MB while its audio alone is under 15 MB, and the upload is on the critical path
+   * between the two calls that bracket it.
+   *
+   * Mono at 16 kHz because that is what recognition resamples to anyway; keeping the source
+   * rate would triple the upload for no gain in accuracy.
+   *
+   * @param path - local source media.
+   * @param signal - cancellation for the transcode.
+   * @returns Path to the extracted audio, valid until the caller's temp directory is cleared.
+   */
+  private async extractAudio(path: string, signal: AbortSignal): Promise<string> {
+    await mkdir(join(this.config.dataDir, 'tmp'), { recursive: true })
+    const key = await this.hashFile(path)
+    const file = join(this.config.dataDir, 'tmp', `audio-${key}.m4a`)
+    if (existsSync(file)) { this.stages.skipped('提取音轨 · 复用缓存', '同一素材的音轨已存在'); return file }
+    const partial = `${file}.part`
+    await this.run('ffmpeg', ['-nostdin', '-y', '-i', path, '-vn', '-ac', '1', '-ar', '16000',
+      '-c:a', 'aac', '-b:a', '48k', '-f', 'mp4', partial], signal)
+    await rename(partial, file)
+    return file
+  }
+
+  /**
+   * Transcribe an audio URL through the asynchronous speech-recognition task API.
+   *
+   * The task API is a three-step flow — submit, poll, download — rather than one request,
+   * because recognition of a long recording outlives an HTTP response. The result arrives
+   * as a separate JSON document at a URL that expires, so it is read here rather than
+   * handed to the caller.
+   *
+   * Sentence times are already absolute positions in the audio and are used as they come:
+   * they are measured boundaries, not the proportional estimates a language model produces
+   * when asked to place its own words on a timeline.
+   *
+   * @param url - publicly reachable URL of the audio to transcribe.
+   * @param signal - cancellation for the submission and every poll.
+   * @returns Sentences with their times in microseconds, ready for range sanitizing.
+   */
+  private async recognizeSpeech(url: string, signal: AbortSignal): Promise<Data[]> {
+    const key = process.env[this.config.asrApiKeyEnv ?? this.config.apiKeyEnv]
+    if (!key) throw new Error(`speech recognition API key is missing: ${this.config.asrApiKeyEnv ?? this.config.apiKeyEnv}`)
+    const base = this.config.asrBaseUrl.replace(/\/$/, '')
+    const headers = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }
+
+    const submit = await this.fetchSigned(`${base}/services/audio/asr/transcription`, {
+      method: 'POST',
+      headers: { ...headers, 'X-DashScope-Async': 'enable' },
+      body: JSON.stringify({
+        model: this.config.asrModel,
+        input: { file_urls: [url] },
+        parameters: { channel_id: [0] },
+      }),
+      signal,
+    })
+    if (!submit.ok) throw new Error(`语音识别任务提交失败：HTTP ${submit.status} ${(await submit.text()).slice(0, 300)}`)
+    const submitted = await submit.json() as { output?: { task_id?: string } }
+    const taskId = submitted.output?.task_id
+    if (taskId === undefined) throw new Error(`语音识别任务没有返回 task_id：${JSON.stringify(submitted).slice(0, 300)}`)
+
+    const deadline = Date.now() + this.config.asrTimeoutMs
+    let task = ''
+    for (;;) {
+      if (Date.now() > deadline) throw new Error(`语音识别任务超时（${Math.round(this.config.asrTimeoutMs / 1000)}s，最后状态 ${task}）`)
+      await this.pause(this.config.asrPollMs, signal)
+      const poll = await this.fetchSigned(`${base}/tasks/${taskId}`, { headers, signal })
+      if (!poll.ok) throw new Error(`查询语音识别任务失败：HTTP ${poll.status} ${(await poll.text()).slice(0, 300)}`)
+      const payload = await poll.json() as {
+        output?: {
+          task_status?: string
+          code?: string
+          message?: string
+          result?: { subtask_status?: string, transcription_url?: string, message?: string }
+          results?: Array<{ subtask_status?: string, transcription_url?: string, message?: string }>
+        }
+      }
+      const output = payload.output ?? {}
+      task = output.task_status ?? ''
+      if (task === 'FAILED' || task === 'UNKNOWN') {
+        throw new Error(`语音识别任务 ${task}：${output.code ?? ''} ${output.message ?? ''}`.trim())
+      }
+      if (task !== 'SUCCEEDED') continue
+      // 两种结果结构并存：数组式（results[]）与单对象式（result）。官方文档明确要求
+      // 不能写死其中一种，因为不同模型走的是不同分支。
+      const entry = output.result ?? (output.results ?? [])[0]
+      if (entry === undefined) throw new Error('语音识别任务成功但结果为空')
+      if (entry.subtask_status !== 'SUCCEEDED' || entry.transcription_url === undefined) {
+        throw new Error(`语音识别子任务未成功：${entry.subtask_status ?? '?'} ${entry.message ?? ''}`.trim())
+      }
+      const document = await this.fetchSigned(entry.transcription_url, { signal })
+      if (!document.ok) throw new Error(`下载识别结果失败：HTTP ${document.status}`)
+      const parsed = await document.json() as { transcripts?: Array<{ sentences?: Array<{ begin_time?: number, end_time?: number, text?: string }> }> }
+      const sentences = (parsed.transcripts ?? []).flatMap(transcript => transcript.sentences ?? [])
+      // 识别给的是毫秒；本插件内部一律用微秒。
+      return sentences
+        .filter(sentence => Number.isFinite(sentence.begin_time) && Number.isFinite(sentence.end_time))
+        .map(sentence => ({
+          start_us: Math.round(Number(sentence.begin_time) * 1000),
+          end_us: Math.round(Number(sentence.end_time) * 1000),
+          text: String(sentence.text ?? ''),
+        }))
+    }
+  }
+
+  /**
+   * Split one matched span's text into sentences with estimated times.
+   *
+   * A search hit on the analysis carries the segment's whole description, which covers tens
+   * of seconds and several sentences, while the question is usually about one of them. Where
+   * a transcript exists the sentence times come from recognition and are exact, so this is
+   * not needed; where it does not - the measured asset has no audio past 1640s of a 2584s
+   * picture - the analysis is the only text there is, and a caller asking for the timing of a
+   * sentence has nothing else to go on.
+   *
+   * The times are interpolated by character count across the span, so they say which sentence
+   * and roughly where, not where the speaker actually paused. Reported as such: the caller
+   * decides whether an estimate is good enough, and can refine the result against real edges.
+   *
+   * @param text - the span's text, as stored.
+   * @param startUs - span start.
+   * @param endUs - span end.
+   * @returns One entry per sentence, or null when the text will not split.
+   */
+  private splitSpanIntoSentences(text: unknown, startUs: number, endUs: number): Data[] | null {
+    const body = String(text ?? '')
+    if (body === '') return null
+    const parts = body.split(/(?<=[。！？；])/).map(part => part.trim()).filter(part => part !== '')
+    if (parts.length < 2) return null
+    const total = parts.reduce((sum, part) => sum + part.length, 0)
+    if (total === 0) return null
+    const span = endUs - startUs
+    const out: Data[] = []
+    let consumed = 0
+    for (const part of parts) {
+      const from = startUs + Math.round(span * (consumed / total))
+      consumed += part.length
+      const to = startUs + Math.round(span * (consumed / total))
+      out.push({ start_us: from, end_us: to, seconds: round2((to - from) / 1e6), text: part })
+    }
+    return out
   }
 
   /**
@@ -2752,6 +3158,442 @@ export class VideoWorkspace {
    * @param trim - an optional range, in seconds, to cut before encoding.
    * @returns The proxy's path.
    */
+  /**
+   * Read the text off the picture by sampling frames and reading each one with the OCR model.
+   *
+   * Replaces asking a multimodal model to watch the whole video and write the captions out.
+   * Measured on the 43-minute asset, that approach took 458.8s - half the tool time of the
+   * session it ran in - because every call had to watch minutes of video and compose a long
+   * answer. Reading a single frame answers a much smaller question, and the measured cost is
+   * 95ms per frame at concurrency 16, so the same coverage arrives in tens of seconds.
+   *
+   * Sampling rather than watching is what makes it safe: text on screen is static between
+   * cuts, so a frame every {@link Config.ocrSampleSeconds} sees each caption, and there is no
+   * answer long enough to be truncated the way a whole-video caption pass was.
+   *
+   * Two things the reader cannot tell us, handled here instead of guessed at: it returns no
+   * position for the text, so the frame's own timestamp is the position; and it does not say
+   * whether the characters were a caption or a station logo, so text present on most frames
+   * is treated as furniture and dropped.
+   *
+   * @param path - local media to read.
+   * @param durationUs - length of the asset, bounding the last sample.
+   * @param signal - cancellation for the frame extraction and every read.
+   * @returns Text pieces with their times, in asset order.
+   */
+  private async readOnScreenText(path: string, durationUs: number, signal: AbortSignal): Promise<Data[]> {
+    const interval = Math.max(1, this.config.ocrSampleSeconds)
+    const keys = await this.hashFile(path)
+    const frameDir = join(this.config.dataDir, 'tmp', `frames-${keys}-${interval}`)
+    await mkdir(frameDir, { recursive: true })
+    const stamp = join(frameDir, '.stamp')
+
+    let names = existsSync(stamp) ? (await readdir(frameDir)).filter(name => name.endsWith('.jpg')).sort() : []
+    if (names.length === 0) {
+      for (const stale of await readdir(frameDir)) await rm(join(frameDir, stale), { force: true })
+      const pattern = join(frameDir, 'f%06d.jpg')
+      // 只缩不放，并统一到偶数高度：读字不需要大图，而缩放是这一步唯一的本地开销。
+      await this.run('ffmpeg', ['-nostdin', '-y', '-i', path,
+        '-vf', `fps=1/${interval},scale='min(1280,iw)':-2`, '-q:v', '4', pattern], signal)
+      names = (await readdir(frameDir)).filter(name => name.endsWith('.jpg')).sort()
+      await writeFile(stamp, String(names.length))
+    } else {
+      this.stages.skipped('抽取画面帧 · 复用缓存', `同一素材的 ${names.length} 帧已存在`)
+    }
+    if (names.length === 0) return []
+
+    // 逐帧读取，并发受配置约束。
+    // 帧之间互不依赖，所以并发是这里唯一能压缩墙钟时间的杠杆：
+    // 实测同一批 60 帧，并发 1 要 45.5s，并发 16 只要 5.7s。
+    const texts: string[] = new Array<string>(names.length).fill('')
+    let cursor = 0
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const index = cursor
+        cursor += 1
+        if (index >= names.length) return
+        const name = names[index] as string
+        try {
+          const bytes = await readFile(join(frameDir, name))
+          texts[index] = await this.readFrame(`data:image/jpeg;base64,${bytes.toString('base64')}`, signal)
+        } catch (error) {
+          // 单帧失败不该让整条证据消失：其余帧仍然有用，缺失的部分由调用方从覆盖
+          // 范围看出来。取消是例外，必须立刻停。
+          if (signal.aborted) throw error
+          console.warn(`video-workspace: 第 ${index + 1}/${names.length} 帧读取失败（${error instanceof Error ? error.message : String(error)}）`)
+        }
+      }
+    }
+    const workers = Math.max(1, Math.min(this.config.ocrConcurrency, names.length))
+    await Promise.all(Array.from({ length: workers }, () => worker()))
+
+    // 每帧拆成「一行一条」，再按行各自求生命周期。
+    //
+    // 早先是按整帧文本合并的，那是错的：帧上同时有角标和字幕时整帧文本各不相同，
+    // 于是同一个角标永远凑不成连续的一段，频率也就永远到不了阈值 ——
+    // 实测水印因此没被滤掉，还跟着字幕一起漏进结果。
+    // 按行处理后，角标与字幕各有各的区间，频率也各自可数。
+    const perFrame = texts.map(text => this.splitCaption(text))
+
+    // 同一个角标会被读成好几种写法，靠完全相同是归不到一起的。
+    //
+    // 实测那条素材的角标出现过 `-小老西儿 bilibili`、`-小老西儿_bilibili`、
+    // `-小老西儿`、`bilibili` 四种形态；只做空白与下划线的归一化仍算四条不同的
+    // 文字，频率被摊薄到阈值以下，于是两次调阈值（0.6、0.35）都没能滤掉它。
+    // 归并的判据改成「一条是另一条的子串，或两条足够相似」：
+    // 角标的几种写法互为子串，而字幕之间不会。
+    const tierKeys = new Map<string, number[]>()
+    /** 每行归一化后的文字 -> 它所属组的 id。第二遍要用同一个映射，不能重新归并 ——
+     * 重新归并会为已经归好的行再建一个空组，组 id 一变，标签就挂错了地方。 */
+    const groupOf = new Map<string, string>()
+    for (let index = 0; index < perFrame.length; index += 1) {
+      for (const line of perFrame[index] as string[]) {
+        const keys = this.normalizeCaption(line)
+        if (keys === '') continue
+        const group = this.groupCaption(keys, tierKeys, groupOf)
+        const seen = tierKeys.get(group) ?? []
+        // 同一帧里重复出现只算一次，否则频率会被重复计数推高。
+        if (seen[seen.length - 1] !== index) seen.push(index)
+        tierKeys.set(group, seen)
+      }
+    }
+    const labelOf = new Map<string, string>()
+    for (let index = 0; index < perFrame.length; index += 1) {
+      for (const line of perFrame[index] as string[]) {
+        const keys = this.normalizeCaption(line)
+        if (keys === '') continue
+        const group = groupOf.get(keys)
+        if (group === undefined) continue
+        // 记下最短的那种写法作为代表：角标里最干净的形态。
+        const current = labelOf.get(group)
+        if (current === undefined || line.length < current.length) labelOf.set(group, line)
+      }
+    }
+
+    // 常驻文字（台标、角标、固定片头）按出现频率识别并丢掉。
+    // 识别模型只给字，不给「这是字幕还是角标」，所以只能靠跨帧频率区分。
+    const persistent = new Set<string>()
+    for (const [group, frames] of tierKeys) {
+      if (frames.length / perFrame.length >= this.config.ocrWatermarkFraction) persistent.add(group)
+    }
+    if (persistent.size > 0) {
+      const shown = [...persistent].slice(0, 6).map(group => labelOf.get(group) ?? group)
+      console.info(`video-workspace: 按常驻文字丢弃 ${persistent.size} 条（出现在 ${Math.round(this.config.ocrWatermarkFraction * 100)}% 以上的帧里）：${shown.join(' / ')}`)
+    }
+
+    // 每一条非角标文字各自合并成连续区间：文字是静止的，区间应当按「它挂了多久」来给，
+    // 而不是按采样点给一串零碎片段。
+    const entries: Data[] = []
+    for (const [group, frames] of tierKeys) {
+      if (persistent.has(group)) continue
+      const label = labelOf.get(group) ?? group
+      let from = frames[0] as number
+      let previous = frames[0] as number
+      const emit = (): void => {
+        entries.push({
+          start_us: Math.round(from * interval * 1e6),
+          end_us: Math.min(durationUs, Math.round((previous + 1) * interval * 1e6)),
+          text: label,
+        })
+      }
+      for (const index of frames.slice(1)) {
+        // 相邻之间的空档给一点容差：字幕换行或识别偶发失败会让中间少一两帧，
+        // 那不该把同一句话切成两段。
+        if (index <= previous + 2) { previous = index; continue }
+        emit()
+        from = index
+        previous = index
+      }
+      emit()
+    }
+    entries.sort((a, b) => Number(a.start_us) - Number(b.start_us))
+    return entries
+  }
+
+  /**
+   * Fold equivalent readings of the same on-screen text into one group.
+   *
+   * The reader is not consistent between frames: one station mark came back as four
+   * different strings, and comparing them literally split its frequency four ways, which is
+   * why a threshold tuned high or low both failed to remove it. Two readings are treated as
+   * the same piece when one contains the other, which is what those four spellings are to
+   * each other and what captions never are.
+   *
+   * Returns the identifier of the group the key belongs to, creating one when nothing
+   * matches. The map is keyed by group identifier and holds that group's frame indices.
+   *
+   * @param keys - normalized text of one line.
+   * @param groups - known groups, keyed by identifier.
+   * @param memo - normalized text to group identifier, so a line seen again resolves to the
+   *   group it already joined rather than starting a new one.
+   * @returns The identifier of the matching or newly created group.
+   */
+  private groupCaption(keys: string, groups: Map<string, number[]>, memo: Map<string, string>): string {
+    const known = memo.get(keys)
+    if (known !== undefined) return known
+    for (const existing of groups.keys()) {
+      // 子串归并只在两者都够长时才做。
+      //
+      // 中文里单字几乎必然是某条字幕的子串：实测把「西」当子串归并，于是
+      // 「跟着老西儿游山西」「西方三圣」这些互不相干的字幕被并成一组，
+      // 结果里出现了只有「西」「小」「东」这种一两个字的条目。
+      // 角标的几种写法（`-小老西儿 bilibili` 与 `bilibili`、`-小老西儿`）
+      // 都不短，所以长度下限不会妨碍它，只会挡住单字的误并。
+      const shorter = existing.length <= keys.length ? existing : keys
+      const longer = existing.length <= keys.length ? keys : existing
+      if (shorter.length >= CAPTION_GROUP_MIN_LENGTH && longer.includes(shorter)) {
+        memo.set(keys, existing)
+        return existing
+      }
+    }
+    // 新组先占位，帧号由调用方填入。
+    groups.set(keys, [])
+    memo.set(keys, keys)
+    return keys
+  }
+
+  /**
+   * Normalize a line of read text for comparison.
+   *
+   * Strips the differences that are noise - spacing, underscores, case - so that two
+   * readings of the same mark differ only where the reader actually disagreed.
+   *
+   * @param line - one line as the model returned it.
+   * @returns The comparable form.
+   */
+  private normalizeCaption(line: string): string {
+    return line.replace(/[\s_\-|·.]+/g, '').toLowerCase()
+  }
+
+  /**
+   * Split a reader's answer into separate pieces of on-screen text.
+   *
+   * The reader returns the characters it saw, one region per line, without saying how many
+   * regions there were. Newlines are the only separator it offers, so each line is treated as
+   * its own piece: a caption and a station logo on the same frame are two entries with
+   * different lifetimes, and keeping them together would make the watermark filter throw away
+   * the caption riding along with it.
+   *
+   * @param answer - the raw text the model returned for one frame.
+   * @returns Non-empty trimmed lines.
+   */
+  private splitCaption(answer: string): string[] {
+    return answer.split('\n').map(line => line.trim()).filter(line => line !== '')
+  }
+
+  /**
+   * Read the text on one image.
+   *
+   * Deliberately not routed through {@link ask}: that helper takes a video URL and wraps the
+   * call in the JSON contract the extraction prompts use, while this asks a different model a
+   * question whose answer is plain text. Sending an image where a video is expected, or
+   * demanding JSON from a model that returns prose, would fail in ways that look like the
+   * reader is broken.
+   *
+   * @param dataUrl - the frame as a base64 data URL.
+   * @param signal - cancellation for the request.
+   * @returns The text the model read, or an empty string when it saw none.
+   */
+  private async readFrame(dataUrl: string, signal: AbortSignal): Promise<string> {
+    const key = process.env[this.config.apiKeyEnv]
+    if (!key) throw new Error(`model API key is missing: ${this.config.apiKeyEnv}`)
+    const response = await this.fetchSigned(`${this.config.modelBaseUrl.replace(/\/$/, '')}/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: this.config.ocrModel,
+        messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: dataUrl } }] }],
+      }),
+      signal,
+    })
+    if (!response.ok) throw new Error(`OCR 帧读取失败：HTTP ${response.status} ${(await response.text()).slice(0, 200)}`)
+    const parsed = await response.json() as { choices?: Array<{ message?: { content?: string } }> }
+    return String(parsed.choices?.[0]?.message?.content ?? '').trim()
+  }
+
+  /**
+   * Which analyses and evidence a asset already has, in the words a caller needs.
+   *
+   * Computing evidence is the expensive half of this plugin - a transcript is a recognition
+   * task, screen text reads hundreds of frames, scene description runs a vision model over the
+   * whole picture - and until this existed the only way to find out whether any of it had been
+   * done was to call the tool that computes it and watch whether the reply said `cached`. That
+   * works, but it downloads the asset and probes it first, so "is this already done" cost more
+   * than the question deserved, and nothing let a caller see the *gaps* without computing
+   * everything first.
+   *
+   * Reports both halves: what is done, and where a done piece stops short of the picture. The
+   * second half is the one that changes behaviour - a transcript that exists only up to 1640s
+   * of a 2584s picture answers nothing past that point, and a caller that knows it will say so
+   * instead of spending a minute re-watching the video looking for speech that is not there.
+   *
+   * @param projectId - project owning the asset.
+   * @param assetId - asset to report on.
+   * @returns Done kinds with their covered range, plus the analyses already on file.
+   */
+  async evidenceStatus(projectId: string, assetId: string): Promise<Data> {
+    // 素材不存在时这里就报错，不必等后面的查询返回空结果再猜原因。
+    await this.asset(projectId, assetId)
+    const db = await this.open()
+    const analyses = db.prepare('SELECT instruction, data, created_at FROM analyses WHERE asset_id=?').all(assetId) as Array<{ instruction: string, data: string, created_at: number }>
+    const coverage = await this.evidenceCoverage(assetId)
+    const kinds = (coverage.kinds ?? {}) as Record<string, { from_seconds: number, to_seconds: number, count: number, covers_picture: boolean, gap_to_picture_end_seconds: number | null }>
+    const pictureSeconds = Number(coverage.picture_seconds ?? 0)
+
+    const done: Data[] = []
+    const notComputed: string[] = []
+    for (const kind of ALL_EVIDENCE_KINDS) {
+      const found = kinds[kind]
+      if (found === undefined || found.count === 0) { notComputed.push(kind); continue }
+      done.push({
+        kind,
+        from_seconds: found.from_seconds,
+        to_seconds: found.to_seconds,
+        count: found.count,
+        covers_picture: found.covers_picture,
+        // 缺口的措辞要明确指向「这段时间没有这类证据」，而不是留一个数字让调用方猜。
+        stops_short_by_seconds: found.gap_to_picture_end_seconds,
+        note: found.covers_picture
+          ? null
+          : `这一类只覆盖到 ${found.to_seconds}s，画面总长 ${round2(pictureSeconds)}s —— 之后的 ${found.gap_to_picture_end_seconds}s 没有这类证据。落在那个范围里的内容，任何检索都找不到它。`,
+      })
+    }
+
+    return {
+      asset_id: assetId,
+      picture_seconds: round2(pictureSeconds),
+      analyses: analyses.map(row => ({
+        instruction: row.instruction,
+        segments: ((JSON.parse(row.data) as { segments?: unknown[] }).segments ?? []).length,
+      })),
+      evidence_done: done,
+      evidence_not_computed: notComputed,
+      next_step: notComputed.length === 0
+        ? '全部证据都已算好，可以直接检索或剪辑。'
+        : `还没算的证据：${notComputed.join('、')}。需要哪一类就用对应的 video_evidence_* 工具算它；不需要就不必算。`,
+    }
+  }
+
+  /**
+   * What each evidence kind actually covers, in seconds.
+   *
+   * `evidence_available` says whether a kind was computed at all, which is not the question a
+   * caller needs answered. The measured asset carries a transcript flag of true and still
+   * answers nothing past 1644s, because its audio stream ends there while the picture runs to
+   * 2584s. A session asked for twelve phrases from that stretch, got no sentence-level times,
+   * and spent 94.5s re-watching the whole video looking for speech that was never recorded.
+   *
+   * Reporting the covered range instead of a flag is what lets a caller tell "no evidence yet,
+   * compute it" apart from "no evidence is possible here, say so".
+   *
+   * @param assetId - asset to summarize.
+   * @returns One line per computed kind: covered range in seconds, item count, and a note when
+   *   the kind stops short of the picture.
+   */
+  private async evidenceCoverage(assetId: string): Promise<Data> {
+    const db = await this.open()
+    const rows = db.prepare('SELECT kind, duration_us, payload FROM evidence WHERE asset_id=?').all(assetId) as Array<{ kind: string, duration_us: number, payload: string }>
+    const asset = db.prepare('SELECT meta FROM assets WHERE id=?').get(assetId) as { meta: string } | undefined
+    const pictureSeconds = asset === undefined ? 0 : (Number((JSON.parse(asset.meta) as { duration_us?: number }).duration_us) || 0) / 1e6
+    const coverage: Data = {}
+    for (const row of rows) {
+      const payload = JSON.parse(row.payload) as Data
+      const span = this.coverageOfKind(row.kind, payload)
+      if (span === null) continue
+      // 与画面总长的差距才是调用方需要的：它决定「这一段有没有这类证据」。
+      const gap = Math.max(0, pictureSeconds - span.toSeconds)
+      coverage[row.kind] = {
+        from_seconds: round2(span.fromSeconds),
+        to_seconds: round2(span.toSeconds),
+        count: span.count,
+        covers_picture: gap < 1,
+        gap_to_picture_end_seconds: gap < 1 ? null : round2(gap),
+      }
+    }
+    return { picture_seconds: round2(pictureSeconds), kinds: coverage }
+  }
+
+  /**
+   * Read the covered span out of one evidence payload, whatever shape that kind stores.
+   *
+   * The kinds do not share a schema, and assuming they did produced a coverage report that
+   * called `silence-timing` and `acoustic-loudness` absent while their rows sat in the
+   * database: the first keeps its spans under `silences` with camelCase bounds rather than
+   * `lines`/`entries`/`scenes` with snake_case ones, and the second stores no spans at all -
+   * it stores one decibel reading per window, so the covered length is the array length times
+   * the window. A status tool that reports computed evidence as missing is worse than no
+   * status tool, because the caller then pays to compute it again.
+   *
+   * @param kind - which evidence kind this payload belongs to.
+   * @param payload - the stored record.
+   * @returns The covered span, or null for a kind whose payload cannot be interpreted.
+   */
+  private coverageOfKind(kind: string, payload: Data): { fromSeconds: number, toSeconds: number, count: number } | null {
+    // 每个窗口一个读数的类型：覆盖长度 = 读数个数 × 窗口长度。
+    if (kind === EVIDENCE_ACOUSTIC) {
+      const levels = Array.isArray(payload.levelsDbfs) ? payload.levelsDbfs : []
+      const windowUs = Number(payload.windowUs)
+      if (levels.length === 0 || !Number.isFinite(windowUs)) return null
+      const declared = Number(payload.duration_us)
+      const measured = (levels.length * windowUs) / 1e6
+      // 读数有时比声明的总长略长（末窗取整），取小的那个。
+      const toSeconds = Number.isFinite(declared) && declared > 0 ? Math.min(measured, declared / 1e6) : measured
+      return { fromSeconds: 0, toSeconds, count: levels.length }
+    }
+    // 有显式区间的类型，两种字段命名各试一次。
+    const items = [payload.lines, payload.entries, payload.scenes, payload.silences]
+      .find(candidate => Array.isArray(candidate) && candidate.length > 0) as Data[] | undefined
+    if (items === undefined) return null
+    const starts: number[] = []
+    const ends: number[] = []
+    for (const item of items) {
+      const start = Number(item.start_us ?? item.startUs)
+      const end = Number(item.end_us ?? item.endUs)
+      if (Number.isFinite(start)) starts.push(start)
+      if (Number.isFinite(end)) ends.push(end)
+    }
+    if (starts.length === 0 || ends.length === 0) return null
+    return {
+      fromSeconds: Math.min(...starts) / 1e6,
+      toSeconds: Math.max(...ends) / 1e6,
+      count: items.length,
+    }
+  }
+
+  /**
+   * Where an audio track stops, in seconds, or `Infinity` when it never does.
+   *
+   * A stream can be present in the header and still hold nothing in the requested range.
+   * The measured asset declares 2584.1s of container and video while its audio stream ends
+   * at 1644.989s, so anything read past that point has no audio at all. Two paths need to
+   * know this before asking ffmpeg for audio, and both fail the same way when they do not:
+   * the AAC encoder gets zero samples, prints `Qavg: nan` or `Input buffer exhausted`, and
+   * ffmpeg exits 69 with `Conversion failed!`.
+   *
+   * Answered from the stream's declared duration rather than by counting packets: seeking
+   * to a timestamp and counting what comes back returned a stray packet for an empty range
+   * and would have chosen the failing branch.
+   *
+   * Assumes one audio stream, which is what a proxy and an export both need; a second track
+   * would not change whether there is audio to read.
+   *
+   * @param path - local media to inspect.
+   * @param signal - cancellation for the probe.
+   * @returns The declared end of the first audio stream, or `Infinity` when it is unknown.
+   */
+  private async audioEndSeconds(path: string, signal: AbortSignal): Promise<number> {
+    try {
+      const { stdout } = await this.run('ffprobe', ['-v', 'error', '-select_streams', 'a:0',
+        '-show_entries', 'stream=duration', '-of', 'csv=p=0', path], signal)
+      const declared = Number(stdout.trim().split('\n')[0])
+      return Number.isFinite(declared) ? declared : Infinity
+    } catch (error) {
+      // 探测失败不该让渲染停下：当成「音频一直都在」，让 ffmpeg 自己去面对。
+      console.warn(`video-workspace: 读取音频流时长失败，按「有音频」处理（${error instanceof Error ? error.message : String(error)}）`)
+      return Infinity
+    }
+  }
+
   private async prepare(path: string, signal: AbortSignal, trim?: { startSeconds: number, endSeconds: number, fps: number }): Promise<string> {
     return this.stages.timed('生成代理视频', async () => {
       await mkdir(join(this.config.dataDir, 'tmp'), { recursive: true })
@@ -2763,7 +3605,24 @@ export class VideoWorkspace {
       const rate = trim === undefined ? 1 : trim.fps
       // 截取区间的代理读的是这一小段，所以帧率可以调高：同样的输入体积换取更细的时间分辨。
       const seek = trim === undefined ? [] : ['-ss', String(trim.startSeconds), '-to', String(trim.endSeconds)]
-      await this.run('ffmpeg',['-nostdin','-y',...seek,'-i',path,'-vf',`${this.proxyScaleFilter()},fps=${rate}`,'-c:v','libx264','-preset','veryfast','-crf','25','-c:a','aac','-b:a','64k','-f','mp4',partial],signal)
+      // 这一段没有音频时就不要输出音频。
+      //
+      // 实测那条 43 分钟素材：容器与视频流都是 2584.1s，音频流只到 1644.989s。
+      // 窗口开到 1800s 起时，整个窗口里一帧音频都没有，AAC 编码器于是输出
+      // `Qavg: nan`，ffmpeg 以 69 退出（Conversion failed!），整窗拿不到代理视频；
+      // 前两窗落在有声区间所以正常。受控对照（同一文件、只改一个参数）：
+      //   -c:a aac（现状）     退出码 69
+      //   -an                  退出码 0，视频 784s 完整
+      //   -c:a aac -shortest   退出码 69，且输出被截到 774s
+      //   -c:a aac -af apad    退出码 69
+      // 所以既不能靠 `-shortest`（它截短窗口），也不能靠补静音；
+      // 只有「这一段没有音频就不输出音频」成立，判据必须落在区间上而不是文件头。
+      // 顺带覆盖真的没有音轨的素材（默片、屏幕录制），它们原本会以同样方式失败。
+      const hasAudio = trim === undefined
+        ? (await this.run('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', path], signal)).stdout.trim() !== ''
+        : trim.startSeconds < await this.audioEndSeconds(path, signal)
+      const audio = hasAudio ? ['-c:a', 'aac', '-b:a', '64k'] : ['-an']
+      await this.run('ffmpeg',['-nostdin','-y',...seek,'-i',path,'-vf',`${this.proxyScaleFilter()},fps=${rate}`,'-c:v','libx264','-preset','veryfast','-crf','25',...audio,'-f','mp4',partial],signal)
       await rename(partial, file)
       return file
     })
@@ -2879,14 +3738,32 @@ export class VideoWorkspace {
     validate?: (answer: Data) => string | null
     /** What the model spent on reasoning this call, for the complaint when validation fails. */
     reasoningTokens?: () => number
+    /**
+     * Close or lower the reasoning channel for this call.
+     *
+     * Extraction tasks set this; the understanding pass leaves it undefined. See
+     * `Config.extractionThinking` for why.
+     */
+    thinking?: 'off' | 'low'
+    /**
+     * Which model to ask, when the task is not the one `Config.model` is for.
+     *
+     * Scene description needs sight but not hearing, and checking a single boundary is a
+     * smaller question than either, so each names its own model rather than everything
+     * paying for the one that also listens.
+     */
+    model?: string
   }): Promise<Data> {
     // 本次工具的用量从这里开始记，避免和上一次调用混在一起。
     this.usage = []
     this.stages.reset()
     const content: Data[] = [{ type: 'video_url', video_url: { url } }, { type: 'text', text: prompt }]
+    // 调用方没指定时用部署配置；两者都没有就不改请求体。
+    const thinking = require?.thinking ?? this.config.extractionThinking
+    const model = require?.model ?? this.config.model
     let lastProblem = ''
     for (let attempt = 1; attempt <= Math.max(1, this.config.modelAttempts ?? 3); attempt++) {
-      const reply = await this.callModel(content, signal)
+      const reply = await this.callModel(content, signal, thinking, model)
       const text = reply.text
       const found = text === undefined ? undefined : firstJsonObject(text)
       if (found !== undefined) {
@@ -2904,8 +3781,24 @@ export class VideoWorkspace {
         lastProblem = text === undefined || text.trim() === '' ? '回复为空' : '回复里找不到完整 JSON 对象'
       }
       console.warn(`video-workspace: 第 ${attempt}/${this.config.modelAttempts ?? 3} 次模型回复不可用（${lastProblem}），重试并要求只输出 JSON`)
-      content.push({ role: 'assistant', content: text ?? '' })
-      content.push({ role: 'user', content: `上一次回复不可用：${lastProblem}。请只输出一个完整的 JSON 对象，不要任何解释、不要 Markdown 代码块。字段与结构必须与要求一致。` })
+      // 重试不再把上一次的回复回灌进对话。
+      //
+      // 这里原本 push 一条 assistant 消息带上模型的上一次回答，端点以
+      //   400 Missing required parameter: 'messages.[0].content[2].type'
+      // 整个拒绝 —— 它不接受 assistant 回复以裸字符串的形式放回 content 数组，
+      // 于是守卫挡住了坏结果，补救动作自己却崩掉，报出来的错误还与真正的原因无关。
+      // 实测连续两次踩到：一次是回复为空，一次是回复里 JSON 语法错。
+      //
+      // 改成把「原任务 + 这次哪里不对」合成一条新的 user 消息：请求体只剩
+      // video_url 与 text 两种 part，不可能再出现形状问题；坏回复本来也没有保留价值，
+      // 而任务说明保留下来才不会让模型丢掉上下文。
+      content.length = 0
+      content.push({ type: 'video_url', video_url: { url } })
+      content.push({
+        type: 'text',
+        text: `${prompt}\n\n上一次的输出不能用：${lastProblem}。请只输出一个完整的 JSON 对象，`
+          + '不要任何解释、不要 Markdown 代码块。字段与结构必须与要求一致。',
+      })
     }
     throw new Error(`模型连续 ${this.config.modelAttempts ?? 3} 次没有给出可用的 JSON（最后的问题：${lastProblem}）。可以把指令说得更具体，或缩小分析范围。`)
   }
@@ -2916,11 +3809,23 @@ export class VideoWorkspace {
    * The deadline covers the whole attempt including its backoff, so a request refused
    * repeatedly still ends inside the configured budget instead of running past it.
    */
-  private async callModel(content: Data[], signal: AbortSignal): Promise<{ text: string | undefined, reasoning: string | undefined }> {
+  private async callModel(content: Data[], signal: AbortSignal, thinking?: 'off' | 'low', model?: string): Promise<{ text: string | undefined, reasoning: string | undefined }> {
     const key = process.env[this.config.apiKeyEnv]
     if (!key) throw new Error(`model API key is missing: ${this.config.apiKeyEnv}`)
-    const body: Data = { model: this.config.model, temperature: 0, max_tokens: this.config.maxOutputTokens ?? 32_768, messages: [{ role: 'user', content }] }
+    const body: Data = { model: model ?? this.config.model, temperature: 0, max_tokens: this.config.maxOutputTokens ?? 32_768, messages: [{ role: 'user', content }] }
     if (this.config.reasoningEffort !== undefined && this.config.reasoningEffort !== '') body.reasoning_effort = this.config.reasoningEffort
+    // 提取任务的思考通道：关掉，或者压到最低。
+    //
+    // 实测该端点的行为：不传参数时模型会思考（一次「照抄一句话」也用了 159 推理
+    // tokens）；`enable_thinking: false` 与 `thinking: {type:'disabled'}` 都被接受，
+    // 推理量归零且答案不变；`reasoning_effort: 'low'` 仍会用掉几十个。
+    // 两个都发，是因为不同兼容端点认的字段名不同，实测这个端点两个都认。
+    if (thinking === 'off') {
+      body.enable_thinking = false
+      body.thinking = { type: 'disabled' }
+    } else if (thinking === 'low') {
+      body.reasoning_effort = 'low'
+    }
     const deadline = Date.now() + (this.config.modelTimeoutMs ?? 1_800_000)
     const started = Date.now()
     const attempts = Math.max(1, this.config.modelAttempts ?? 3)
@@ -3092,16 +3997,23 @@ export class VideoWorkspace {
   }
 
   /** Read stored evidence without computing it, or `undefined` when absent. */
-  private async cachedEvidence(assetId: string, kind: string): Promise<Data | undefined> {
-    const row = (await this.open()).prepare('SELECT payload FROM evidence WHERE asset_id=? AND kind=?').get(assetId, kind) as { payload: string } | undefined
+  private async cachedEvidence(assetId: string, kind: string, expectedProviderVersion?: string): Promise<Data | undefined> {
+    const row = (await this.open()).prepare('SELECT payload, provider_version FROM evidence WHERE asset_id=? AND kind=?').get(assetId, kind) as { payload: string, provider_version: string } | undefined
     if (row === undefined) return undefined
+    // 产出方式的版本变了，旧记录就不能再用。
+    //
+    // 缓存原本只按 (asset, kind) 命中，于是改进提取方式后，已经被算过一遍的素材
+    // 会永远返回旧结果 —— 修复对存量素材等于没有生效，而这恰恰是最需要它的地方
+    // （一条 43 分钟的视频只会被提取一次，之后再也不会重算）。
+    // provider_version 随项目清单往返 OSS，所以判断在本地也能做。
+    if (expectedProviderVersion !== undefined && row.provider_version !== expectedProviderVersion) return undefined
     return { asset_id: assetId, cached: true, ...(JSON.parse(row.payload) as Data) }
   }
 
   /** Store one evidence row and re-upload the project manifest so OSS carries it too. */
-  private async saveEvidence(projectId: string, assetId: string, kind: string, payload: Data, durationUs: number): Promise<void> {
+  private async saveEvidence(projectId: string, assetId: string, kind: string, payload: Data, durationUs: number, providerVersion?: string): Promise<void> {
     const db = await this.open()
-    db.prepare('INSERT OR REPLACE INTO evidence (asset_id,kind,duration_us,payload,provider,provider_version,created_at) VALUES (?,?,?,?,?,?,?)').run(assetId, kind, Math.round(durationUs), JSON.stringify(payload), kind === EVIDENCE_ACOUSTIC ? 'ffmpeg' : 'ffmpeg', 'pcm-rms-v1', Date.now())
+    db.prepare('INSERT OR REPLACE INTO evidence (asset_id,kind,duration_us,payload,provider,provider_version,created_at) VALUES (?,?,?,?,?,?,?)').run(assetId, kind, Math.round(durationUs), JSON.stringify(payload), kind === EVIDENCE_ACOUSTIC ? 'ffmpeg' : 'ffmpeg', providerVersion ?? EVIDENCE_PROVIDER_VERSION, Date.now())
     await this.manifest(projectId)
   }
 
