@@ -59,13 +59,18 @@ if (!existsSync(join(profileDir, 'node_modules', 'dsh-video-workspace'))) {
 const profileConfigSource = join(root, 'config', 'profile', 'cordis.patch.yml')
 const profileConfigTarget = join(profileDir, 'cordis.patch.yml')
 try {
-  if (existsSync(profileConfigSource)) {
-    const wanted = readFileSync(profileConfigSource)
-    const current = existsSync(profileConfigTarget) ? readFileSync(profileConfigTarget) : null
-    if (current === null || !current.equals(wanted)) {
-      writeFileSync(profileConfigTarget, wanted)
-      console.log('profile 配置已同步：config/profile/cordis.patch.yml → runtime/home/profiles/video/')
-    }
+  if (!existsSync(profileConfigSource)) {
+    fail(
+      `找不到仓库 profile 配置 ${profileConfigSource}`,
+      '不能在缺少源配置时继续使用可能过期的运行时提示词与插件配置',
+    )
+  }
+
+  const wanted = readFileSync(profileConfigSource)
+  const current = existsSync(profileConfigTarget) ? readFileSync(profileConfigTarget) : null
+  if (current === null || !current.equals(wanted)) {
+    writeFileSync(profileConfigTarget, wanted)
+    console.log('profile 配置已同步：config/profile/cordis.patch.yml → runtime/home/profiles/video/')
   }
 } catch (error) {
   fail(
