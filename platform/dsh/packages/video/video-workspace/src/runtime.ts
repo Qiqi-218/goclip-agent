@@ -783,6 +783,9 @@ export class VideoWorkspace {
     const ocrRow = db.prepare('SELECT payload FROM evidence WHERE asset_id=? AND kind=?').get(assetId, EVIDENCE_OCR) as { payload: string } | undefined
     const asrRow = db.prepare('SELECT payload FROM evidence WHERE asset_id=? AND kind=?').get(assetId, EVIDENCE_TRANSCRIPT) as { payload: string } | undefined
     const visualRow = db.prepare('SELECT payload FROM evidence WHERE asset_id=? AND kind=?').get(assetId, EVIDENCE_VISUAL) as { payload: string } | undefined
+    if (asrRow === undefined) missing.push('还没算过语音转写：video_evidence_transcript')
+    if (ocrRow === undefined) missing.push('还没算过屏幕文字：video_evidence_ocr')
+    if (visualRow === undefined) missing.push('还没算过画面描述：video_evidence_visual')
     if (ocrRow !== undefined) {
       const entries = (JSON.parse(ocrRow.payload) as { entries?: Data[] }).entries ?? []
       for (const entry of entries) {
@@ -1765,6 +1768,19 @@ export class VideoWorkspace {
     const source = await this.stages.timed('准备素材', () => this.materialize(asset.path, signal))
     try {
       const duration = Number((await this.probe(source.path, signal)).duration_us) || 0
+      const hasAudio = (await this.run('ffprobe', [
+        '-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=index', '-of', 'csv=p=0', source.path,
+      ], signal)).stdout.trim() !== ''
+      if (!hasAudio) {
+        const record = {
+          lines: [],
+          line_count: 0,
+          duration_us: duration,
+          note: '素材没有音轨，因此没有可转写的语音内容。',
+        }
+        await this.saveEvidence(projectId, assetId, EVIDENCE_TRANSCRIPT, record, duration, EVIDENCE_PROVIDER_VERSION)
+        return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
+      }
       // 把音频单独交给识别模型，而不是把整段视频交给多模态模型。
       //
       // 后者是这条链路上代价最高的一次失败：43 分钟素材花了 192 秒，思考通道吃掉
@@ -3444,7 +3460,7 @@ export class VideoWorkspace {
     const notComputed: string[] = []
     for (const kind of ALL_EVIDENCE_KINDS) {
       const found = kinds[kind]
-      if (found === undefined || found.count === 0) { notComputed.push(kind); continue }
+      if (found === undefined) { notComputed.push(kind); continue }
       done.push({
         kind,
         from_seconds: found.from_seconds,
@@ -3453,8 +3469,10 @@ export class VideoWorkspace {
         covers_picture: found.covers_picture,
         // 缺口的措辞要明确指向「这段时间没有这类证据」，而不是留一个数字让调用方猜。
         stops_short_by_seconds: found.gap_to_picture_end_seconds,
-        note: found.covers_picture
-          ? null
+        note: found.count === 0
+          ? '已计算，但没有发现这一类证据。'
+          : found.covers_picture
+            ? null
           : `这一类只覆盖到 ${found.to_seconds}s，画面总长 ${round2(pictureSeconds)}s —— 之后的 ${found.gap_to_picture_end_seconds}s 没有这类证据。落在那个范围里的内容，任何检索都找不到它。`,
       })
     }
@@ -3542,8 +3560,9 @@ export class VideoWorkspace {
     }
     // 有显式区间的类型，两种字段命名各试一次。
     const items = [payload.lines, payload.entries, payload.scenes, payload.silences]
-      .find(candidate => Array.isArray(candidate) && candidate.length > 0) as Data[] | undefined
+      .find(candidate => Array.isArray(candidate)) as Data[] | undefined
     if (items === undefined) return null
+    if (items.length === 0) return { fromSeconds: 0, toSeconds: 0, count: 0 }
     const starts: number[] = []
     const ends: number[] = []
     for (const item of items) {
@@ -3863,7 +3882,7 @@ export class VideoWorkspace {
         // 覆盖而非追加：重试时调用方只为最终那次回答付费。
         this.usage = [{
           provider: 'bailian',
-          model: String(this.config.model),
+          model: String(model ?? this.config.model),
           ms: Date.now() - started,
           text_tokens: details?.text_tokens ?? Math.max(0, (parsed.usage?.completion_tokens ?? 0) - reasoningTokens),
           reasoning_tokens: reasoningTokens,
@@ -4013,7 +4032,12 @@ export class VideoWorkspace {
   /** Store one evidence row and re-upload the project manifest so OSS carries it too. */
   private async saveEvidence(projectId: string, assetId: string, kind: string, payload: Data, durationUs: number, providerVersion?: string): Promise<void> {
     const db = await this.open()
-    db.prepare('INSERT OR REPLACE INTO evidence (asset_id,kind,duration_us,payload,provider,provider_version,created_at) VALUES (?,?,?,?,?,?,?)').run(assetId, kind, Math.round(durationUs), JSON.stringify(payload), kind === EVIDENCE_ACOUSTIC ? 'ffmpeg' : 'ffmpeg', providerVersion ?? EVIDENCE_PROVIDER_VERSION, Date.now())
+    const provider = kind === EVIDENCE_ACOUSTIC || kind === EVIDENCE_SHOTS || kind === EVIDENCE_TIMING
+      ? 'ffmpeg'
+      : kind === EVIDENCE_TRANSCRIPT ? this.config.asrModel
+        : kind === EVIDENCE_OCR ? this.config.ocrModel
+          : kind === EVIDENCE_VISUAL ? this.config.visionModel : kind
+    db.prepare('INSERT OR REPLACE INTO evidence (asset_id,kind,duration_us,payload,provider,provider_version,created_at) VALUES (?,?,?,?,?,?,?)').run(assetId, kind, Math.round(durationUs), JSON.stringify(payload), provider, providerVersion ?? EVIDENCE_PROVIDER_VERSION, Date.now())
     await this.manifest(projectId)
   }
 
