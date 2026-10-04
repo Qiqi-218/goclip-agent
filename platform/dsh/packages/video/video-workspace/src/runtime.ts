@@ -6,7 +6,9 @@ import { access, mkdir, readFile, writeFile, readdir, rename, rm, stat } from 'n
 import { basename, dirname, extname, join, resolve } from 'node:path'
 import { execFile as nodeExecFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { createCanvas } from '@napi-rs/canvas'
 import type { DatabaseSync } from 'node:sqlite'
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { Config } from './config.ts'
 import { curveFromPcm, loudSpans, summarize } from './acoustic.ts'
 import { buildShots, parseSceneTimes, summarizeShots } from './shots.ts'
@@ -55,6 +57,7 @@ const EMPTY_ANSWER_REASONING_FLOOR = 6000
  * extracted before it is not the same data as one extracted after.
  */
 const EVIDENCE_PROVIDER_VERSION = 'omni-v2-windowed'
+const TRANSCRIPT_PROVIDER_VERSION = 'asr-v2-chunked'
 
 /**
  * Frame rate for a trimmed window's proxy, against the 1 fps used for a whole asset.
@@ -108,8 +111,52 @@ const ALL_EVIDENCE_KINDS = [
  */
 const ORDINAL_PARKING = -1000
 
+type SubtitleStyle = {
+  font_family?: string
+  font_size?: number
+  font_weight?: 'normal' | 'bold'
+  text_color?: string
+  outline_color?: string
+  outline_width?: number
+  position?: 'top-left' | 'top-center' | 'top-right' | 'center-left' | 'center' | 'center-right' | 'bottom-left' | 'bottom-center' | 'bottom-right'
+  background_color?: string
+  background_opacity?: number
+  shadow_color?: string
+  shadow_blur?: number
+  shadow_offset_x?: number
+  shadow_offset_y?: number
+}
+
 /** Round a duration to two decimals; clip lengths are not worth more precision. */
 function round2(value: number): number { return Math.round(value * 100) / 100 }
+
+/**
+ * FFmpeg's atempo accepts one factor from 0.5 to 2.0. A clip can legitimately be
+ * much slower or faster than that, so express its requested speed as a chain rather
+ * than clamping it (which would silently make the audio disagree with the video).
+ */
+function tempoFilters(speed: number): string[] {
+  const filters: string[] = []
+  let remaining = speed
+  while (remaining > 2) { filters.push('atempo=2'); remaining /= 2 }
+  while (remaining < 0.5) { filters.push('atempo=0.5'); remaining /= 0.5 }
+  if (Math.abs(remaining - 1) > 1e-9) filters.push(`atempo=${remaining.toFixed(6)}`)
+  return filters
+}
+
+/** Wrap CJK and Latin subtitle text to the actual available pixel width. */
+function subtitleLines(context: { measureText(text: string): { width: number } }, text: string, maxWidth: number): string[] {
+  const lines: string[] = []
+  for (const paragraph of text.replace(/\r/g, '').split('\n')) {
+    let line = ''
+    for (const char of Array.from(paragraph)) {
+      const candidate = line + char
+      if (line !== '' && context.measureText(candidate).width > maxWidth) { lines.push(line); line = char } else line = candidate
+    }
+    if (line !== '' || paragraph === '') lines.push(line)
+  }
+  return lines.length === 0 ? [''] : lines
+}
 
 const HIGHLIGHT_QUERY_WORDS = ['高光', '精彩', '亮点', '好看', '名场面', '精华', '高燃', 'highlight']
 
@@ -222,6 +269,15 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS projects(
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL
+);
+-- Local work remains usable while OSS is temporarily unavailable.  This row is the
+-- durable reminder to publish the newest project snapshot once connectivity returns.
+CREATE TABLE IF NOT EXISTS project_sync(
+  project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  status TEXT NOT NULL,
+  error TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS assets(
   id TEXT PRIMARY KEY,
@@ -389,6 +445,9 @@ export class VideoWorkspace {
     this.db = db
     this.repairStoredAnalyses(db)
     await this.restore()
+    // A failed manifest upload must not make startup unusable.  Existing local rows are
+    // authoritative for this process, and pending projects are retried in the background.
+    void this.retryPendingManifests().catch(error => console.warn(`video-workspace: 重试待同步项目失败：${error instanceof Error ? error.message : String(error)}`))
     return db
   }
 
@@ -614,7 +673,7 @@ export class VideoWorkspace {
    * `oss_key` identifies the proxy video a previous run uploaded, so an identical request
    * repeats neither the upload nor the model call.
    */
-  async understand(projectId: string, assetId: string, instruction: string | undefined, signal: AbortSignal): Promise<Data> {
+  async understand(projectId: string, assetId: string, instruction: string | undefined, signal: AbortSignal, onProgress?: (value: JsonValue) => void): Promise<Data> {
     const asset = await this.asset(projectId, assetId)
     const db = await this.open()
     const request = instruction ?? DEFAULT_INSTRUCTION
@@ -629,7 +688,7 @@ export class VideoWorkspace {
         this.stages.skipped('生成代理视频', '复用已保存的分析，未重新生成代理')
         this.stages.skipped('上传代理视频', '复用已保存的分析，未重新上传')
         this.stages.skipped('模型理解', '同一素材 + 同一指令已分析过，直接复用')
-        return { asset_id: assetId, ...previous, reused: true, stages: this.stages.snapshot() }
+        return { asset_id: assetId, ...previous, reused: true, sync: await this.syncStatus(projectId), stages: this.stages.snapshot() }
       }
     }
     if (!asset.path.startsWith('oss://')) this.stages.skipped('下载素材', '素材就是本地文件，无需从 OSS 下载')
@@ -641,7 +700,7 @@ export class VideoWorkspace {
       this.usage = []
       this.stages.reset()
       const run = await this.askChunks({
-        projectId, assetId, sourcePath: source.path, durationUs: duration, operation: 'understand', input: { instruction: request }, signal,
+        projectId, assetId, sourcePath: source.path, durationUs: duration, operation: 'understand', input: { instruction: request }, signal, progress: onProgress,
         prompt: window => `这是原视频第 ${round2(window.startUs / 1e6)} 到 ${round2(window.endUs / 1e6)} 秒的截取。分析此视频并${request}。只返回 JSON：{"summary":"","segments":[{"start_us":0,"end_us":1,"visual":"","audio":"","tags":[""],"is_highlight":false,"highlight_reason":"","confidence":0.0}]}。所有时间戳必须相对此截取开头；segments 覆盖这段截取；is_highlight 只标真正值得单独剪出的高光；不确定就留空或 false，不要编造。`,
       })
       const segments = this.dedupeRanges(run.chunks.flatMap(chunk => this.shiftRanges(chunk.data.segments, chunk.startUs, duration)))
@@ -657,7 +716,7 @@ export class VideoWorkspace {
       // 覆盖区间随理解结果一起返回，理由：调用方在决定「要定位某句话」之前就该知道
       // 语音转写覆盖到哪。实测那次会话里，转写标记为「有」而实际只到 1644s，
       // 模型为 12 句落在那之后的话去重看整片，花了 94.5 秒找一个不存在的东西。
-      return { asset_id: assetId, ...record, reused: false, evidence_coverage: await this.evidenceCoverage(assetId), stages: this.stages.snapshot() }
+      return { asset_id: assetId, ...record, reused: false, evidence_coverage: await this.evidenceCoverage(assetId), sync: await this.syncStatus(projectId), stages: this.stages.snapshot() }
       // 代理视频是缓存，留着给下次复用；只有下载来的源文件要清掉。
     } finally { await source.cleanup() }
   }
@@ -953,7 +1012,7 @@ export class VideoWorkspace {
    * the same letters.
    */
   private relevance(segment: Data, needle: string, words: string[]): number { const confidence = typeof segment.confidence === 'number' ? segment.confidence : 0; if (HIGHLIGHT_QUERY_WORDS.includes(needle)) return segment.is_highlight === true ? 2000 + confidence : 0; const text = this.segmentText(segment); if (text === '') return 0; const rawTags = segment.tags; const tags = Array.isArray(rawTags) ? rawTags.filter((tag): tag is string => typeof tag === 'string').map(tag => tag.toLowerCase()) : []; if (tags.includes(needle)) return 1000 + confidence; const fields = ['visual','audio','summary','highlight_reason','reason'].map(field => segment[field]).filter((value): value is string => typeof value === 'string').map(value => value.toLowerCase()); if (fields.some(value => value === needle)) return 900 + confidence; if (text.includes(needle)) return 500 + confidence; const hits = words.filter(word => text.includes(word)).length; if (hits === 0) return 0; return 100 * (hits / words.length) + confidence }
-  async find(projectId: string, assetId: string, subject: string, signal: AbortSignal): Promise<Data> { const asset = await this.asset(projectId, assetId); this.stages.reset(); const source = await this.stages.timed('下载素材', () => this.materialize(asset.path, signal)); try { const duration = (await this.durationOf(assetId)) ?? 0; this.usage = []; const run = await this.askChunks({ projectId, assetId, sourcePath: source.path, durationUs: duration, operation: 'find', input: { subject }, signal, prompt: window => `这是原视频第 ${round2(window.startUs / 1e6)} 到 ${round2(window.endUs / 1e6)} 秒的截取。在这段视频里找出“${subject}”出现的时间段。\n只返回 JSON：{"matches":[{"start_us":0,"end_us":1,"reason":"","confidence":0.0}]}\n所有时间戳必须相对此截取开头。命中几处就返回几段；确实没有就返回 {"matches":[]}；不要编造。` }); const result: Data = { matches: this.dedupeRanges(run.chunks.flatMap(chunk => this.shiftRanges(chunk.data.matches, chunk.startUs, duration)), 'reason'), status: run.failed.length === 0 ? 'completed' : 'partial', chunking: { enabled: run.chunked, completed_chunks: run.chunks.length, failed_chunks: run.failed } }
+  async find(projectId: string, assetId: string, subject: string, signal: AbortSignal, onProgress?: (value: JsonValue) => void): Promise<Data> { const asset = await this.asset(projectId, assetId); this.stages.reset(); const source = await this.stages.timed('下载素材', () => this.materialize(asset.path, signal)); try { const duration = (await this.durationOf(assetId)) ?? 0; this.usage = []; const run = await this.askChunks({ projectId, assetId, sourcePath: source.path, durationUs: duration, operation: 'find', input: { subject }, signal, progress: onProgress, prompt: window => `这是原视频第 ${round2(window.startUs / 1e6)} 到 ${round2(window.endUs / 1e6)} 秒的截取。在这段视频里找出“${subject}”出现的时间段。\n只返回 JSON：{"matches":[{"start_us":0,"end_us":1,"reason":"","confidence":0.0}]}\n所有时间戳必须相对此截取开头。命中几处就返回几段；确实没有就返回 {"matches":[]}；不要编造。` }); const result: Data = { matches: this.dedupeRanges(run.chunks.flatMap(chunk => this.shiftRanges(chunk.data.matches, chunk.startUs, duration)), 'reason'), status: run.failed.length === 0 ? 'completed' : 'partial', chunking: { enabled: run.chunked, completed_chunks: run.chunks.length, failed_chunks: run.failed } }
       const cleaned = this.sanitizeRanges(result.matches, duration)
       // 模型给的是粗略区间；这里用录音自身的物理边界把它收敛到可剪的位置。
       const tolerance = (this.config.refineToleranceSeconds ?? 1.5) * 1e6
@@ -1746,7 +1805,7 @@ export class VideoWorkspace {
    */
   async ocrEvidence(projectId: string, assetId: string, signal: AbortSignal): Promise<Data> {
     const cached = await this.cachedEvidence(assetId, EVIDENCE_OCR, EVIDENCE_PROVIDER_VERSION)
-    if (cached !== undefined) return cached
+    if (cached !== undefined) return { ...cached, sync: await this.syncStatus(projectId) }
     const asset = await this.asset(projectId, assetId)
     this.stages.reset()
     const source = await this.stages.timed('准备素材', () => this.materialize(asset.path, signal))
@@ -1767,7 +1826,7 @@ export class VideoWorkspace {
           : entries.length === 0 ? '没有读出屏幕文字。若这段视频本来就没有字幕或图表，这是正确结果。' : null,
       }
       await this.saveEvidence(projectId, assetId, EVIDENCE_OCR, record, duration, EVIDENCE_PROVIDER_VERSION)
-      return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
+      return { asset_id: assetId, cached: false, ...record, sync: await this.syncStatus(projectId), stages: this.stages.snapshot() }
     } finally { await source.cleanup() }
   }
 
@@ -1789,9 +1848,9 @@ export class VideoWorkspace {
    * @param signal - cancellation for the transcode, upload and model call.
    * @returns Spoken lines with their times.
    */
-  async transcriptEvidence(projectId: string, assetId: string, signal: AbortSignal): Promise<Data> {
-    const cached = await this.cachedEvidence(assetId, EVIDENCE_TRANSCRIPT, EVIDENCE_PROVIDER_VERSION)
-    if (cached !== undefined) return cached
+  async transcriptEvidence(projectId: string, assetId: string, signal: AbortSignal, onProgress?: (value: JsonValue) => void): Promise<Data> {
+    const cached = await this.cachedEvidence(assetId, EVIDENCE_TRANSCRIPT, TRANSCRIPT_PROVIDER_VERSION)
+    if (cached !== undefined) return { ...cached, sync: await this.syncStatus(projectId) }
     const asset = await this.asset(projectId, assetId)
     this.stages.reset()
     const source = await this.stages.timed('准备素材', () => this.materialize(asset.path, signal))
@@ -1807,31 +1866,68 @@ export class VideoWorkspace {
           duration_us: duration,
           note: '素材没有音轨，因此没有可转写的语音内容。',
         }
-        await this.saveEvidence(projectId, assetId, EVIDENCE_TRANSCRIPT, record, duration, EVIDENCE_PROVIDER_VERSION)
-        return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
+        await this.saveEvidence(projectId, assetId, EVIDENCE_TRANSCRIPT, record, duration, TRANSCRIPT_PROVIDER_VERSION)
+        return { asset_id: assetId, cached: false, ...record, sync: await this.syncStatus(projectId), stages: this.stages.snapshot() }
       }
-      // 把音频单独交给识别模型，而不是把整段视频交给多模态模型。
-      //
-      // 后者是这条链路上代价最高的一次失败：43 分钟素材花了 192 秒，思考通道吃掉
-      // 16384 token 后结构化输出为空，还被存成「这段视频没有人声」，随后引出 21 次
-      // 整片重看（838 秒）。分窗也没救回来 —— 三种窗口尺寸都拿不到完整覆盖。
-      // 换成识别模型后同一条素材 41 秒跑完，且专有名词全对。
-      const audio = await this.stages.timed('提取音轨', () => this.extractAudio(source.path, signal))
-      const key = `${this.config.ossPrefix.replace(/\/$/, '')}/asr-source-${randomUUID()}.m4a`
-      const url = await this.stages.timed('上传音频', () => this.uploadFile(audio, key, 'audio/mp4'))
-      const sentences = await this.stages.timed('语音识别', () => this.recognizeSpeech(url, signal))
-      const lines = this.sanitizeRanges(sentences, duration)
-        .map(line => ({ ...line, text: String(line.text ?? '').trim() }))
-        .filter(line => line.text !== '')
+      // 长音频也按和视频理解相同的窗口切开：每段独立上传、独立识别，
+      // 某一段损坏或超时不会让整条视频的转写归零。
+      const audioEnd = await this.audioEndSeconds(source.path, signal)
+      const windows = this.modelWindows(duration)
+      const chunks: Data[] = []
+      const allLines: Data[] = []
+      for (const [index, window] of windows.entries()) {
+        const chunkProgress: Data = {
+          index: index + 1,
+          start_us: window.startUs,
+          end_us: window.endUs,
+          status: 'pending',
+          line_count: 0,
+        }
+        onProgress?.({ type: 'chunk', operation: 'transcript', status: 'running', index: index + 1, total: windows.length, start_us: window.startUs, end_us: window.endUs })
+        if (window.startUs / 1e6 >= audioEnd) {
+          chunkProgress.status = 'no_audio'
+          chunkProgress.note = '该分段超出音轨末尾。'
+          chunks.push(chunkProgress)
+          this.stages.skipped(`ASR 分片 ${index + 1}/${windows.length}`, '该时间段没有音频')
+          onProgress?.({ type: 'chunk', operation: 'transcript', ...chunkProgress } as unknown as JsonValue)
+          continue
+        }
+        try {
+          const endSeconds = Math.min(window.endUs / 1e6, audioEnd)
+          const audio = await this.stages.timed(`提取 ASR 音频 ${index + 1}/${windows.length}`, () => this.extractAudioWindow(source.path, window.startUs / 1e6, endSeconds, signal))
+          const key = `${this.config.ossPrefix.replace(/\/$/, '')}/asr-chunks/${assetId}/${window.startUs}-${window.endUs}-${randomUUID()}.m4a`
+          const url = await this.stages.timed(`上传 ASR 分片 ${index + 1}/${windows.length}`, () => this.uploadFile(audio, key, 'audio/mp4', `上传 ASR 分片 ${index + 1}/${windows.length}`))
+          const sentences = await this.stages.timed(`识别 ASR 分片 ${index + 1}/${windows.length}`, () => this.recognizeSpeech(url, signal))
+          const lines = this.sanitizeRanges(sentences, Math.round((endSeconds - window.startUs / 1e6) * 1e6))
+            .map(line => ({ ...line, start_us: Number(line.start_us) + window.startUs, end_us: Number(line.end_us) + window.startUs, text: String(line.text ?? '').trim() }))
+            .filter(line => line.text !== '')
+          allLines.push(...lines)
+          chunkProgress.status = 'completed'
+          chunkProgress.line_count = lines.length
+          chunks.push(chunkProgress)
+          onProgress?.({ type: 'chunk', operation: 'transcript', ...chunkProgress } as unknown as JsonValue)
+        } catch (error) {
+          chunkProgress.status = 'failed'
+          chunkProgress.error = error instanceof Error ? error.message : String(error)
+          chunks.push(chunkProgress)
+          onProgress?.({ type: 'chunk', operation: 'transcript', ...chunkProgress } as unknown as JsonValue)
+        }
+      }
+      const lines = this.dedupeRanges(this.sanitizeRanges(allLines, duration), 'text')
+      const failedChunks = chunks.filter(chunk => chunk.status === 'failed')
       const record = {
         lines,
         line_count: lines.length,
         duration_us: duration,
-        status: 'completed',
-        note: lines.length === 0 ? '没有转写出说话内容。若这段视频本来就没有人声，这是正确结果。' : null,
+        status: failedChunks.length === 0 ? 'completed' : 'partial',
+        chunking: { enabled: windows.length > 1, total_chunks: windows.length, completed_chunks: chunks.filter(chunk => chunk.status === 'completed').length, failed_chunks: failedChunks.map(chunk => ({ start_us: chunk.start_us, end_us: chunk.end_us, error: chunk.error })) },
+        chunks,
+        note: failedChunks.length > 0
+          ? '部分 ASR 分片失败，已保留其它分片的转写结果。'
+          : lines.length === 0 ? '没有转写出说话内容。若这段视频本来就没有人声，这是正确结果。' : null,
       }
-      await this.saveEvidence(projectId, assetId, EVIDENCE_TRANSCRIPT, record, duration, EVIDENCE_PROVIDER_VERSION)
-      return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
+      await this.saveEvidence(projectId, assetId, EVIDENCE_TRANSCRIPT, record, duration, TRANSCRIPT_PROVIDER_VERSION)
+      return { asset_id: assetId, cached: false, ...record, sync: await this.syncStatus(projectId), stages: this.stages.snapshot() }
     } finally { await source.cleanup() }
   }
 
@@ -1854,7 +1950,7 @@ export class VideoWorkspace {
    */
   async visualEvidence(projectId: string, assetId: string, signal: AbortSignal): Promise<Data> {
     const cached = await this.cachedEvidence(assetId, EVIDENCE_VISUAL, EVIDENCE_PROVIDER_VERSION)
-    if (cached !== undefined) return cached
+    if (cached !== undefined) return { ...cached, sync: await this.syncStatus(projectId) }
     const asset = await this.asset(projectId, assetId)
     this.stages.reset()
     const source = await this.stages.timed('准备素材', () => this.materialize(asset.path, signal))
@@ -1897,7 +1993,7 @@ export class VideoWorkspace {
         failed_windows: failedWindows.length === 0 ? null : failedWindows.map(index => index + 1),
       }
       await this.saveEvidence(projectId, assetId, EVIDENCE_VISUAL, record, duration, EVIDENCE_PROVIDER_VERSION)
-      return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
+      return { asset_id: assetId, cached: false, ...record, sync: await this.syncStatus(projectId), stages: this.stages.snapshot() }
     } finally { await source.cleanup() }
   }
 
@@ -2005,6 +2101,81 @@ export class VideoWorkspace {
     }
   }
 
+  /** Burn timed cues without FFmpeg's optional libass/subtitles filter. */
+  private async burnCanvasSubtitles(output: string, burned: string, cues: Array<{ start_us: number, end_us: number, text: string }>, work: string, signal: AbortSignal, style: SubtitleStyle = {}): Promise<void> {
+    const media = await this.probe(output, signal)
+    const width = Number(media.width)
+    const height = Number(media.height)
+    if (!(width > 0 && height > 0)) throw new Error('无法烧录字幕：成片没有可用的画面尺寸。')
+    const overlayHeight = Math.max(120, Math.round(height * 0.3))
+    const fontSize = Math.max(16, Math.round((style.font_size ?? this.config.subtitleFontSize ?? 22) * width / 640))
+    const lineHeight = Math.round(fontSize * 1.32)
+    const margin = Math.max(18, Math.round(height * 0.025))
+    const font = (style.font_family ?? this.config.subtitleFont ?? 'Hiragino Sans GB').replace(/"/g, '')
+    const position = style.position ?? 'bottom-center'
+    const horizontal = position.endsWith('left') ? 'left' : position.endsWith('right') ? 'right' : 'center'
+    const vertical = position.startsWith('top') ? 'top' : position.startsWith('center') ? 'center' : 'bottom'
+    const textColor = style.text_color ?? '#FFFFFF'
+    const outlineColor = style.outline_color ?? '#000000'
+    const outlineWidth = Math.max(0, style.outline_width ?? 3)
+    const backgroundColor = style.background_color
+    const backgroundOpacity = Math.max(0, Math.min(1, style.background_opacity ?? 0.72))
+    const dir = join(work, 'subtitle-overlays')
+    await mkdir(dir, { recursive: true })
+    const paths: string[] = []
+    for (const [index, cue] of cues.entries()) {
+      const canvas = createCanvas(width, overlayHeight)
+      const context = canvas.getContext('2d')
+      context.font = `${style.font_weight ?? 'bold'} ${fontSize}px "${font}", "Hiragino Sans GB", sans-serif`
+      context.textAlign = horizontal
+      context.textBaseline = 'alphabetic'
+      context.lineJoin = 'round'
+      const lines = subtitleLines(context, cue.text, width - margin * 2)
+      const totalTextHeight = lineHeight * lines.length
+      const textTop = vertical === 'top' ? margin : vertical === 'center' ? (overlayHeight - totalTextHeight) / 2 : overlayHeight - margin - totalTextHeight
+      const firstBaseline = textTop + fontSize
+      const textX = horizontal === 'left' ? margin : horizontal === 'right' ? width - margin : width / 2
+      const lineWidths = lines.map(line => context.measureText(line).width)
+      const boxWidth = Math.min(width - margin * 2, Math.max(...lineWidths) + margin * 2)
+      const boxX = horizontal === 'left' ? margin - margin / 2 : horizontal === 'right' ? width - margin - boxWidth + margin / 2 : (width - boxWidth) / 2
+      if (backgroundColor !== undefined && backgroundOpacity > 0) {
+        context.fillStyle = backgroundColor
+        context.globalAlpha = backgroundOpacity
+        context.fillRect(boxX, textTop - margin / 2, boxWidth, totalTextHeight + margin)
+        context.globalAlpha = 1
+      }
+      context.lineWidth = outlineWidth
+      context.strokeStyle = outlineColor
+      context.fillStyle = textColor
+      context.shadowColor = style.shadow_color ?? 'transparent'
+      context.shadowBlur = Math.max(0, style.shadow_blur ?? 0)
+      context.shadowOffsetX = style.shadow_offset_x ?? 0
+      context.shadowOffsetY = style.shadow_offset_y ?? 0
+      lines.forEach((line, lineIndex) => {
+        const y = firstBaseline + lineIndex * lineHeight
+        context.strokeText(line, textX, y)
+        context.fillText(line, textX, y)
+      })
+      const path = join(dir, `${String(index).padStart(5, '0')}.png`)
+      await writeFile(path, canvas.toBuffer('image/png'))
+      paths.push(path)
+    }
+    const args = ['-nostdin', '-y', '-i', output]
+    for (const path of paths) args.push('-loop', '1', '-framerate', '30', '-i', path)
+    let previous = '[0:v]'
+    const filters: string[] = []
+    for (const [index, cue] of cues.entries()) {
+      const next = `[subtitle${index}]`
+      const start = (cue.start_us / 1e6).toFixed(6)
+      const end = (cue.end_us / 1e6).toFixed(6)
+      const overlayY = (style.position ?? 'bottom-center').startsWith('top') ? '0' : (style.position ?? 'bottom-center').startsWith('center') ? '(H-h)/2' : 'H-h'
+      filters.push(`${previous}[${index + 1}:v]overlay=x=0:y=${overlayY}:shortest=1:enable='between(t,${start},${end})'${next}`)
+      previous = next
+    }
+    args.push('-filter_complex', filters.join(';'), '-map', previous, '-map', '0:a?', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-shortest', burned)
+    await this.run('ffmpeg', args, signal)
+  }
+
   /**
    * Collect everything the evidence says about one range.
    *
@@ -2067,7 +2238,7 @@ export class VideoWorkspace {
    * @param signal - cancellation for the download, upload and model call.
    * @returns Candidate ranges, each with why it was called similar.
    */
-  async findSimilar(a: { project_id: string, asset_id: string, start_us: number, end_us: number }, signal: AbortSignal): Promise<Data> {
+  async findSimilar(a: { project_id: string, asset_id: string, start_us: number, end_us: number }, signal: AbortSignal, onProgress?: (value: JsonValue) => void): Promise<Data> {
     const asset = await this.asset(a.project_id, a.asset_id)
     const duration = await this.durationOf(a.asset_id)
     const start = Math.max(0, Math.round(a.start_us))
@@ -2093,7 +2264,7 @@ export class VideoWorkspace {
       ].filter(line => line !== '').join('\n')
       this.usage = []
       const run = await this.askChunks({
-        projectId: a.project_id, assetId: a.asset_id, sourcePath: source.path, durationUs: duration ?? 0, operation: 'similar', input: { start, end, reference }, signal,
+        projectId: a.project_id, assetId: a.asset_id, sourcePath: source.path, durationUs: duration ?? 0, operation: 'similar', input: { start, end, reference }, signal, progress: onProgress,
         prompt: window => [
         `这是原视频第 ${round2(window.startUs / 1e6)} 到 ${round2(window.endUs / 1e6)} 秒的截取。原视频第 ${round2(start / 1e6)} 秒到第 ${round2(end / 1e6)} 秒这一段，内容是这样的：`,
         reference,
@@ -2423,7 +2594,7 @@ export class VideoWorkspace {
    * neighbour was copied keeps the join honest by matching the copy path's codec
    * parameters; the two cannot be mixed, so the decision is made once for the export.
    */
-  async render(timelineId: string, filename: string | undefined, signal: AbortSignal, options: { aspect?: 'keep' | '16:9' | '9:16' | '1:1', focus?: 'left' | 'center' | 'right', burnSubtitles?: 'transcript' | 'screen-text' } = {}): Promise<Data> {
+  async render(timelineId: string, filename: string | undefined, signal: AbortSignal, options: { aspect?: 'keep' | '16:9' | '9:16' | '1:1', focus?: 'left' | 'center' | 'right', burnSubtitles?: 'transcript' | 'screen-text', subtitleStyle?: SubtitleStyle } = {}): Promise<Data> {
     const timeline = await this.timeline(timelineId) as { project_id: string, segments: Array<{ asset_id: string, start_us: number, end_us: number, speed: number, muted: number }> }
     const clips = timeline.segments
     if (clips.length === 0) throw new Error(`时间线 ${timelineId} 没有任何片段，无法导出。`)
@@ -2532,7 +2703,12 @@ export class VideoWorkspace {
           // 帧率也统一：否则 -c copy 拼出来的文件时长会与声明不符。
           videoFilters.push('fps=30')
         }
-        if (clip.speed !== 1) videoFilters.push(`setpts=${(1 / clip.speed).toFixed(6)}*PTS`)
+        if (clip.speed !== 1) {
+          // 变速必须同时作用于两条流。此前只有 setpts，视频会先结束但原速音轨
+          // 仍把 MP4 的总时长拖回素材长度；计划和 SRT 按 speed 计算，成片却不是。
+          videoFilters.push(`setpts=${(1 / clip.speed).toFixed(6)}*PTS`)
+          audioFilters.push(...tempoFilters(clip.speed))
+        }
         if (frameFilter !== null) videoFilters.push(frameFilter)
         if (clip.muted === 1) audioFilters.push('volume=0')
         const gain = gains[index] ?? 0
@@ -2593,20 +2769,10 @@ export class VideoWorkspace {
         if (mapped.cues.length === 0) {
           notes.push(`要求烧录字幕，但这条时间线覆盖的片段里没有${burnSource === 'screen-text' ? '屏幕文字' : '语音转写'}证据，成片不含字幕。先调用 video_evidence_${burnSource === 'screen-text' ? 'ocr' : 'transcript'}。`)
         } else {
-          const srt = join(work, 'burn.srt')
-          await writeFile(srt, renderSrt(mapped.cues), 'utf8')
           const burned = join(work, `burned-${name}`)
-          // subtitles 滤镜把文件名当滤镜参数解析，路径里的冒号、反斜杠、单引号都要转义，
-          // 否则 Windows 路径会被当成选项分隔符。
-          const escaped = srt.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'")
-          await this.stages.timed('烧录字幕', () => this.run('ffmpeg', [
-            '-nostdin', '-y', '-i', output,
-            '-vf', `subtitles='${escaped}':force_style='FontName=${this.config.subtitleFont ?? 'Microsoft YaHei'},FontSize=${this.config.subtitleFontSize ?? 22},Outline=2,Shadow=0,MarginV=${this.config.subtitleMarginV ?? 28}'`,
-            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-            '-c:a', 'copy', burned,
-          ], signal))
+          await this.stages.timed('烧录字幕', () => this.burnCanvasSubtitles(output, burned, mapped.cues, work, signal, options.subtitleStyle))
           await rename(burned, output)
-          notes.push(`已把 ${mapped.cues.length} 条字幕烧录进画面（${burnSource === 'screen-text' ? '屏幕文字' : '语音转写'}）。成片因此重编码了一次。`)
+          notes.push(`已把 ${mapped.cues.length} 条字幕烧录进画面（${burnSource === 'screen-text' ? '屏幕文字' : '语音转写'}，Canvas + overlay）。成片因此重编码了一次。`)
         }
       }
       // 导出后必须确认成片里真的有画面。某些源文件（索引损坏的 AV1）能让 ffmpeg
@@ -2904,14 +3070,23 @@ export class VideoWorkspace {
    * @param signal - cancellation for the transcode.
    * @returns Path to the extracted audio, valid until the caller's temp directory is cleared.
    */
-  private async extractAudio(path: string, signal: AbortSignal): Promise<string> {
+  /** Extract one source-time audio window for a long-video ASR task. */
+  private async extractAudioWindow(path: string, startSeconds: number, endSeconds: number, signal: AbortSignal): Promise<string> {
     await mkdir(join(this.config.dataDir, 'tmp'), { recursive: true })
     const key = await this.hashFile(path)
-    const file = join(this.config.dataDir, 'tmp', `audio-${key}.m4a`)
-    if (existsSync(file)) { this.stages.skipped('提取音轨 · 复用缓存', '同一素材的音轨已存在'); return file }
+    const tag = `${key}-${Math.round(startSeconds * 1e3)}-${Math.round(endSeconds * 1e3)}`
+    const file = join(this.config.dataDir, 'tmp', `audio-${tag}.m4a`)
+    if (existsSync(file)) return file
     const partial = `${file}.part`
-    await this.run('ffmpeg', ['-nostdin', '-y', '-i', path, '-vn', '-ac', '1', '-ar', '16000',
-      '-c:a', 'aac', '-b:a', '48k', '-f', 'mp4', partial], signal)
+    try {
+      await this.run('ffmpeg', ['-nostdin', '-y', '-ss', String(startSeconds), '-to', String(endSeconds), '-i', path,
+        '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'aac', '-b:a', '48k', '-f', 'mp4', partial], signal)
+    } catch (error) {
+      let size = 0
+      try { size = (await stat(partial)).size } catch { /* no partial output */ }
+      if (size < 4096) throw error
+      console.warn(`video-workspace: ASR 分片尾部解码失败，使用已提取前缀（${startSeconds}–${endSeconds}s）`)
+    }
     await rename(partial, file)
     return file
   }
@@ -2947,7 +3122,7 @@ export class VideoWorkspace {
         parameters: { channel_id: [0] },
       }),
       signal,
-    })
+    }, '提交 ASR 任务')
     if (!submit.ok) throw new Error(`语音识别任务提交失败：HTTP ${submit.status} ${(await submit.text()).slice(0, 300)}`)
     const submitted = await submit.json() as { output?: { task_id?: string } }
     const taskId = submitted.output?.task_id
@@ -2958,7 +3133,7 @@ export class VideoWorkspace {
     for (;;) {
       if (Date.now() > deadline) throw new Error(`语音识别任务超时（${Math.round(this.config.asrTimeoutMs / 1000)}s，最后状态 ${task}）`)
       await this.pause(this.config.asrPollMs, signal)
-      const poll = await this.fetchSigned(`${base}/tasks/${taskId}`, { headers, signal })
+      const poll = await this.fetchSigned(`${base}/tasks/${taskId}`, { headers, signal }, '轮询 ASR 任务')
       if (!poll.ok) throw new Error(`查询语音识别任务失败：HTTP ${poll.status} ${(await poll.text()).slice(0, 300)}`)
       const payload = await poll.json() as {
         output?: {
@@ -2982,7 +3157,7 @@ export class VideoWorkspace {
       if (entry.subtask_status !== 'SUCCEEDED' || entry.transcription_url === undefined) {
         throw new Error(`语音识别子任务未成功：${entry.subtask_status ?? '?'} ${entry.message ?? ''}`.trim())
       }
-      const document = await this.fetchSigned(entry.transcription_url, { signal })
+      const document = await this.fetchSigned(entry.transcription_url, { signal }, '下载 ASR 结果')
       if (!document.ok) throw new Error(`下载识别结果失败：HTTP ${document.status}`)
       const parsed = await document.json() as { transcripts?: Array<{ sentences?: Array<{ begin_time?: number, end_time?: number, text?: string }> }> }
       const sentences = (parsed.transcripts ?? []).flatMap(transcript => transcript.sentences ?? [])
@@ -3519,6 +3694,7 @@ export class VideoWorkspace {
       })),
       evidence_done: done,
       evidence_not_computed: notComputed,
+      sync: await this.syncStatus(projectId),
       next_step: notComputed.length === 0
         ? '全部证据都已算好，可以直接检索或剪辑。'
         : `还没算的证据：${notComputed.join('、')}。需要哪一类就用对应的 video_evidence_* 工具算它；不需要就不必算。`,
@@ -3688,8 +3864,39 @@ export class VideoWorkspace {
    * connection and then stops responding stalls the tool call — and `restore` runs
    * during plugin startup, so a stalled bucket would hang the whole boot.
    */
-  private async fetchSigned(url: string, init: RequestInit = {}): Promise<Response> { const timeout = AbortSignal.timeout(this.config.requestTimeoutMs ?? 120_000); const signal = init.signal === undefined || init.signal === null ? timeout : AbortSignal.any([init.signal as AbortSignal, timeout]); return fetch(url, { ...init, signal }) }
-  private async materialize(ref: string, signal: AbortSignal): Promise<{ path: string,cleanup: () => Promise<void> }> { if (!ref.startsWith('oss://')) return { path: ref, cleanup: async () => undefined }; const key = ref.slice('oss://'.length); const path = join(this.config.dataDir,'tmp',`${randomUUID()}-${basename(key)}`); await mkdir(dirname(path),{recursive:true}); const response = await this.fetchSigned(this.signedUrl(key), { signal }); if (!response.ok) throw new Error(`OSS download failed: ${response.status}`); await this.writeStreamTo(response, path); return { path, cleanup: () => rm(path, { force: true }) } }
+  private async fetchSigned(url: string, init: RequestInit = {}, label = 'OSS 请求'): Promise<Response> {
+    const timeout = AbortSignal.timeout(this.config.requestTimeoutMs ?? 120_000)
+    const signal = init.signal === undefined || init.signal === null ? timeout : AbortSignal.any([init.signal as AbortSignal, timeout])
+    return this.fetchWithRetry(label, () => fetch(url, { ...init, signal }), init.signal as AbortSignal | undefined)
+  }
+
+  /** Retry transient transport and server failures while preserving a caller cancellation. */
+  private async fetchWithRetry(label: string, request: () => Promise<Response>, signal?: AbortSignal): Promise<Response> {
+    const attempts = Math.max(1, this.config.ossAttempts ?? 3)
+    const baseDelay = Math.max(1, this.config.ossRetryBaseMs ?? 1000)
+    let lastError = ''
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        const response = await request()
+        const transient = response.status === 408 || response.status === 429 || response.status >= 500
+        if (!transient) return response
+        lastError = `HTTP ${response.status}`
+        if (attempt === attempts) {
+          await response.body?.cancel().catch(() => undefined)
+          throw new Error(`${label} 失败（已尝试 ${attempts} 次）：${lastError}`)
+        }
+        await response.body?.cancel().catch(() => undefined)
+      } catch (error) {
+        if (signal?.aborted) throw error
+        lastError = error instanceof Error ? error.message : String(error)
+        if (attempt === attempts) throw new Error(`${label} 失败（已尝试 ${attempts} 次）：${lastError}`)
+      }
+      await this.pause(Math.min(baseDelay * 2 ** (attempt - 1), 15_000), signal ?? new AbortController().signal)
+    }
+    throw new Error(`${label} 失败：${lastError}`)
+  }
+
+  private async materialize(ref: string, signal: AbortSignal): Promise<{ path: string,cleanup: () => Promise<void> }> { if (!ref.startsWith('oss://')) return { path: ref, cleanup: async () => undefined }; const key = ref.slice('oss://'.length); const path = join(this.config.dataDir,'tmp',`${randomUUID()}-${basename(key)}`); await mkdir(dirname(path),{recursive:true}); const response = await this.fetchSigned(this.signedUrl(key), { signal }, '下载 OSS 素材'); if (!response.ok) throw new Error(`下载 OSS 素材失败：HTTP ${response.status}`); await this.writeStreamTo(response, path); return { path, cleanup: () => rm(path, { force: true }) } }
   /**
    * Write a response body to a file, refusing a short download.
    *
@@ -3748,7 +3955,7 @@ export class VideoWorkspace {
    * of Buffer or ArrayBuffer"). `duplex: 'half'` is the Node extension that permits a
    * streaming request body at all.
    */
-  private async uploadFile(path: string, key: string, contentType: string): Promise<string> { const date = new Date().toUTCString(); const credentials = this.credentials(); const body = Readable.toWeb(createReadStream(path)) as unknown as BodyInit; const response = await this.fetchSigned(this.objectUrl(key),{method:'PUT',...{ duplex: 'half' } as Record<string, unknown>,headers:{Date:date,'Content-Length':String((await stat(path)).size),'Content-Type':contentType,Authorization:`OSS ${credentials.id}:${this.signature('PUT',key,date,contentType)}`},body}); if (!response.ok) { const detail = (await response.text()).trim().replace(/\s+/g, ' ').slice(0, 500); throw new Error(`OSS upload failed: ${response.status}${detail === '' ? '' : ` ${detail}`}`) } return this.signedUrl(key) }
+  private async uploadFile(path: string, key: string, contentType: string, label = '上传 OSS 文件'): Promise<string> { const date = new Date().toUTCString(); const credentials = this.credentials(); const bytes = String((await stat(path)).size); const response = await this.fetchWithRetry(label, () => { const body = Readable.toWeb(createReadStream(path)) as unknown as BodyInit; return fetch(this.objectUrl(key), { method:'PUT', ...{ duplex: 'half' } as Record<string, unknown>, headers:{Date:date,'Content-Length':bytes,'Content-Type':contentType,Authorization:`OSS ${credentials.id}:${this.signature('PUT',key,date,contentType)}`}, body }) }); if (!response.ok) { const detail = (await response.text()).trim().replace(/\s+/g, ' ').slice(0, 500); throw new Error(`${label}失败：HTTP ${response.status}${detail === '' ? '' : ` ${detail}`}`) } return this.signedUrl(key) }
   /** SHA-256 of a file, computed in chunks so the file never sits in the heap. */
   private async hashFile(path: string): Promise<string> { const hash = createHash('sha256'); await pipeline(createReadStream(path), hash); return hash.digest('hex') }
   /**
@@ -3759,7 +3966,7 @@ export class VideoWorkspace {
    * every render.
    */
   private async keyframeGap(path: string, atSeconds: number, signal: AbortSignal): Promise<number> { const { stdout } = await this.run('ffprobe',['-v','error','-select_streams','v','-skip_frame','nokey','-read_intervals',`${Math.max(0, atSeconds - 30)}%${atSeconds + 1}`,'-show_entries','frame=pts_time','-of','csv=p=0',path],signal); const times = stdout.split('\n').map(line => Number(line.trim().split(',')[0])).filter(value => Number.isFinite(value)); const before = times.filter(time => time <= atSeconds); if (before.length === 0) return 0; return Math.max(0, atSeconds - Math.max(...before)) }
-  private async uploadBytes(data: Buffer, key: string, contentType: string): Promise<string> { const date = new Date().toUTCString(); const credentials = this.credentials(); const response = await this.fetchSigned(this.objectUrl(key),{method:'PUT',headers:{Date:date,'Content-Type':contentType,Authorization:`OSS ${credentials.id}:${this.signature('PUT',key,date,contentType)}`},body:data as unknown as BodyInit}); if (!response.ok) { const detail = (await response.text()).trim().replace(/\s+/g, ' ').slice(0, 500); throw new Error(`OSS upload failed: ${response.status}${detail === '' ? '' : ` ${detail}`}`) } return this.signedUrl(key) }
+  private async uploadBytes(data: Buffer, key: string, contentType: string, label = '上传 OSS 数据'): Promise<string> { const date = new Date().toUTCString(); const credentials = this.credentials(); const response = await this.fetchWithRetry(label, () => fetch(this.objectUrl(key), { method:'PUT', headers:{Date:date,'Content-Type':contentType,Authorization:`OSS ${credentials.id}:${this.signature('PUT',key,date,contentType)}`}, body:data as unknown as BodyInit })); if (!response.ok) { const detail = (await response.text()).trim().replace(/\s+/g, ' ').slice(0, 500); throw new Error(`${label}失败：HTTP ${response.status}${detail === '' ? '' : ` ${detail}`}`) } return this.signedUrl(key) }
   /**
    * Ask the model about the uploaded video and return the JSON object it produced.
    *
@@ -3886,6 +4093,7 @@ export class VideoWorkspace {
     input: unknown
     prompt: (window: { startUs: number, endUs: number }) => string
     signal: AbortSignal
+    progress: ((value: JsonValue) => void) | undefined
   }): Promise<{ chunks: Array<{ startUs: number, endUs: number, data: Data }>, failed: Array<{ start_us: number, end_us: number, error: string }>, chunked: boolean }> {
     const windows = this.modelWindows(a.durationUs)
     const inputKey = this.modelInputKey(a.input)
@@ -3895,25 +4103,30 @@ export class VideoWorkspace {
     const chunks: Array<{ startUs: number, endUs: number, data: Data }> = []
     const failed: Array<{ start_us: number, end_us: number, error: string }> = []
     for (const window of windows) {
+      const chunkIndex = windows.indexOf(window)
+      a.progress?.({ type: 'chunk', operation: a.operation, status: 'running', index: chunkIndex + 1, total: windows.length, start_us: window.startUs, end_us: window.endUs })
       const cached = read.get(a.assetId, a.operation, inputKey, window.startUs, window.endUs) as { status: string, payload: string | null, error: string | null } | undefined
       if (cached?.status === 'completed' && cached.payload !== null) {
         try {
           chunks.push({ ...window, data: JSON.parse(cached.payload) as Data })
           this.stages.skipped(`模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`, '复用已完成分片')
+          a.progress?.({ type: 'chunk', operation: a.operation, status: 'completed', index: chunkIndex + 1, total: windows.length, start_us: window.startUs, end_us: window.endUs, cached: true })
           continue
         } catch { /* damaged cache is recomputed below */ }
       }
       try {
         const proxy = await this.prepare(a.sourcePath, a.signal, { startSeconds: window.startUs / 1e6, endSeconds: window.endUs / 1e6, fps: 1 })
         const key = `${this.config.ossPrefix.replace(/\/$/, '')}/chunks/${a.assetId}/${a.operation}-${window.startUs}-${window.endUs}-${randomUUID()}.mp4`
-        const url = await this.stages.timed(`上传模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`, () => this.uploadFile(proxy, key, 'video/mp4'))
+        const url = await this.stages.timed(`上传模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`, () => this.uploadFile(proxy, key, 'video/mp4', `上传模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`))
         const data = await this.stages.timed(`模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`, () => this.ask(url, a.prompt(window), a.signal, { reset: false }))
         write.run(a.assetId, a.operation, inputKey, window.startUs, window.endUs, 'completed', JSON.stringify(data), null, Date.now())
         chunks.push({ ...window, data })
+        a.progress?.({ type: 'chunk', operation: a.operation, status: 'completed', index: chunkIndex + 1, total: windows.length, start_us: window.startUs, end_us: window.endUs })
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         write.run(a.assetId, a.operation, inputKey, window.startUs, window.endUs, 'failed', null, message, Date.now())
         failed.push({ start_us: window.startUs, end_us: window.endUs, error: message })
+        a.progress?.({ type: 'chunk', operation: a.operation, status: 'failed', index: chunkIndex + 1, total: windows.length, start_us: window.startUs, end_us: window.endUs, error: message })
       }
     }
     await this.manifest(a.projectId)
@@ -4038,7 +4251,7 @@ export class VideoWorkspace {
    */
   async acousticEvidence(projectId: string, assetId: string, signal: AbortSignal): Promise<Data> {
     const cached = await this.cachedEvidence(assetId, EVIDENCE_ACOUSTIC)
-    if (cached !== undefined) return cached
+    if (cached !== undefined) return { ...cached, sync: await this.syncStatus(projectId) }
     const asset = await this.asset(projectId, assetId)
     this.stages.reset()
     const source = await this.stages.timed('准备素材', () => this.materialize(asset.path, signal))
@@ -4059,7 +4272,7 @@ export class VideoWorkspace {
         const duration = await this.durationOf(assetId)
         const record = { ...curve, loud_spans: loudSpans(curve), duration_us: duration ?? levels.length * windowUs, sample_rate: sampleRate }
         await this.saveEvidence(projectId, assetId, EVIDENCE_ACOUSTIC, record, duration ?? levels.length * windowUs)
-        return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
+        return { asset_id: assetId, cached: false, ...record, sync: await this.syncStatus(projectId), stages: this.stages.snapshot() }
       } finally { await rm(raw, { force: true }) }
     } finally { await source.cleanup() }
   }
@@ -4074,7 +4287,7 @@ export class VideoWorkspace {
    */
   async shotEvidence(projectId: string, assetId: string, signal: AbortSignal): Promise<Data> {
     const cached = await this.cachedEvidence(assetId, EVIDENCE_SHOTS)
-    if (cached !== undefined) return cached
+    if (cached !== undefined) return { ...cached, sync: await this.syncStatus(projectId) }
     const asset = await this.asset(projectId, assetId)
     this.stages.reset()
     const source = await this.stages.timed('准备素材', () => this.materialize(asset.path, signal))
@@ -4088,7 +4301,7 @@ export class VideoWorkspace {
       const summary = summarizeShots(shots, duration, (this.config.shotPacingWindowSeconds ?? 30) * 1_000_000, this.config.shotBusyLimit ?? 8)
       const record = { ...summary, scene_threshold: threshold, duration_us: duration, cut_count: Math.max(0, shots.length - 1) }
       await this.saveEvidence(projectId, assetId, EVIDENCE_SHOTS, record, duration)
-      return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
+      return { asset_id: assetId, cached: false, ...record, sync: await this.syncStatus(projectId), stages: this.stages.snapshot() }
     } finally { await source.cleanup() }
   }
 
@@ -4100,7 +4313,7 @@ export class VideoWorkspace {
    */
   async timingEvidence(projectId: string, assetId: string, signal: AbortSignal): Promise<Data> {
     const cached = await this.cachedEvidence(assetId, EVIDENCE_TIMING)
-    if (cached !== undefined) return cached
+    if (cached !== undefined) return { ...cached, sync: await this.syncStatus(projectId) }
     const asset = await this.asset(projectId, assetId)
     this.stages.reset()
     const source = await this.stages.timed('准备素材', () => this.materialize(asset.path, signal))
@@ -4122,7 +4335,7 @@ export class VideoWorkspace {
       const kept = subtractSpans(duration, silences, (this.config.minKeepSeconds ?? 0.3) * 1_000_000)
       const record = { silences, silence_count: silences.length, silenced_us: silences.reduce((sum, span) => sum + (span.endUs - span.startUs), 0), kept_intervals: kept, kept_count: kept.length, min_keep_seconds: this.config.minKeepSeconds ?? 0.3, noise_db: noiseDb, duration_us: duration }
       await this.saveEvidence(projectId, assetId, EVIDENCE_TIMING, record, duration)
-      return { asset_id: assetId, cached: false, ...record, stages: this.stages.snapshot() }
+      return { asset_id: assetId, cached: false, ...record, sync: await this.syncStatus(projectId), stages: this.stages.snapshot() }
     } finally { await source.cleanup() }
   }
 
@@ -4189,10 +4402,22 @@ export class VideoWorkspace {
     const previous = this.manifestWrites.get(projectId) ?? Promise.resolve()
     const next = previous.then(() => this.uploadManifest(projectId), () => this.uploadManifest(projectId))
     this.manifestWrites.set(projectId, next.catch(() => undefined))
-    return next
+    try {
+      await next
+      await this.clearSyncPending(projectId)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      await this.markSyncPending(projectId, message)
+      console.warn(`video-workspace: 项目 ${projectId} 已保存到本地，OSS 同步待重试：${message}`)
+    }
   }
 
-  private async uploadManifest(projectId: string): Promise<void> { const db = await this.open(); const project = db.prepare('SELECT * FROM projects WHERE id=?').get(projectId) as Data | undefined; if (!project) return; const assets = db.prepare('SELECT * FROM assets WHERE project_id=?').all(projectId); const timelines = db.prepare('SELECT * FROM timelines WHERE project_id=?').all(projectId); const jobs = db.prepare('SELECT j.* FROM jobs j JOIN timelines t ON t.id=j.timeline_id WHERE t.project_id=?').all(projectId); const analyses = db.prepare('SELECT a.id asset_id,an.instruction,an.data,an.created_at FROM assets a JOIN analyses an ON an.asset_id=a.id WHERE a.project_id=?').all(projectId); const evidence = db.prepare('SELECT e.* FROM evidence e JOIN assets a ON a.id=e.asset_id WHERE a.project_id=?').all(projectId); const chunks = db.prepare('SELECT c.* FROM model_chunks c JOIN assets a ON a.id=c.asset_id WHERE a.project_id=?').all(projectId); const segments = db.prepare('SELECT s.timeline_id, s.ordinal, s.asset_id, s.start_us, s.end_us, s.speed, s.muted FROM timeline_segments s JOIN timelines t ON t.id=s.timeline_id WHERE t.project_id=? ORDER BY s.timeline_id, s.ordinal').all(projectId); const proposals = db.prepare('SELECT * FROM proposals WHERE project_id=?').all(projectId); const prefix = this.config.ossProjectPrefix.replace(/\/$/,''); const key = `${prefix}/${projectId}/manifest.json`; await this.uploadBytes(Buffer.from(JSON.stringify({ version: 6, project, assets, timelines, jobs, analyses, evidence, chunks, segments, proposals }, null, 2)), key, 'application/json'); const ids = (db.prepare('SELECT id FROM projects ORDER BY id').all() as Array<{ id: string }>).map(row => row.id); await this.uploadBytes(Buffer.from(JSON.stringify({ version: 6, projects: ids }, null, 2)), `${prefix}/index.json`, 'application/json') }
+  private async markSyncPending(projectId: string, error: string): Promise<void> { const db = await this.open(); if (!db.prepare('SELECT 1 FROM projects WHERE id=?').get(projectId)) return; db.prepare("INSERT INTO project_sync(project_id,status,error,attempts,updated_at) VALUES (?,'pending',?,1,?) ON CONFLICT(project_id) DO UPDATE SET status='pending',error=excluded.error,attempts=project_sync.attempts+1,updated_at=excluded.updated_at").run(projectId, error, Date.now()) }
+  private async clearSyncPending(projectId: string): Promise<void> { (await this.open()).prepare('DELETE FROM project_sync WHERE project_id=?').run(projectId) }
+  private async syncStatus(projectId: string): Promise<Data> { const row = (await this.open()).prepare('SELECT status,error,attempts,updated_at FROM project_sync WHERE project_id=?').get(projectId) as { status: string, error: string | null, attempts: number, updated_at: number } | undefined; return row === undefined ? { status: 'synced' } : { status: row.status, error: row.error, attempts: row.attempts, updated_at: row.updated_at } }
+  private async retryPendingManifests(): Promise<void> { const rows = (await this.open()).prepare("SELECT project_id FROM project_sync WHERE status='pending'").all() as Array<{ project_id: string }>; for (const row of rows) await this.manifest(row.project_id) }
+
+  private async uploadManifest(projectId: string): Promise<void> { const db = await this.open(); const project = db.prepare('SELECT * FROM projects WHERE id=?').get(projectId) as Data | undefined; if (!project) return; const assets = db.prepare('SELECT * FROM assets WHERE project_id=?').all(projectId); const timelines = db.prepare('SELECT * FROM timelines WHERE project_id=?').all(projectId); const jobs = db.prepare('SELECT j.* FROM jobs j JOIN timelines t ON t.id=j.timeline_id WHERE t.project_id=?').all(projectId); const analyses = db.prepare('SELECT a.id asset_id,an.instruction,an.data,an.created_at FROM assets a JOIN analyses an ON an.asset_id=a.id WHERE a.project_id=?').all(projectId); const evidence = db.prepare('SELECT e.* FROM evidence e JOIN assets a ON a.id=e.asset_id WHERE a.project_id=?').all(projectId); const chunks = db.prepare('SELECT c.* FROM model_chunks c JOIN assets a ON a.id=c.asset_id WHERE a.project_id=?').all(projectId); const segments = db.prepare('SELECT s.timeline_id, s.ordinal, s.asset_id, s.start_us, s.end_us, s.speed, s.muted FROM timeline_segments s JOIN timelines t ON t.id=s.timeline_id WHERE t.project_id=? ORDER BY s.timeline_id, s.ordinal').all(projectId); const proposals = db.prepare('SELECT * FROM proposals WHERE project_id=?').all(projectId); const prefix = this.config.ossProjectPrefix.replace(/\/$/,''); const key = `${prefix}/${projectId}/manifest.json`; await this.uploadBytes(Buffer.from(JSON.stringify({ version: 6, project, assets, timelines, jobs, analyses, evidence, chunks, segments, proposals }, null, 2)), key, 'application/json', '同步项目 manifest'); const ids = (db.prepare('SELECT id FROM projects ORDER BY id').all() as Array<{ id: string }>).map(row => row.id); await this.uploadBytes(Buffer.from(JSON.stringify({ version: 6, projects: ids }, null, 2)), `${prefix}/index.json`, 'application/json', '同步项目索引') }
   /**
    * Rebuild the local index from the OSS manifest, which owns the data.
    *

@@ -3,6 +3,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionUpdate, ToolCallContent } from '@agentclientprotocol/sdk'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type {} from '@deepseek-ai/dsh-token-meter'
 import { assistantBlockToAcp } from './content.ts'
 
@@ -57,6 +58,16 @@ export function toolCallUpdate(event: SessionEvent<'tool/call'>): SessionUpdate 
     kind: 'other',
     status: 'in_progress',
     rawInput: parseToolArguments(event.data.arguments),
+  }
+}
+
+/** Convert a live, non-durable tool progress payload into an ACP update. */
+export function toolProgressUpdate(toolCallId: string, progress: JsonValue): SessionUpdate {
+  return {
+    sessionUpdate: 'tool_call_update',
+    toolCallId,
+    status: 'in_progress',
+    content: [{ type: 'content', content: { type: 'text', text: JSON.stringify(progress) } }],
   }
 }
 

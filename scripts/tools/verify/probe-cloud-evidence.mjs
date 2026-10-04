@@ -414,6 +414,17 @@ record('命中画面描述时引用里指出它来自这一维',
   record('变速后字幕不越过成片长度',
     fast.cues.every(cue => cue.end_us <= 4_000_000),
     `最末 ${Math.max(...fast.cues.map(c => c.end_us)) / 1e6}s，上限 4s`)
+
+  // 不能只验时间线和 SRT：此前它们都正确地除以 speed，但渲染只给视频设了
+  // setpts，原速音轨把 MP4 拉回 5 秒。这条直接探测真实产物，保证两条流一起变速。
+  const rendered = await vw2.render('tl-sub', 'speed-audio-sync.mp4', new AbortController().signal)
+  const renderedFile = served.get(rendered.oss_key)
+  const probe = JSON.parse((await run('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', renderedFile])).stdout)
+  const duration = Number(probe.format?.duration)
+  record('变速导出同时压缩音视频，成片时长与计划一致',
+    // AAC 在尾部会留下最多几帧编码填充；0.15s 仍远小于此前原速音轨造成的整秒偏差。
+    Math.abs(duration - 4) < 0.15,
+    `成片 ${duration.toFixed(3)}s，计划 4.000s`)
 }
 
 // ── 字幕烧录：字幕必须真的进了画面 ────────────────────────────────────────
@@ -421,7 +432,7 @@ record('命中画面描述时引用里指出它来自这一维',
   // 只断言"渲染成功"是不够的：烧录是一个可选的后期步骤，它失败时最自然的写法
   // 就是跳过而不报错 —— 那样用户会拿到一个没有字幕的成片，而返回值里写着成功。
   // 这里直接数像素：把成片底部那一条与未烧录版本比对。
-  const burned = await vw2.render('tl-sub', 'burned.mp4', new AbortController().signal, { burnSubtitles: 'transcript' })
+  const burned = await vw2.render('tl-sub', 'burned.mp4', new AbortController().signal, { burnSubtitles: 'transcript', subtitleStyle: { text_color: '#FFD400', outline_color: '#000000', outline_width: 4, position: 'bottom-center', background_color: '#000000', background_opacity: 0.4, font_size: 30 } })
   const plain = await vw2.render('tl-sub', 'plain.mp4', new AbortController().signal)
   // 取本地路径走探针自己的 served 映射：上传时已把每个对象落在盘上，
   // 直接列目录是猜布局，猜错了只会得到一个与产品无关的失败。

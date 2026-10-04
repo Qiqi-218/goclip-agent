@@ -17,7 +17,7 @@ import { AcpContentError, admitAcpPrompt } from './content.ts'
 import { turnEndToStopReason } from './codec.ts'
 import { mountAcpMcpServers } from './mcp.ts'
 import { AcpModelControl } from './model-control.ts'
-import { assistantUpdates, toolCallUpdate, toolResultUpdate } from './updates.ts'
+import { assistantUpdates, toolCallUpdate, toolProgressUpdate, toolResultUpdate } from './updates.ts'
 
 /** The continuable-subagent teardown used without depending on the subagent package. */
 interface ContinuableDrain {
@@ -103,6 +103,7 @@ export class AcpSession {
   private inflight: InflightPrompt | undefined
   private closing: Promise<void> | undefined
   private readonly pendingSelections = new Map<string, ModelSelection>()
+  private readonly stopToolProgress: () => void
 
   private constructor(
     private readonly ctx: Context,
@@ -113,6 +114,18 @@ export class AcpSession {
     this.agent = handle.agent
     this.modelControl = modelControl
     this.disposeAgent = () => handle.dispose()
+    this.stopToolProgress = this.ctx.on('tools/progress', (exec, progress) => {
+      if (exec.agent !== this.agent) return
+      const previous = this.outputTail
+      this.outputTail = previous
+        .then(() => this.notify({
+          sessionId: this.agent.session.id,
+          update: toolProgressUpdate(exec.callId, progress),
+        }))
+        .catch((error: unknown) => {
+          this.ctx.logger.warn(`acp: tool-progress update delivery failed: ${errorChain(error)}`)
+        })
+    })
   }
 
   private readonly disposeAgent: () => Promise<void>
@@ -456,6 +469,7 @@ export class AcpSession {
       } catch (error: unknown) {
         failures.push(error)
       }
+      this.stopToolProgress()
       this.pendingSelections.clear()
       if (failures.length === 1) throw failures[0]
       /* v8 ignore start -- independent teardown failures can aggregate only under multiple simultaneous provider faults. */

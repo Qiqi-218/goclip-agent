@@ -21,6 +21,9 @@
         # 导入时整个文件会被读进内存再上传 OSS，这个上限防止长视频撑爆进程堆。
         maxImportBytes: 4294967296
         requestTimeoutMs: 120000
+        # OSS/ASR 的网络抖动会重试；次数包含首次，避免一次断连让整条处理归零。
+        ossAttempts: 3
+        ossRetryBaseMs: 1000
         modelTimeoutMs: 1800000
         searchLimit: 50
         # 导入后是否保留本地源文件。默认 false（删源文件，素材归 OSS）；

@@ -13611,6 +13611,9 @@ importers:
       '@deepseek-ai/schemastery':
         specifier: link:../../../vendor/schemastery
         version: link:../../../vendor/schemastery
+      '@napi-rs/canvas':
+        specifier: 1.0.8
+        version: 1.0.8
     devDependencies:
       '@deepseek-ai/cordis':
         specifier: workspace:~
@@ -23683,7 +23686,6 @@ snapshots:
       '@napi-rs/canvas-linux-x64-musl': 1.0.8
       '@napi-rs/canvas-win32-arm64-msvc': 1.0.8
       '@napi-rs/canvas-win32-x64-msvc': 1.0.8
-    optional: true
 
   '@napi-rs/wasm-runtime@1.1.5(@emnapi/core@1.10.0)(@emnapi/runtime@1.10.0)':
     dependencies:

@@ -33,7 +33,7 @@ async function executeBody(test: Awaited<ReturnType<typeof setup>>, name: string
   if (definition === undefined) throw new Error('missing Schedule tool')
   return await definition.execute(args, {
     callId: ToolCallId('body-call'), rootCallId: ToolCallId('body-call'), token: Symbol('test-body') as ToolExecutionToken,
-    name, arguments: args, agent: test.agent, signal, deferContext() {}, concludeTurn() {},
+    name, arguments: args, agent: test.agent, signal, deferContext() {}, concludeTurn() {}, progress() {},
   })
 }
 

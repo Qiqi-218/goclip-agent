@@ -196,6 +196,8 @@ declare module '@deepseek-ai/cordis' {
      * @mode emit
      */
     'tools/result'(this: Scoped<ToolRuntime>, exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>): undefined
+    /** Emit a non-durable progress update for a running tool call. */
+    'tools/progress'(this: Scoped<ToolRuntime>, exec: Readonly<ToolExecution>, progress: JsonValue): undefined
     /**
      * A tool was registered or unregistered, or a scoped restriction changed
      * (the available tool set changed — possibly for one scope only). An
@@ -416,6 +418,8 @@ export interface ToolDispatchExecution extends Omit<ToolExecution, 'signal'> {
  * `tool/result`.
  */
 export interface ToolRunContext extends ToolExecution {
+  /** Publish a live, non-durable update while the tool is still running. */
+  progress(progress: JsonValue): void
   /**
    * Defer one context — typically a nested-dispatch context ferried by a
    * composite tool, or a fresh plugin-sourced instruction — until this tool's
@@ -1397,6 +1401,7 @@ export class ToolRuntime extends Service {
     const agent = exec.agent
     const parent = exec.parent
     const signal = exec.signal
+    let executionRef: MutableToolRunContext | undefined
     // Distinguish a mode-collapsed call (visible in the scope, denied only by
     // the `ptc` collapse) from a genuinely unknown tool. A collapsed call is
     // deterministically denied, so it terminates BEFORE the extensible policy
@@ -1418,6 +1423,10 @@ export class ToolRuntime extends Service {
       ...exec.schema !== undefined ? { schema: exec.schema } : {},
       deferContext(context: UserMessage): void {
         deferredContexts.push(context)
+      },
+      progress: (progress: JsonValue): void => {
+        if (executionRef === undefined) throw new Error('tool progress reported before execution was prepared')
+        this.ctx.emit('tools/progress', executionRef, snapshotToolValue(name, progress))
       },
       concludeTurn(): void {
         concludingExecutions.add(this as unknown as ToolExecution)
@@ -1443,6 +1452,7 @@ export class ToolRuntime extends Service {
         throw new TypeError('tool execution arguments must be losslessly JSON-serializable')
       }
       const execution: MutableToolRunContext = { ...base, arguments: deepFreeze(detached) }
+      executionRef = execution
       this.deferredContexts.set(execution, deferredContexts)
       this.contentFinalizers.set(execution, finalizerFor())
       if (!collapsed) this.contentProjectors.set(execution, capturedProjector)

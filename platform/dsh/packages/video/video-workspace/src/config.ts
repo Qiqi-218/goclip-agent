@@ -30,6 +30,10 @@ export interface Config {
    * connection and then stops responding would otherwise stall the whole boot.
    */
   requestTimeoutMs: number
+  /** Total attempts for a transient OSS or ASR HTTP request, including the first one. */
+  ossAttempts: number
+  /** Initial retry delay for OSS and ASR requests; each later retry doubles it. */
+  ossRetryBaseMs: number
   /**
    * Deadline for one Qwen Omni request, in milliseconds.
    *
@@ -353,6 +357,8 @@ export const Config: z<Config> = z.object({
   signedUrlSeconds: z.number().required(),
   maxImportBytes: z.natural().default(4 * 1024 * 1024 * 1024),
   requestTimeoutMs: z.natural().default(120_000),
+  ossAttempts: z.natural().default(3),
+  ossRetryBaseMs: z.natural().default(1000),
   modelTimeoutMs: z.natural().default(1_800_000),
   searchLimit: z.natural().default(50),
   keepSourceFiles: z.boolean().default(false),
