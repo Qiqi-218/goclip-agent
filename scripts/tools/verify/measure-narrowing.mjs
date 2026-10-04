@@ -142,3 +142,18 @@ console.log('\n=== 这个改动的边界 ===')
 console.log('  只在「查询词字面出现在已存转述里」时收窄。')
 console.log('  描述式提问（没有可匹配的字面词）仍会拿到整段 —— 这是设计的取舍：')
 console.log('  宁可给粗区间，也不给一个猜出来的精确区间。')
+
+// ---- 投影：这套改动对那场会话意味着什么 --------------------------------
+//
+// 用实测覆盖率乘以实测耗时，而不是用「应该会快」这类说法。
+// 明确区分：以下是**投影**，不是实测。修复后的真实数字要等一次新会话。
+const findInVideoMs = 39900          // 那场会话里 video_find_in_video 的单次均值
+const toolTotalMs = 1_339_000        // 全部工具耗时
+console.log('\n=== 投影（不是实测）===')
+console.log(`  video_find_in_video 实测: 21 次 / 839s，占工具耗时 ${(100 * 21 * findInVideoMs / toolTotalMs).toFixed(0)}%`)
+console.log(`  按实测覆盖率 ${narrowedCount}/${subjects.length} 收窄成功：`)
+console.log(`    若这些调用不再发生 → 省 ${((narrowedCount * findInVideoMs) / 60000).toFixed(1)} 分钟`)
+console.log(`    剩余 ${subjects.length - narrowedCount} 次仍需整片重看 → ${(((subjects.length - narrowedCount) * findInVideoMs) / 60000).toFixed(1)} 分钟`)
+console.log(`  活跃用时 ${(toolTotalMs / 60000).toFixed(1)} 分钟 → ${((toolTotalMs - narrowedCount * findInVideoMs) / 60000).toFixed(1)} 分钟（降 ${(100 * narrowedCount * findInVideoMs / toolTotalMs).toFixed(0)}%）`)
+console.log('\n  这一步没有验证的部分：模型拿到句子级区间后是否真的不再升级到整片重看。')
+console.log('  那要看修复后的一次真实会话 —— 用 analyze-sessions.mjs 对照同样的指标。')
