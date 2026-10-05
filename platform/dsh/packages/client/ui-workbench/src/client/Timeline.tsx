@@ -23,6 +23,7 @@ import { EVIDENCE_EFFECT, EvidenceLane, evidenceRows } from './EvidenceLanes.tsx
 import { CLIP_EFFECT, intentFromEditedAction, ordinalOfAction, toRows, type EditIntent, type EditSubject } from './editor-model.ts'
 import { EVIDENCE_LANES, laneOfAction, type EvidenceLaneKey, type EvidenceVisibility } from './evidence-model.ts'
 import { filmSecondsOf } from './timing.ts'
+import { TimelineScrollbar } from './TimelineScrollbar.tsx'
 import type { EvidencePayload } from './read.ts'
 import styles from './Timeline.module.css'
 
@@ -131,6 +132,14 @@ export function Timeline({
   const [scaleWidth, setScaleWidth] = useState(DEFAULT_SCALE_WIDTH)
   const viewport = useRef<HTMLDivElement>(null)
   /**
+   * The lane's scroll geometry, for the scrollbar to draw.
+   *
+   * State rather than only read from the DOM: the thumb has to follow the scroll while the person
+   * scrolls, so something has to re-render when it moves. `readScrollLeft` stays the source of truth
+   * for the zoom arithmetic, which must not be one event behind.
+   */
+  const [geometry, setGeometry] = useState({ scrollLeft: 0, viewportWidth: 0, contentWidth: 0 })
+  /**
    * Where the lane is scrolled to, in pixels, read from the DOM at the moment it is needed.
    *
    * Read rather than tracked through the editor's scroll callback: that callback is not the only way
@@ -140,6 +149,18 @@ export function Timeline({
    *
    * @returns The scroller's current horizontal offset, or 0 when it cannot be read.
    */
+  /** Re-measure the lane's scroll geometry from the DOM. */
+  const measure = useCallback(() => {
+    const grid = viewport.current?.querySelector('.timeline-editor-edit-area .ReactVirtualized__Grid')
+    if (!(grid instanceof HTMLElement)) return
+    setGeometry(current => {
+      const next = { scrollLeft: grid.scrollLeft, viewportWidth: grid.clientWidth, contentWidth: grid.scrollWidth }
+      return current.scrollLeft === next.scrollLeft && current.viewportWidth === next.viewportWidth && current.contentWidth === next.contentWidth
+        ? current
+        : next
+    })
+  }, [])
+
   const readScrollLeft = useCallback((): number => {
     /*
      * 要的是**编辑区**那个 grid，不是时间区那个：两者都是 `.ReactVirtualized__Grid`，
@@ -199,6 +220,8 @@ export function Timeline({
       return next
     })
   }, [readScrollLeft, scrollTo])
+
+
 
   /**
    * Zoom to one factor outright, anchoring the viewport's centre.
@@ -260,6 +283,37 @@ export function Timeline({
     [CLIP_EFFECT]: { id: CLIP_EFFECT, name: t('column.timeline') },
     [EVIDENCE_EFFECT]: { id: EVIDENCE_EFFECT, name: t('evidence.lanes') },
   }), [t])
+
+  /*
+   * Keep the scrollbar's geometry current.
+   *
+   * Four things change it and each needs its own trigger:
+   *
+   * - the person scrolling — the grid's own `scroll` event, which catches a trackpad gesture and a
+   *   scrollbar drag alike;
+   * - the lane being resized — a `ResizeObserver` on the grid;
+   * - the scale changing — this effect re-runs on `scaleWidth`;
+   * - **the library filling the grid in.** This is the one that took measuring to find: on mount the
+   *   grid exists but is still empty, so it reports `scrollWidth === clientWidth` and there is
+   *   nothing to scroll. A `ResizeObserver` does not fire for that, because the element's own box
+   *   did not change — only its contents did. Measured in a browser, every reading stayed at the
+   *   viewport width and the scrollbar never appeared. Re-measuring on the row count closes it.
+   */
+  useEffect(() => {
+    measure()
+    const frame = requestAnimationFrame(() => { measure() })
+    const grid = viewport.current?.querySelector('.timeline-editor-edit-area .ReactVirtualized__Grid')
+    if (!(grid instanceof HTMLElement)) return () => cancelAnimationFrame(frame)
+    const onScroll = (): void => { measure() }
+    grid.addEventListener('scroll', onScroll, { passive: true })
+    const observer = new ResizeObserver(() => { measure() })
+    observer.observe(grid)
+    return () => {
+      cancelAnimationFrame(frame)
+      grid.removeEventListener('scroll', onScroll)
+      observer.disconnect()
+    }
+  }, [measure, scaleWidth, rows.length])
 
   /**
    * Fold one edited action back into a tool call and hand it up.
@@ -423,6 +477,20 @@ export function Timeline({
           }}
         />
       </div>
+
+      {/*
+       * 滑轴画在车道**下面**：库把自己的滚动条藏了起来，而这条轴有近万像素宽，
+       * 没有任何可见的方式能沿着它移动。滚轮能移动它，但滚轮既不可发现、也抓不住。
+       */}
+            <TimelineScrollbar
+        assetSeconds={assetSeconds}
+        clips={clips}
+        contentWidth={geometry.contentWidth}
+        onScrollTo={pixels => { scrollTo(pixels); measure() }}
+        scrollLeft={geometry.scrollLeft}
+        t={t}
+        viewportWidth={geometry.viewportWidth}
+      />
     </div>
   )
 }
