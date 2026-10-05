@@ -316,7 +316,13 @@ export function mediaRoute(source: MediaSource, prefix: string): WebRoute {
       // The query string carries no meaning here, so it is cut before the segments are read.
       const pathname = (req.url ?? '').split('?').at(0) ?? ''
       const rest = pathname.slice(base.length).replace(/^\/+/, '')
-      const path = rest === '' ? [] : rest.split('/').map(segment => decodeURIComponent(segment))
+      let path: string[]
+      try {
+        path = rest === '' ? [] : rest.split('/').map(segment => decodeURIComponent(segment))
+      } catch {
+        sendStatus(res, 400)
+        return
+      }
       // `data` is reserved: an asset id could otherwise be spelled `data` and shadow the
       // measurement form, making which one answers depend on a naming coincidence.
       if (path[0] === DATA_SEGMENT) return serveData(source, path.slice(1), req, res)

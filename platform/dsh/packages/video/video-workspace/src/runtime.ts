@@ -1075,7 +1075,7 @@ export class VideoWorkspace {
     }
     // Anything past the two ids must be exactly the render form; no other shape is addressable.
     if (kind !== 'render' || jobId === undefined || path.length !== 4) return null
-    const row = (await this.open()).prepare('SELECT j.output, t.name FROM jobs j JOIN timelines t ON t.id=j.timeline_id WHERE j.id=? AND t.project_id=?').get(jobId, projectId) as { output: string | null, name: string | null } | undefined
+    const row = (await this.open()).prepare('SELECT j.output, t.name FROM jobs j JOIN timelines t ON t.id=j.timeline_id WHERE j.id=? AND t.project_id=? AND t.asset_id=?').get(jobId, projectId, assetId) as { output: string | null, name: string | null } | undefined
     if (row === undefined || row.output === null || row.output === '') return null
     // A finished film is stored as an OSS key, but older rows carry a signed URL. Take the
     // key out of either form so the route always signs fresh rather than reusing a stale one.
