@@ -371,6 +371,14 @@ export function Timeline({
       <div className={styles.bar}>
         <span className={styles.barLabel}>{t('column.timeline')}</span>
         {/*
+         * 「边界可以拖、刻度可以点」这条提示必须留着。
+         *
+         * 加长度读数时我把它替换掉了 —— 于是界面里再没有任何地方说边界能拖，
+         * 而那正是这一处唯一发现得它的途径（实测：那条断言的缺失让 `timeline.hint`
+         * 变成了孤儿键，谁也没发现）。
+         */}
+        <span className={styles.barHint} data-timeline-hint="">{t('timeline.hint')}</span>
+        {/*
          * 两个长度并排显示，因为它们回答不同的问题：刻度上的轴是**录制**（素材多长、
          * 哪几段被用了、中间空了哪些），而这个读数是**成片**（按倍速折算后有多长）。
          * 只给一个数会让人以为轴就是成片，那正是先前那个错。

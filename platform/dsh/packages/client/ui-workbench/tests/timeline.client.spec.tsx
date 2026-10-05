@@ -472,3 +472,23 @@ describe('zooming the timeline', () => {
     expect(captured.props?.scaleWidth).toBe(0.5)
   })
 })
+describe('what the bar tells the person', () => {
+  it('keeps the hint that clip edges can be dragged', () => {
+    /*
+     * 这条提示是**唯一**说明「边界可拖」的地方。加长度读数时它被替换掉了，于是
+     * `timeline.hint` 成了没人用的孤儿键 —— 而没有任何断言因此变红，谁也没发现。
+     * 这条就是那个缺失的断言。
+     */
+    const { container } = renderTimeline()
+    expect(container.querySelector('[data-timeline-hint]')?.textContent).toBe(zh['timeline.hint'])
+  })
+
+  it('reports both lengths, because they answer different questions', () => {
+    // 轴是**录制**（素材多长、哪几段被用了），读数里另有**成片**（按倍速折算后多长）。
+    // 只给一个数会让人以为轴就是成片 —— 那正是先前那个坐标错。
+    const { container } = renderTimeline()
+    const lengths = container.querySelector('[data-lengths]')?.textContent ?? ''
+    expect(lengths).toContain('2584')
+    expect(lengths).toContain('14.6')
+  })
+})
