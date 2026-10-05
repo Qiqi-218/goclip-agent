@@ -1,0 +1,24 @@
+/**
+ * The subtitle overlay.
+ *
+ * The stage covers the picture and ignores pointer events, so it changes nothing about how the
+ * player is used: the controls underneath stay clickable while a subtitle is on screen. Its own
+ * background is transparent — the text and its box carry all the appearance, and the position
+ * comes from the inline style the caller resolved.
+ */
+
+.stage {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.box {
+  /* 具体位置由 previewStyle 的九宫格换算给出。 */
+  box-sizing: border-box;
+}
+
+.text {
+  display: inline-block;
+}

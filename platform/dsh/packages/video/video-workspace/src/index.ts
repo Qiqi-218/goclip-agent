@@ -1,13 +1,16 @@
 /** DSH-native local video tools. */
 import type { Context } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-host-webserver'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { Config } from './config.ts'
+import { mediaRoute } from './media-route.ts'
 import { VideoWorkspace } from './runtime.ts'
 
 export { Config } from './config.ts'
 export const name = 'video-workspace'
-export const inject = ['tools']
+// `webServer` carries the read-only media route the workbench plays assets through.
+export const inject = ['tools', 'webServer']
 const output = { schema: { type: 'json' as const }, render: (_: object, value: JsonValue) => [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }] }
 /**
  * Output for a tool that calls the model.
@@ -47,6 +50,75 @@ export function apply(ctx: Context, config: Config): void {
   // 释放数据库句柄：否则索引文件一直被占用，WAL 边车文件会随进程寿命增长。
   // 代理视频是缓存，随进程结束一起清掉，免得缓存目录无限增长。
   ctx.effect(() => () => video.dispose(), 'video-workspace.dispose')
+  // 只读媒体路由：工作台用它把素材放进 <video>，靠 Range 请求拖动进度条。
+  // 前缀为空表示部署方不要这条路由 —— 显式关闭，而不是留一条无人知道的开放路径。
+  const mediaPrefix = config.mediaRoutePrefix.trim()
+  if (mediaPrefix !== '') {
+    ctx.effect(
+      () => ctx.webServer.register(mediaRoute({
+        resolve: async path => {
+          const target = await video.resolveMedia(path)
+          // 第二道校验：即使某个地址形式忘了验证，也到不了本项目之外的对象。
+          return target !== null && video.ownsObjectKey(target.key) ? target : null
+        },
+        sign: (key, method) => video.signedAssetUrl(key, method),
+        loudness: async path => {
+          // 路由把维度那一段切掉后才交过来，所以这里只有两个 id。
+          const [projectId, assetId] = path
+          if (projectId === undefined || assetId === undefined) return null
+          try {
+            return await video.loudnessCurve(projectId, assetId)
+          } catch (error) {
+            // 素材不存在也是「没有可画的东西」，路由会翻成 404。
+            // 若让它冒出去变成 502，界面就分不清「没有这个素材」和「读取出错」，
+            // 会给用户一个错误的提示。
+            return null
+          }
+        },
+        timelines: async path => {
+          const [projectId, assetId] = path
+          if (projectId === undefined || assetId === undefined) return null
+          try {
+            return await video.timelinesForAsset(projectId, assetId)
+          } catch {
+            return null
+          }
+        },
+        renders: async path => {
+          const [projectId, assetId] = path
+          if (projectId === undefined || assetId === undefined) return null
+          try {
+            return await video.rendersOf(projectId, assetId)
+          } catch {
+            return null
+          }
+        },
+        evidence: async path => {
+          const [projectId, assetId] = path
+          if (projectId === undefined || assetId === undefined) return null
+          try {
+            return await video.evidenceTracks(projectId, assetId)
+          } catch {
+            return null
+          }
+        },
+        history: async path => {
+          // 三个 id：历史属于时间线，而一条素材可以有多条时间线。
+          const [projectId, assetId, timelineId] = path
+          if (projectId === undefined || assetId === undefined || timelineId === undefined) return null
+          try {
+            // 先确认这条时间线确实属于这个项目与素材，否则一个猜出来的 id 就能读到别处。
+            const timelines = await video.timelinesForAsset(projectId, assetId) as { timelines?: Array<{ id: string }> } | null
+            if (timelines?.timelines?.some(timeline => timeline.id === timelineId) !== true) return null
+            return await video.timelineHistory(timelineId)
+          } catch {
+            return null
+          }
+        },
+      }, mediaPrefix)),
+      'video-workspace.media-route',
+    )
+  }
   const add = (tool: Parameters<typeof ctx.tools.register>[0]) => ctx.tools.register(tool)
   add(defineTool({ name: 'video_project_create', description: '创建本地剪辑项目。', parameters: { id: { type: 'string', required: true }, name: { type: 'string', required: true } }, output, async execute(a) { return json(video.createProject(a.id, a.name)) }, presentCall: present('创建剪辑项目') }))
   add(defineTool({ name: 'video_project_list', description: '列出剪辑项目。', parameters: {}, output, isConcurrencySafe: () => true, async execute() { return json(video.projects()) }, presentCall: present('列出剪辑项目') }))
@@ -61,7 +133,10 @@ export function apply(ctx: Context, config: Config): void {
   add(defineTool({ name: 'video_timeline_merge', description: '把第 N 段与第 N+1 段合成一段。只有同一素材、播放设置相同、且在素材上首尾相接的两段才能合。', parameters: { timeline_id: { type: 'string', required: true }, base_revision: { type: 'integer', required: true }, ordinal: { type: 'integer', required: true } }, output, async execute(a) { return json(video.mergeSegments(a)) }, presentCall: present('合并片段') }))
   add(defineTool({ name: 'video_asset_delete', description: '删除一个素材及其全部派生数据（分析、证据、引用它的时间线）。OSS 上的对象不会被删，工具只管理索引。', parameters: { project_id: { type: 'string', required: true }, asset_id: { type: 'string', required: true } }, output, async execute(a) { return json(video.deleteAsset(a.project_id, a.asset_id)) }, presentCall: present('删除素材') }))
   add(defineTool({ name: 'video_project_delete', description: '删除一个项目及其全部内容。OSS 上的对象保留。', parameters: { project_id: { type: 'string', required: true } }, output, async execute(a) { return json(video.deleteProject(a.project_id)) }, presentCall: present('删除项目') }))
+  add(defineTool({ name: 'video_timeline_subtitle_style', description: '设置时间线的字幕样式。字段全部可选，只提有问题的那个即可，其余保持原样。**位置用九宫格**（bottom-center 等）而不是坐标：换成竖版时坐标会失效，九宫格不会。字号与边距是**画面高度的占比**（size 0.04 约等于 1080p 下 43px），不是像素，所以换画幅不用重设。颜色写 #rrggbb。返回里会列出没被接受的字段与原因。样式不影响 revision —— 它改的是成片长什么样，不是成片是什么。', parameters: { timeline_id: { type: 'string', required: true }, font: { type: 'string' }, size: { type: 'number' }, bold: { type: 'boolean' }, italic: { type: 'boolean' }, color: { type: 'string' }, outlineColor: { type: 'string' }, outlineWidth: { type: 'number' }, alignment: { type: 'string', enum: ['bottom-left', 'bottom-center', 'bottom-right', 'middle-left', 'middle-center', 'middle-right', 'top-left', 'top-center', 'top-right'] }, marginVertical: { type: 'number' }, marginHorizontal: { type: 'number' }, backgroundColor: { type: 'string' }, backgroundOpacity: { type: 'number' }, shadowColor: { type: 'string' }, shadowOffset: { type: 'number' }, source: { type: 'string', enum: ['transcript', 'screen-text'] } }, output, async execute(a) { const { timeline_id, ...style } = a as { timeline_id: string } & Record<string, unknown>; return json(video.setSubtitleStyle({ timeline_id, style })) }, presentCall: present('设置字幕样式') }))
+  add(defineTool({ name: 'video_subtitle_style_get', description: '读时间线的字幕样式，并给出默认值与生效值。style 为 null 表示从未设置过 —— 那与「设置成了默认值」不同：导出时会用部署默认值并在备注里说明。', parameters: { timeline_id: { type: 'string', required: true } }, output, isConcurrencySafe: () => true, async execute(a) { return json(video.subtitleStyle(a.timeline_id)) }, presentCall: present('读取字幕样式') }))
   add(defineTool({ name: 'video_timeline_rename', description: '给时间线起名或改名（传空字符串则清空）。名字不属于编辑内容，所以**不会**推进 revision。', parameters: { timeline_id: { type: 'string', required: true }, name: { type: 'string', required: true } }, output, async execute(a) { return json(video.renameTimeline(a.timeline_id, a.name)) }, presentCall: present('重命名时间线') }))
+  add(defineTool({ name: 'video_timeline_name_segment', description: '给某一段起名或改名（传空字符串则清掉名字）。名字存在**片段**上而不是时间线上：它标的是这一刀里的某一块，同一段素材在别处再用一次是另一块。与时间线改名不同，这个动作**会推进 revision** —— 把一段叫作「开场」改变了这一刀读起来的样子。「修改片段名称或标记」用它。', parameters: { timeline_id: { type: 'string', required: true }, base_revision: { type: 'integer', required: true }, ordinal: { type: 'integer', required: true }, name: { type: 'string', required: true } }, output, async execute(a) { return json(video.nameSegment(a)) }, presentCall: present('给片段起名') }))
   add(defineTool({ name: 'video_timeline_history', description: '列出一条时间线可回滚的历史版本（每次编辑前都留了快照）。回滚前先看这个选目标 revision。', parameters: { timeline_id: { type: 'string', required: true } }, output, async execute(a) { return json(video.timelineHistory(a.timeline_id)) }, presentCall: present('历史版本') }))
   add(defineTool({ name: 'video_timeline_revert', description: '把时间线回到某个早先的 revision。回滚本身也是一次编辑（版本号继续往前走），所以可以再回滚回来，不会把已经发生的事抹掉。', parameters: { timeline_id: { type: 'string', required: true }, base_revision: { type: 'integer', required: true }, target_revision: { type: 'integer', required: true } }, output, async execute(a) { return json(video.revertTimeline(a)) }, presentCall: present('回滚版本') }))
   add(defineTool({ name: 'video_find_similar', description: '找出与**给定区间内容相似**的其它片段（同一个人、同一类画面、同一类情节都算）。参照物是那一段自己的证据（说的话、屏幕上的字、画面描述、分段描述），所以结果可核验：把两段的描述并排看就能判断像不像。参照区间本身会从结果里剔除。', parameters: { project_id: { type: 'string', required: true }, asset_id: { type: 'string', required: true }, start_us: { type: 'integer', required: true }, end_us: { type: 'integer', required: true } }, output: costedOutput, async execute(a, exec) { const result = await video.findSimilar(a, exec.signal); return json(Promise.resolve({ ...result, usage: video.lastUsage() })) }, presentCall: present('找相似片段') }))

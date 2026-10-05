@@ -1,0 +1,96 @@
+/**
+ * The revision list's appearance.
+ *
+ * The present revision is marked rather than hidden: seeing where you are in a list of states is
+ * what makes the others readable as "before" and "after". A proposal that has not been applied is
+ * drawn as a proposal, for the same reason the timeline draws one that way.
+ */
+
+.list {
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.item {
+  margin: 0;
+}
+
+.row,
+.rowProposed {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  padding: 5px 10px;
+  border: none;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.row:hover:not(:disabled),
+.row:focus-visible:not(:disabled) {
+  background: var(--dsw-alias-bg-layer-2);
+  outline: none;
+}
+
+/* 已经是当前版本：按下去没有意义，所以看起来也不该像能按。 */
+.row:disabled {
+  cursor: default;
+}
+
+/* 已提出但还没被接受的回滚。 */
+.rowProposed {
+  border-left: 2px solid var(--dsw-alias-brand-primary);
+}
+
+.number {
+  flex: none;
+  width: 30px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.detail {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.note_ {
+  overflow: hidden;
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.meta {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.badge {
+  flex: none;
+  margin-left: auto;
+  padding: 0 5px;
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-xs);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10px;
+}
+
+.note {
+  margin: 0;
+  padding: 8px 10px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 1.6;
+}

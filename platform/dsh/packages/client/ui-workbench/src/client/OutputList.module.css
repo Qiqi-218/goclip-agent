@@ -1,0 +1,124 @@
+/** The output column's appearance. Only appearance lives here. */
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.render {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.video {
+  width: 100%;
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.name {
+  overflow: hidden;
+  color: var(--dsw-alias-label-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notice {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px 4px;
+}
+
+.noticeTitle {
+  margin: 0;
+  color: var(--dsw-alias-label-primary);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.noticeHint {
+  margin: 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* 失败的那一次：与能播的成片用不同的边，因为这一栏里「哪个能放」是第一个要看清的事。 */
+.failed {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px;
+  border-left: 2px solid var(--dsw-alias-label-tertiary);
+  border-radius: var(--dsw-radius-xs);
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+.failedTitle {
+  margin: 0;
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.failedStage {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+}
+
+.failedNote {
+  margin: 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 10px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.stages {
+  margin: 0 0 6px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 10px;
+}
+
+.stagesSummary {
+  cursor: pointer;
+}
+
+.stageList {
+  margin: 4px 0 0;
+  padding-left: 16px;
+}
+
+.stage,
+.stageFailed {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 死掉的那一步在列表里标出来：读的人才能一眼看到管线断在哪。 */
+.stageFailed {
+  color: var(--dsw-alias-label-primary);
+  font-weight: 600;
+}
+
+.stageName {
+  margin-right: 6px;
+}
+
+.stageMs {
+  color: var(--dsw-alias-label-tertiary);
+}

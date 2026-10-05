@@ -1,0 +1,348 @@
+// @vitest-environment jsdom
+/**
+ * The timeline surface's integration with the editor library.
+ *
+ * The library is mocked, deliberately. Its own drawing, dragging and zooming are its behaviour to
+ * guarantee, not this package's, and a real instance brings `interactjs` pointer plumbing into
+ * jsdom, where it either does nothing or fails for reasons unrelated to what is under test. What
+ * this package owns — and what these cases pin down — is the wiring:
+ *
+ * - the clips reach it laid out on the **film's** axis, not at their positions in the recording;
+ * - a drag is translated into a tool call rather than applied locally;
+ * - the playhead follows the player instead of the lane keeping a cursor of its own;
+ * - an edit that has been reported but not confirmed is drawn differently from a settled one.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, fireEvent, render } from '@testing-library/react'
+import { forwardRef, useImperativeHandle, type ReactNode } from 'react'
+
+/** One action as the mocked editor receives it. */
+interface FakeAction {
+  readonly id: string
+  readonly start: number
+  readonly end: number
+  readonly effectId: string
+}
+
+/** What the mocked editor was rendered with, and how a test drives its callbacks. */
+interface CapturedProps {
+  editorData?: { id: string, actions: FakeAction[] }[]
+  scaleWidth?: number
+  dragLine?: boolean
+  gridSnap?: boolean
+  getActionRender?: (action: FakeAction) => ReactNode
+  onClickActionOnly?: (event: unknown, param: { action: FakeAction, time: number }) => void
+  onCursorDrag?: (time: number) => void
+  onClickTimeArea?: (time: number) => boolean | undefined
+  onActionMoveEnd?: (param: { action: FakeAction }) => void
+  onActionResizeEnd?: (param: { action: FakeAction }) => void
+}
+
+const captured: { props: CapturedProps | null, setTime: ReturnType<typeof vi.fn> } = {
+  props: null,
+  setTime: vi.fn(),
+}
+
+vi.mock('@xzdarcy/react-timeline-editor', () => ({
+  // 替身必须转发 ref：这个组件用 ref 调 `setTime` 把播放头推给车道，
+  // 不转发的替身会让「播放头联动」那条测试因为 ref 为 null 而失败 —— 而那是替身的缺陷。
+  Timeline: forwardRef((props: CapturedProps, ref: unknown) => {
+    captured.props = props
+    useImperativeHandle(ref as never, () => ({ setTime: captured.setTime, getTime: () => 0 }), [])
+    return <div data-editor="" />
+  }),
+}))
+vi.mock('@xzdarcy/react-timeline-editor/dist/react-timeline-editor.css', () => ({}))
+
+const { Timeline } = await import('../src/client/Timeline.tsx')
+const { zh } = await import('../src/client/locales.ts')
+const { availableLanes } = await import('../src/client/Timeline.tsx')
+
+beforeEach(() => { captured.props = null; captured.setTime.mockClear() })
+afterEach(cleanup)
+
+/**
+ * Dictionary lookup with the `{name}` substitution the locale seat performs.
+ * @param key - dictionary key.
+ * @param params - placeholder values.
+ * @returns the rendered string.
+ */
+const t = (key: keyof typeof zh, params?: Record<string, unknown>): string => {
+  const template = zh[key]
+  if (params === undefined) return template
+  return template.replace(/\{(\w+)\}/g, (match, name: string) => (name in params ? String(params[name]) : match))
+}
+
+/** Three clips of the real cut: 7.72s, 4.00s and 2.84s of film (the last at 2×). */
+const CLIPS = [
+  { ordinal: 0, start_us: 21_740_000, end_us: 29_460_000, speed: 1, muted: false },
+  { ordinal: 1, start_us: 272_490_000, end_us: 276_490_000, speed: 1, muted: false },
+  { ordinal: 2, start_us: 296_580_000, end_us: 302_260_000, speed: 2, muted: true },
+]
+
+/** Length of the recording the clips were cut from. */
+const ASSET_US = 2_584_133_000
+
+/**
+ * Render the timeline.
+ * @param overrides - props to replace.
+ * @returns the render result plus the two spies.
+ */
+function renderTimeline(overrides: Partial<Parameters<typeof Timeline>[0]> = {}) {
+  const onSeek = vi.fn()
+  const onEdit = vi.fn()
+  const result = render(
+    <Timeline
+      assetDurationUs={ASSET_US}
+      baseRevision={2}
+      clips={CLIPS}
+      evidence={null}
+      lanes={{ transcript: false, screenText: false, shots: false, silences: false, loudness: false, chapters: false, highlights: false }}
+      onEdit={onEdit}
+      onSeek={onSeek}
+      pendingOrdinals={[]}
+      playheadUs={0}
+      t={t as never}
+      timelineId="tl-1"
+      {...overrides}
+    />,
+  )
+  return { ...result, onSeek, onEdit }
+}
+
+describe('timeline wiring', () => {
+  it('lays the clips out on the film axis, end to end', () => {
+    renderTimeline()
+    const actions = captured.props?.editorData?.[0]?.actions ?? []
+    // 成片轴：0 → 7.72 → 11.72 → 14.56。若把素材坐标当轴坐标，第一段会落在 21.74 而不是 0。
+    expect(actions[0]?.start).toBeCloseTo(0, 6)
+    expect(actions[0]?.end).toBeCloseTo(7.72, 6)
+    expect(actions[1]?.start).toBeCloseTo(7.72, 6)
+    expect(actions[1]?.end).toBeCloseTo(11.72, 6)
+    expect(actions[2]?.start).toBeCloseTo(11.72, 6)
+    expect(actions[2]?.end).toBeCloseTo(14.56, 6)
+  })
+
+  it('turns line snapping off, which this recording would otherwise make destructive', () => {
+    // 开着它时实测一次拖动被吸到 −264 秒外；这条守住那个结论。
+    renderTimeline()
+    expect(captured.props?.dragLine).toBe(false)
+    expect(captured.props?.gridSnap).toBe(true)
+  })
+
+  it('reports a drag as a tool call instead of applying it', () => {
+    const { onEdit } = renderTimeline()
+    const action = { id: 'clip-1', start: 7.72, end: 11.72, effectId: 'clip' }
+    // 第二段在成片里 4.00 → 6.00 秒，即多取 2 秒素材。
+    captured.props?.onActionResizeEnd?.({ action: { ...action, end: 13.72 } })
+    expect(onEdit).toHaveBeenCalledWith({
+      tool: 'video_timeline_trim',
+      args: { timeline_id: 'tl-1', base_revision: 2, ordinal: 1, edge: 'end', delta_us: 2_000_000 },
+    })
+  })
+
+  it('scales a drag back into source time through the clip playback rate', () => {
+    const { onEdit } = renderTimeline()
+    // 第 2 段是 2 倍速：成片里延长 1 秒等于素材里多取 2 秒。
+    const action = { id: 'clip-2', start: 11.72, end: 14.56, effectId: 'clip' }
+    captured.props?.onActionMoveEnd?.({ action: { ...action, end: 15.56 } })
+    expect(onEdit).toHaveBeenCalledWith(expect.objectContaining({
+      args: expect.objectContaining({ ordinal: 2, edge: 'end', delta_us: 2_000_000 }),
+    }))
+  })
+
+  it('reports nothing when a drag left the clip alone', () => {
+    const { onEdit } = renderTimeline()
+    captured.props?.onActionMoveEnd?.({ action: { id: 'clip-1', start: 7.72, end: 11.72, effectId: 'clip' } })
+    // 一字未改的拖动要报 null，好让上层的「待确认」标记被清掉；直接丢掉汇报会让它卡住。
+    expect(onEdit).toHaveBeenCalledWith(null)
+  })
+
+  it('reports nothing when no timeline is loaded', () => {
+    const { onEdit } = renderTimeline({ timelineId: null })
+    captured.props?.onActionResizeEnd?.({ action: { id: 'clip-1', start: 7.72, end: 12.72, effectId: 'clip' } })
+    expect(onEdit).toHaveBeenCalledWith(null)
+  })
+
+  it('asks the player to move rather than moving a cursor of its own', () => {
+    const { onSeek } = renderTimeline()
+    captured.props?.onCursorDrag?.(3.5)
+    expect(onSeek).toHaveBeenCalledWith(3_500_000)
+    captured.props?.onClickTimeArea?.(8)
+    expect(onSeek).toHaveBeenCalledWith(8_000_000)
+  })
+
+  it('sends the playhead to the lane so both views agree', () => {
+    renderTimeline({ playheadUs: 12_500_000 })
+    expect(captured.setTime).toHaveBeenCalledWith(12.5)
+  })
+})
+
+describe('timeline controls', () => {
+  it('widens the scale when zoomed in and narrows it when zoomed out', () => {
+    const { container } = renderTimeline()
+    const initial = captured.props?.scaleWidth ?? 0
+    fireEvent.click(container.querySelector('[data-zoom="in"]') as Element)
+    expect(captured.props?.scaleWidth ?? 0).toBeGreaterThan(initial)
+    fireEvent.click(container.querySelector('[data-zoom="out"]') as Element)
+    fireEvent.click(container.querySelector('[data-zoom="out"]') as Element)
+    expect(captured.props?.scaleWidth ?? 0).toBeLessThan(initial)
+  })
+
+  it('takes the zoom slider as the scale itself', () => {
+    const { container } = renderTimeline()
+    // scaleWidth 就是「每秒多少像素」；把它和刻度秒数一起改等于没缩放 —— 验证时犯过这个错。
+    fireEvent.change(container.querySelector('[data-zoom-range]') as Element, { target: { value: '240' } })
+    expect(captured.props?.scaleWidth).toBe(240)
+  })
+})
+
+describe('what a clip looks like', () => {
+  it('names the clip and the stretch of recording it draws', () => {
+    renderTimeline()
+    const rendered = captured.props?.getActionRender?.({ id: 'clip-1', start: 7.72, end: 11.72, effectId: 'clip' })
+    render(<div data-shot="">{rendered}</div>)
+    const shot = document.querySelector('[data-shot]')
+    // 拖动之后最需要核对的就是「这一段取自哪里」，所以片段上必须写出来。
+    expect(shot?.textContent).toContain('272.5→276.5')
+    expect(shot?.textContent).toContain('#2')
+  })
+
+  it('draws a reported but unconfirmed edit differently from a settled one', () => {
+    renderTimeline({ pendingOrdinals: [1] })
+    render(<div data-shot="">{captured.props?.getActionRender?.({ id: 'clip-1', start: 7.72, end: 11.72, effectId: 'clip' })}</div>)
+    expect(document.querySelector('[data-shot] [data-clip-pending]')).not.toBeNull()
+  })
+
+  it('leaves a settled clip unmarked', () => {
+    renderTimeline({ pendingOrdinals: [] })
+    render(<div data-shot="">{captured.props?.getActionRender?.({ id: 'clip-0', start: 0, end: 7.72, effectId: 'clip' })}</div>)
+    expect(document.querySelector('[data-shot] [data-clip-pending]')).toBeNull()
+  })
+
+  it('renders nothing for an action this surface did not mint', () => {
+    renderTimeline()
+    expect(captured.props?.getActionRender?.({ id: 'foreign-1', start: 0, end: 1, effectId: 'x' })).toBeNull()
+  })
+})
+
+/** Evidence with two tracks present and four absent, as the host reports an asset. */
+const EVIDENCE = {
+  transcript: [{ start_us: 22_740_000, end_us: 24_740_000, text: '第一句' }],
+  chapters: [{ start_us: 22_740_000, end_us: 26_740_000, summary: '讲塔的来历', is_highlight: true }],
+  highlights: [{ start_us: 23_000_000, end_us: 25_000_000, reason: '塔的全景', confidence: 0.9 }],
+} as never
+
+/** All lanes visible. */
+const ALL_LANES = { transcript: true, screenText: true, shots: true, silences: true, loudness: true, chapters: true, highlights: true }
+
+/** No lanes visible. */
+const NO_LANES = { transcript: false, screenText: false, shots: false, silences: false, loudness: false, chapters: false, highlights: false }
+
+describe('evidence lanes', () => {
+  it('offers only the lanes the recording actually has evidence for', () => {
+    // 给一条没有证据的轨道，会让人以为「这里没有停顿」，而实际是「停顿还没测过」——
+    // 那是两个不同的结论，所以开关只列出真的有的。
+    expect(availableLanes(EVIDENCE)).toEqual(['transcript', 'chapters', 'highlights'])
+    // 章节没有自己的判定分支时，它会掉进高光的兜底：这条素材有高光、于是章节也被列出来，
+    // 而一条只有章节、没有高光的素材会反过来把章节藏掉。下面这条正是那个方向。
+    // 参数就是 tracks 本身，不要再包一层 `tracks` —— 包了会得到一个空对象，
+    // 断言于是因为「什么都没传」而通过或失败，与要守的那件事无关。
+    expect(availableLanes({ chapters: [{ start_us: 0, end_us: 1_000_000, summary: '开场', is_highlight: false }] } as never))
+      .toEqual(['chapters'])
+    expect(availableLanes(null)).toEqual([])
+    expect(availableLanes({} as never)).toEqual([])
+  })
+
+  it('adds one row per enabled lane, under the clip row', () => {
+    renderTimeline({ evidence: EVIDENCE, lanes: ALL_LANES })
+    const rows = captured.props?.editorData ?? []
+    // 第 1 行是片段，其后每行一条证据轨道。
+    expect(rows[0]?.id).toBe('clips')
+    expect(rows.map(row => row.id)).toEqual(['clips', 'transcript', 'screenText', 'shots', 'silences', 'loudness', 'chapters', 'highlights'])
+  })
+
+  it('draws a chapter as readable text, because the lane answers what a section is about', () => {
+    // 章节与高光来自同一份分析片段，画法却不同，因为回答的问题不同：章节要说「这一段讲了
+    // 什么」，文字必须铺开；高光只说「哪几段值得挑」，位置本身就是答案。
+    renderTimeline({ evidence: EVIDENCE, lanes: ALL_LANES })
+    const chapters = captured.props?.getActionRender?.({ id: 'lane-chapters', start: 0, end: 1, effectId: 'evidence' })
+    render(<div data-shot="">{chapters}</div>)
+    expect(document.querySelector('[data-shot] [data-evidence-text]')?.textContent).toBe('讲塔的来历')
+  })
+
+  it('draws a highlight as a block rather than as text', () => {
+    renderTimeline({ evidence: EVIDENCE, lanes: ALL_LANES })
+    const highlights = captured.props?.getActionRender?.({ id: 'lane-highlights', start: 0, end: 1, effectId: 'evidence' })
+    render(<div data-shot="">{highlights}</div>)
+    expect(document.querySelector('[data-shot] [data-evidence-mark="highlights"]')).not.toBeNull()
+    expect(document.querySelector('[data-shot] [data-evidence-text]')).toBeNull()
+  })
+
+  it('draws no evidence rows when no lane is enabled', () => {
+    renderTimeline({ evidence: EVIDENCE, lanes: NO_LANES })
+    expect((captured.props?.editorData ?? []).map(row => row.id)).toEqual(['clips'])
+  })
+
+  it('gives every evidence row one action covering the film, not a sliver of it', () => {
+    renderTimeline({ evidence: EVIDENCE, lanes: ALL_LANES })
+    const lane = (captured.props?.editorData ?? []).find(row => row.id === 'transcript')
+    expect(lane?.actions).toHaveLength(1)
+    expect(lane?.actions[0]?.id).toBe('lane-transcript')
+    expect(lane?.actions[0]?.effectId).toBe('evidence')
+    // 动作的像素宽度 = end × scaleWidth，所以 end 必须是**成片秒数**。
+    // 这两条守住两种都让轨道看起来是空的写法：end=1 把动作压成一秒宽，
+    // 而一个「很大」的 end 会把行撑到几百万像素、把成片挤成一条线。
+    expect(lane?.actions[0]?.end).toBeCloseTo(14.56, 6)
+    expect(lane?.actions[0]?.start).toBe(0)
+  })
+
+  it('keeps a lane renderable when the timeline has no clips yet', () => {
+    // 成片长度为 0 时动作宽度也是 0，库不渲染宽度为 0 的动作 —— 轨道会整个消失。
+    renderTimeline({ clips: [], evidence: EVIDENCE, lanes: ALL_LANES })
+    const lane = (captured.props?.editorData ?? []).find(row => row.id === 'transcript')
+    expect(lane?.actions[0]?.end).toBeGreaterThan(0)
+  })
+
+  it('does not let an evidence lane be dragged', () => {
+    // 证据是测出来的，不是剪出来的；让它可拖会产生一条改不了任何东西的编辑意图。
+    renderTimeline({ evidence: EVIDENCE, lanes: ALL_LANES })
+    const lane = (captured.props?.editorData ?? []).find(row => row.id === 'highlights')
+    expect(lane?.actions[0]?.movable).toBe(false)
+    expect(lane?.actions[0]?.flexible).toBe(false)
+  })
+
+  it('places a spoken line where the film uses that stretch of the recording', () => {
+    renderTimeline({ evidence: EVIDENCE, lanes: ALL_LANES })
+    const rendered = captured.props?.getActionRender?.({ id: 'lane-transcript', start: 0, end: 1, effectId: 'evidence' })
+    render(<div data-shot="">{rendered}</div>)
+    const mark = document.querySelector('[data-shot] [data-evidence-text]') as HTMLElement | null
+    expect(mark).not.toBeNull()
+    // 素材 22.74s 在第 1 段（成片 0→7.72s）里，落在 1.00s；成片总长 14.56s → 6.868%。
+    // 这条断的是「素材坐标被换算过」：直接拿素材秒数去除会被夹到 100%，
+    // 停在最右端，看上去像一个有意的位置。
+    expect(mark?.style.left).toBe('6.868131868131869%')
+  })
+
+  it('never places an evidence mark past the right edge of the film', () => {
+    renderTimeline({ evidence: EVIDENCE, lanes: ALL_LANES })
+    const rendered = captured.props?.getActionRender?.({ id: 'lane-transcript', start: 0, end: 1, effectId: 'evidence' })
+    render(<div data-shot="">{rendered}</div>)
+    const marks = [...document.querySelectorAll('[data-shot] [data-evidence-text]')] as HTMLElement[]
+    expect(marks.length).toBeGreaterThan(0)
+    for (const item of marks) expect(Number.parseFloat(item.style.left)).toBeLessThan(100)
+  })
+
+  it('marks the cut point lane with ticks, not blocks', () => {
+    renderTimeline({ evidence: { shots: [{ start_us: 23_000_000, end_us: 23_000_000 }] } as never, lanes: ALL_LANES })
+    const rendered = captured.props?.getActionRender?.({ id: 'lane-shots', start: 0, end: 1, effectId: 'evidence' })
+    // 零长度的切点在区间判定里会被丢掉，所以这里预期没有标记 —— 而不该出现一个宽度为 0 的块。
+    render(<div data-shot="">{rendered}</div>)
+    expect(document.querySelector('[data-shot] [data-evidence-mark="shots"]')).toBeNull()
+  })
+
+  it('reports nothing for an action id it did not mint', () => {
+    renderTimeline({ evidence: EVIDENCE, lanes: ALL_LANES })
+    expect(captured.props?.getActionRender?.({ id: 'lane-unknown', start: 0, end: 1, effectId: 'evidence' })).toBeNull()
+  })
+})

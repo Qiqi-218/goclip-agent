@@ -1,0 +1,148 @@
+/**
+ * The timeline's toolbar and lane.
+ *
+ * The library ships its own stylesheet for the lane itself; what lives here is the toolbar above
+ * it and the appearance of the clip blocks we draw through `getActionRender`.
+ *
+ * Clip colour is the one place this surface departs from the theme's neutral surfaces: a pending
+ * edit has to be distinguishable from a confirmed one at a glance, because the person is looking
+ * at a timeline that does not yet match the one the host holds.
+ */
+
+.timeline {
+  display: flex;
+  /* 占满父容器余下的高度。不写 flex:1 时它是 flex:0 1 auto，高度塌成内容 ——
+     而库内部的虚拟化网格需要一个**确定**的高度才能算出该有几行可见。 */
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.bar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+.barLabel {
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.barHint {
+  overflow: hidden;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.barSpacer {
+  flex: 1;
+}
+
+.zoomButton {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-xs);
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.zoomButton:hover {
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+.zoomRange {
+  width: 130px;
+  accent-color: var(--dsw-alias-brand-primary);
+}
+
+/* The lane scrolls horizontally; the library draws the ruler and rows inside it. */
+.lane {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/*
+ * The library's stylesheet fixes its root at 600×600 (`.timeline-editor`), which is larger than
+ * the space this panel gives it. Left alone it overflows the panel, and its internal virtualised
+ * grid sizes itself against 600px — so the rows are laid out for a viewport that is not there and
+ * the lane appears to have a large empty tail.
+ *
+ * `:global()` gives this override the specificity of two classes against the library's one, so it
+ * wins whichever stylesheet the bundler emits last.
+ */
+.lane :global(.timeline-editor) {
+  width: 100%;
+  height: 100%;
+}
+
+/* Clip block, drawn for every action through getActionRender. */
+.clip,
+.clipPending {
+  display: flex;
+  box-sizing: border-box;
+  gap: 4px;
+  align-items: center;
+  width: 100%;
+  height: 100%;
+  padding: 0 5px;
+  overflow: hidden;
+  border-radius: var(--dsw-radius-xs);
+  color: var(--dsw-alias-label-primary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.clip {
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+/* A reported but unconfirmed edit: dashed, so it never reads as the host's own state. */
+.clipPending {
+  border: 1px dashed var(--dsw-alias-brand-primary);
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+.clipName {
+  flex: none;
+  font-weight: 600;
+}
+
+.clipTag {
+  flex: none;
+  padding: 0 4px;
+  border-radius: var(--dsw-radius-xs);
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10px;
+}
+
+.clipRange {
+  overflow: hidden;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 10px;
+  text-overflow: ellipsis;
+}
+
+/* 证据轨道：内容自己按成片比例定位，所以这一层只是一个定位上下文。 */
+.evidenceLane {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}

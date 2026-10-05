@@ -55,6 +55,9 @@
 - insert:
     - id: ui-evidence
       name: "@deepseek-ai/dsh-client-ui-evidence"
+    # 剪辑工作台：占中心区，侧栏「工作台」按钮打开它。
+    - id: ui-workbench
+      name: "@deepseek-ai/dsh-client-ui-workbench"
 
 # ── 系统提示词注入 ────────────────────────────────────────────────────────────
 #
