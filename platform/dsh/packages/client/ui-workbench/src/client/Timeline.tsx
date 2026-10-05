@@ -48,6 +48,13 @@ export type TimelineProps =
     readonly pendingOrdinals: readonly number[]
     /** Called with the ordinal of a clip the person selected. */
     readonly onSelectClip: (ordinal: number) => void
+    /**
+     * Receives the zoom controls, or null when this lane goes away.
+     *
+     * The keyboard shortcuts live in the panel and the zoom lives here, so this is how a key press
+     * reaches it without the panel re-rendering on every scale change.
+     */
+    readonly onZoomReady?: (controls: ZoomControls | null) => void
     /** Measured evidence for the recording, or null while none was read. */
     readonly evidence: EvidencePayload['tracks'] | null
     /** Which evidence lanes to draw. */
@@ -108,11 +115,129 @@ const ZOOM_STEP = 1.5
  * @param props - the clips, the player's position, and the edit channel.
  * @returns the lane, with its zoom controls.
  */
+export interface ZoomControls {
+  /** Zoom in one step, anchored at the viewport centre. */
+  readonly in: () => void
+  /** Zoom out one step, anchored at the viewport centre. */
+  readonly out: () => void
+  /** Back to the default scale, anchored at the viewport centre. */
+  readonly reset: () => void
+}
+
 export function Timeline({
-  clips, assetDurationUs, playheadUs, onSeek, onEdit, onSelectClip, timelineId, baseRevision, pendingOrdinals, evidence, lanes, t,
+  clips, assetDurationUs, playheadUs, onSeek, onEdit, onSelectClip, onZoomReady, timelineId, baseRevision, pendingOrdinals, evidence, lanes, t,
 }: TimelineProps): ReactNode {
   const editorRef = useRef<TimelineState>(null)
   const [scaleWidth, setScaleWidth] = useState(DEFAULT_SCALE_WIDTH)
+  const viewport = useRef<HTMLDivElement>(null)
+  /**
+   * Where the lane is scrolled to, in pixels, read from the DOM at the moment it is needed.
+   *
+   * Read rather than tracked through the editor's scroll callback: that callback is not the only way
+   * the lane scrolls — a scrollbar drag, a trackpad gesture and the library's own auto-scroll all
+   * move it — and a value that is one event behind makes the zoom anchor drift. Measured against a
+   * real browser, relying on the callback left the anchor 25 seconds off after one wheel step.
+   *
+   * @returns The scroller's current horizontal offset, or 0 when it cannot be read.
+   */
+  const readScrollLeft = useCallback((): number => {
+    /*
+     * 要的是**编辑区**那个 grid，不是时间区那个：两者都是 `.ReactVirtualized__Grid`，
+     * 而时间区那个不滚动（`overflow: hidden`）。选错会把 0 当成滚动量 —— 锚定于是
+     * 按「已经在最左端」来算，实测漂了 25 秒。
+     */
+    const grid = viewport.current?.querySelector('.timeline-editor-edit-area .ReactVirtualized__Grid')
+    return grid instanceof HTMLElement ? grid.scrollLeft : 0
+  }, [])
+
+  /**
+   * Zoom while keeping one point of the axis where it is on screen.
+   *
+   * **Anchoring is the whole feature.** Zooming about the viewport's left edge moves the moment the
+   * person was looking at off screen, so the thing they were about to edit disappears exactly as
+   * they try to get closer to it. Anchoring about the pointer keeps it under the pointer; the zoom
+   * buttons anchor about the middle, because a button press has no pointer position on the axis.
+   *
+   * The arithmetic is the library's own mapping — `pixel = startLeft + time / scale * scaleWidth`,
+   * with `startLeft` at 0 — solved for the scroll offset that puts the anchored moment back where it
+   * was. Doing it any other way (scaling the scroll offset by the zoom ratio, say) drifts, because
+   * the anchor is not at the scroll origin.
+   *
+   * @param factor - how much to multiply the scale by; above 1 zooms in.
+   * @param anchorX - the pixel of the viewport to hold still, or null for its middle.
+   */
+  /**
+   * Move the lane's horizontal scroll, when the editor can.
+   *
+   * Guarded with a `typeof` check rather than a plain call: `setScrollLeft` is on the library's
+   * `TimelineState`, so the type says it is there, but a stub or a different build can hand back a
+   * handle without it — and the whole zoom would then throw instead of merely not re-anchoring.
+   *
+   * @param value - the new scroll offset in pixels.
+   */
+  const scrollTo = useCallback((value: number) => {
+    const editor = editorRef.current
+    if (editor === null || typeof editor.setScrollLeft !== 'function') return
+    editor.setScrollLeft(value)
+  }, [])
+
+  const zoomBy = useCallback((factor: number, anchorX: number | null) => {
+    const element = viewport.current
+    if (element === null) return
+    setScaleWidth(current => {
+      const next = Math.min(MAX_SCALE_WIDTH, Math.max(MIN_SCALE_WIDTH, current * factor))
+      if (next === current) return current
+      const anchor = anchorX === null ? element.clientWidth / 2 : anchorX
+      /*
+       * 锚点那一刻在轴上的位置是 `(scrollLeft + anchor) / current`；要让它缩放后仍落在
+       * 视口的同一处，新的滚动位置就是 `(scrollLeft + anchor) × next / current − anchor`。
+       * 先把滚动挪好再改缩放，否则会先画出一帧错位的内容。
+       */
+      const from = readScrollLeft()
+      const wanted = (from + anchor) * (next / current) - anchor
+      scrollTo(Math.max(0, Math.round(wanted)))
+      return next
+    })
+  }, [readScrollLeft, scrollTo])
+
+  /**
+   * Zoom to one factor outright, anchoring the viewport's centre.
+   *
+   * The keyboard shortcut needs this: a shortcut has no pointer position on the axis, and a person
+   * pressing "reset zoom" expects the view back at the start rather than scrolled to wherever they
+   * happened to be. Going through `zoomBy` would also keep the current scroll, which after a long
+   * zoom-in leaves the axis showing a stretch nobody asked for.
+   *
+   * @param width - the pixels-per-tick to use.
+   */
+  const zoomTo = useCallback((width: number) => {
+    const element = viewport.current
+    if (element === null) return
+    setScaleWidth(current => {
+      const next = Math.min(MAX_SCALE_WIDTH, Math.max(MIN_SCALE_WIDTH, width))
+      const anchor = element.clientWidth / 2
+      const from = readScrollLeft()
+      const wanted = (from + anchor) * (next / current) - anchor
+      scrollTo(Math.max(0, Math.round(wanted)))
+      return next
+    })
+  }, [])
+
+  /*
+   * The zoom controls a shortcut can reach.
+   *
+   * A ref rather than props: the shortcut lives in the panel, the zoom lives here, and the panel
+   * has no business re-rendering every time the scale changes just so a key press can read it.
+   */
+  useEffect(() => {
+    if (onZoomReady === undefined) return
+    onZoomReady({
+      in: () => zoomBy(ZOOM_STEP, null),
+      out: () => zoomBy(1 / ZOOM_STEP, null),
+      reset: () => zoomTo(DEFAULT_SCALE_WIDTH),
+    })
+    return () => onZoomReady(null)
+  }, [onZoomReady, zoomBy, zoomTo])
 
   const subject = useMemo<EditSubject>(() => ({ clips, assetDurationUs }), [clips, assetDurationUs])
   /*
@@ -165,6 +290,28 @@ export function Timeline({
     editorRef.current?.setTime(playheadUs / 1e6)
   }, [playheadUs])
 
+  /*
+   * Ctrl/⌘ + 滚轮缩放，锚在指针上。
+   *
+   * 监听器用原生注册而不是 React 的 `onWheel`：后者在 React 18 里是**被动**的，
+   * `preventDefault()` 会被忽略，于是浏览器在缩放的同时还会横向滚动一次 —— 看起来就是
+   * 「缩放了但跳到了别处」。`{ passive: false }` 是这里唯一能拦住它的写法。
+   *
+   * 不按修饰键时完全不干预：那种滚轮由库的滚动容器处理，是横向滚动，正是想要的。
+   */
+  useEffect(() => {
+    const element = viewport.current
+    if (element === null) return
+    const onWheel = (event: WheelEvent): void => {
+      if (!event.ctrlKey && !event.metaKey) return
+      event.preventDefault()
+      // 位移取符号即可：一格滚轮是一格缩放，触控板的细碎位移不该被放大成大幅跳变。
+      zoomBy(event.deltaY < 0 ? ZOOM_STEP : 1 / ZOOM_STEP, event.clientX - element.getBoundingClientRect().left)
+    }
+    element.addEventListener('wheel', onWheel, { passive: false })
+    return () => element.removeEventListener('wheel', onWheel)
+  }, [zoomBy])
+
   return (
     <div className={styles.timeline} data-timeline="">
       <div className={styles.bar}>
@@ -184,7 +331,7 @@ export function Timeline({
         <button
           type="button" className={styles.zoomButton} data-zoom="out"
           aria-label={t('timeline.zoomOut')} title={t('timeline.zoomOut')}
-          onClick={() => setScaleWidth(value => Math.max(MIN_SCALE_WIDTH, value / ZOOM_STEP))}
+          onClick={() => zoomBy(1 / ZOOM_STEP, null)}
         >−</button>
         <input
           type="range" className={styles.zoomRange} data-zoom-range=""
@@ -195,11 +342,11 @@ export function Timeline({
         <button
           type="button" className={styles.zoomButton} data-zoom="in"
           aria-label={t('timeline.zoomIn')} title={t('timeline.zoomIn')}
-          onClick={() => setScaleWidth(value => Math.min(MAX_SCALE_WIDTH, value * ZOOM_STEP))}
+          onClick={() => zoomBy(ZOOM_STEP, null)}
         >＋</button>
       </div>
 
-      <div className={styles.lane} data-timeline-viewport="">
+      <div className={styles.lane} ref={viewport} data-timeline-viewport="">
         <EditorTimeline
           ref={editorRef}
           editorData={rows}

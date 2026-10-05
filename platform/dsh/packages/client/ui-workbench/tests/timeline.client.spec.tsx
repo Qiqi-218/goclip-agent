@@ -38,18 +38,39 @@ interface CapturedProps {
   onActionResizeEnd?: (param: { action: FakeAction }) => void
 }
 
-const captured: { props: CapturedProps | null, setTime: ReturnType<typeof vi.fn> } = {
+const captured: { props: CapturedProps | null, setTime: ReturnType<typeof vi.fn>, scrollLeft: number[] } = {
   props: null,
   setTime: vi.fn(),
+  scrollLeft: [],
 }
 
 vi.mock('@xzdarcy/react-timeline-editor', () => ({
   // 替身必须转发 ref：这个组件用 ref 调 `setTime` 把播放头推给车道，
   // 不转发的替身会让「播放头联动」那条测试因为 ref 为 null 而失败 —— 而那是替身的缺陷。
+  //
+  // `setScrollLeft` 也要给：缩放用它把光标下那一刻钉住，而真实库的 `TimelineState` 里
+  // 确实有这个方法。替身只给一半接口时，测出来的是替身的短板而不是组件的行为。
   Timeline: forwardRef((props: CapturedProps, ref: unknown) => {
     captured.props = props
-    useImperativeHandle(ref as never, () => ({ setTime: captured.setTime, getTime: () => 0 }), [])
-    return <div data-editor="" />
+    useImperativeHandle(ref as never, () => ({
+      setTime: captured.setTime,
+      getTime: () => 0,
+      setScrollLeft: (value: number) => { captured.scrollLeft.push(value) },
+    }), [])
+    /*
+     * 替身要画出**真实的滚动容器结构**：组件从
+     * `.timeline-editor-edit-area .ReactVirtualized__Grid` 上读滚动量。
+     *
+     * 这一层不能省。库里有**两个** `.ReactVirtualized__Grid`（时间区一个、编辑区一个），
+     * 而时间区那个不滚动 —— 组件最初就是选错了那个，实测锚定漂了 25 秒。
+     * 替身若只给一个 grid，那条错就永远测不出来。
+     */
+    return (
+      <div data-editor="">
+        <div className="timeline-editor-time-area"><div className="ReactVirtualized__Grid" data-time-grid="" /></div>
+        <div className="timeline-editor-edit-area"><div className="ReactVirtualized__Grid" data-edit-grid="" /></div>
+      </div>
+    )
   }),
 }))
 vi.mock('@xzdarcy/react-timeline-editor/dist/react-timeline-editor.css', () => ({}))
@@ -58,7 +79,7 @@ const { Timeline } = await import('../src/client/Timeline.tsx')
 const { zh } = await import('../src/client/locales.ts')
 const { availableLanes } = await import('../src/client/Timeline.tsx')
 
-beforeEach(() => { captured.props = null; captured.setTime.mockClear() })
+beforeEach(() => { captured.props = null; captured.setTime.mockClear(); captured.scrollLeft = [] })
 afterEach(cleanup)
 
 /**
@@ -359,5 +380,95 @@ describe('evidence lanes', () => {
   it('reports nothing for an action id it did not mint', () => {
     renderTimeline({ evidence: EVIDENCE, lanes: ALL_LANES })
     expect(captured.props?.getActionRender?.({ id: 'lane-unknown', start: 0, end: 1, effectId: 'evidence' })).toBeNull()
+  })
+})
+describe('zooming the timeline', () => {
+  /** A viewport wide enough that the anchor arithmetic has something to work with. */
+  const VIEWPORT_WIDTH = 1000
+
+  beforeEach(() => {
+    Object.defineProperty(HTMLElement.prototype, 'clientWidth', { configurable: true, get: () => VIEWPORT_WIDTH })
+  })
+
+  /**
+   * Scroll the lane the way the editor reports it.
+   * @param container - the rendered tree.
+   * @param left - the offset in pixels.
+   */
+  function scrollTo(container: HTMLElement, left: number): void {
+    // 组件从**编辑区**那个 grid 上读滚动量；改它的 scrollLeft 就是「这条道被滚动过」。
+    const grid = container.querySelector('[data-edit-grid]') as HTMLElement
+    expect(grid).not.toBeNull()
+    Object.defineProperty(grid, 'scrollLeft', { value: left, configurable: true, writable: true })
+  }
+
+  it('changes the scale on ctrl-wheel, and leaves a plain wheel alone', () => {
+    // 不按修饰键时完全不干预：那种滚轮是横向滚动，正是想要的。
+    const { container } = renderTimeline()
+    const lane = container.querySelector('[data-timeline-viewport]') as HTMLElement
+    const before = captured.props?.scaleWidth ?? 0
+    fireEvent.wheel(lane, { deltaY: -100 })
+    expect(captured.props?.scaleWidth).toBe(before)
+    fireEvent.wheel(lane, { deltaY: -100, ctrlKey: true, clientX: 400 })
+    expect(captured.props?.scaleWidth ?? 0).toBeGreaterThan(before)
+  })
+
+  it('zooms out on a downward ctrl-wheel', () => {
+    const { container } = renderTimeline()
+    const lane = container.querySelector('[data-timeline-viewport]') as HTMLElement
+    const before = captured.props?.scaleWidth ?? 0
+    fireEvent.wheel(lane, { deltaY: 100, ctrlKey: true, clientX: 400 })
+    expect(captured.props?.scaleWidth ?? 0).toBeLessThan(before)
+  })
+
+  it('holds the moment under the pointer still', () => {
+    /*
+     * 这是缩放做对与做错的分界：缩放若以视口左缘为锚，人正要放大的那一刻会被推出屏幕，
+     * 于是「想看清楚」的动作恰好把要看的东西弄丢。
+     *
+     * 换算：`scrollNeeded = (scrollLeft + anchor) × next / old − anchor`。
+     * 从 scaleWidth 4、滚到 400px、指针在 400px 处放大 1.5 倍：
+     * (400 + 400) × 6 / 4 − 400 = 800。锚点那一刻仍在视口的同一处。
+     *
+     * 若按「滚动量乘缩放比」（400 × 1.5 = 600）就会漂 —— 因为锚点不在滚动原点上。
+     */
+    const { container } = renderTimeline()
+    const lane = container.querySelector('[data-timeline-viewport]') as HTMLElement
+    scrollTo(container, 400)
+    fireEvent.wheel(lane, { deltaY: -100, ctrlKey: true, clientX: 400 })
+    expect(captured.props?.scaleWidth).toBe(6)
+    expect(captured.scrollLeft).toEqual([800])
+  })
+
+  it('holds the centre still for the zoom buttons, which have no pointer', () => {
+    // 按钮没有指针位置，所以锚在视口中心：从滚到 200px 处放大 1.5 倍，
+    // (200 + 500) × 6 / 4 − 500 = 550。
+    const { container } = renderTimeline()
+    scrollTo(container, 200)
+    fireEvent.click(container.querySelector('[data-zoom="in"]') as Element)
+    expect(captured.props?.scaleWidth).toBe(6)
+    expect(captured.scrollLeft).toEqual([550])
+  })
+
+  it('does not scroll into negative territory at the very start', () => {
+    // 已经在最左端时缩小：算出来是负数，夹到 0 —— 否则库会收到一个非法滚动量。
+    const { container } = renderTimeline()
+    const lane = container.querySelector('[data-timeline-viewport]') as HTMLElement
+    scrollTo(container, 0)
+    fireEvent.wheel(lane, { deltaY: 100, ctrlKey: true, clientX: 0 })
+    expect(captured.scrollLeft.every(value => value >= 0)).toBe(true)
+  })
+
+  it('stops at the scale limits rather than running past them', () => {
+    const { container } = renderTimeline()
+    const lane = container.querySelector('[data-timeline-viewport]') as HTMLElement
+    for (let press = 0; press < 30; press += 1) {
+      fireEvent.wheel(lane, { deltaY: -100, ctrlKey: true, clientX: 400 })
+    }
+    expect(captured.props?.scaleWidth).toBe(400)
+    for (let press = 0; press < 60; press += 1) {
+      fireEvent.wheel(lane, { deltaY: 100, ctrlKey: true, clientX: 400 })
+    }
+    expect(captured.props?.scaleWidth).toBe(0.5)
   })
 })

@@ -18,7 +18,7 @@
  */
 import type { TimelineAction, TimelineRow } from '@xzdarcy/timeline-engine'
 import type { ClipSpan } from './timing.ts'
-import { layoutOnSourceAxis, trimDeltaFromAxis } from './timing.ts'
+import { layoutOnSourceAxis, rateOf, trimDeltaFromAxis } from './timing.ts'
 
 /** One clip as the media route serialises it, plus the asset bounds its edits are limited by. */
 export interface EditableClip extends ClipSpan {
@@ -107,7 +107,22 @@ export function toRows(subject: EditSubject): TimelineRow[] {
  * instruction the tool cannot carry out — is a mistake the compiler should catch rather than the
  * host.
  */
-export type EditIntent = TrimIntent | RevertIntent | SplitIntent | MergeIntent | RemoveIntent | RenameIntent | ReorderIntent | NameSegmentIntent | AdjustIntent
+export type EditIntent = AddIntent | TrimIntent | RevertIntent | SplitIntent | MergeIntent | RemoveIntent | RenameIntent | ReorderIntent | NameSegmentIntent | AdjustIntent
+
+/** Add a copy of a stretch of the recording to the end of the timeline. */
+export interface AddIntent {
+  /** Tool name to invoke. */
+  readonly tool: 'video_timeline_add'
+  /** Arguments for that tool. */
+  readonly args: {
+    readonly timeline_id: string
+    readonly base_revision: number
+    readonly asset_id: string
+    readonly start_us: number
+    readonly end_us: number
+    readonly speed: number
+  }
+}
 
 /** Move one clip to another position in the running order. */
 export interface ReorderIntent {
@@ -352,6 +367,41 @@ export function canMergeWithNext(first: EditableClip, second: EditableClip): boo
 }
 
 /**
+ * The call that would add a copy of one clip to the end of the timeline.
+ *
+ * "Paste" is an append because that is what the host's add operation does: it appends to the end.
+ * A paste that claimed to insert at a position would need an add followed by a reorder, and the
+ * reorder's ordinal is only known once the first call has landed — two calls where the second's
+ * argument depends on the first's result. That sequencing belongs to the agent that owns the
+ * conversation, not to a keyboard shortcut. Appending is predictable, and where the copy landed is
+ * visible on the axis immediately.
+ *
+ * @param clip - the clip to copy, in recording time.
+ * @param assetId - the recording it was cut from.
+ * @param timelineId - the timeline to add it to.
+ * @param baseRevision - the revision the caller last read.
+ * @returns The call to make.
+ */
+export function copyToEndIntent(
+  clip: ClipSpan,
+  assetId: string,
+  timelineId: string,
+  baseRevision: number,
+): AddIntent {
+  return {
+    tool: 'video_timeline_add',
+    args: {
+      timeline_id: timelineId,
+      base_revision: baseRevision,
+      asset_id: assetId,
+      start_us: clip.start_us,
+      end_us: clip.end_us,
+      speed: rateOf(clip.speed),
+    },
+  }
+}
+
+/**
  * The clip an intent is about, or null when it is not about a clip.
  *
  * A revision restore and a rename act on the timeline, not on one of its clips; every other intent
@@ -365,6 +415,8 @@ export function clipOfIntent(intent: EditIntent): number | null {
   switch (intent.tool) {
     case 'video_timeline_revert':
     case 'video_timeline_rename':
+    // 追加一段不针对已有的某一段，所以没有待确认的序号。
+    case 'video_timeline_add':
       return null
     // 重排说的是「把第 from 段挪走」，受影响的正是 from 那一段。
     case 'video_timeline_reorder':

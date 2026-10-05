@@ -232,3 +232,13 @@
 .lanesGap {
   width: 12px;
 }
+/* 快捷键提示：一行小字，紧贴时间线下方。 */
+.shortcuts {
+  flex: none;
+  margin: 0;
+  padding: 3px 10px;
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 10px;
+  line-height: 1.5;
+}

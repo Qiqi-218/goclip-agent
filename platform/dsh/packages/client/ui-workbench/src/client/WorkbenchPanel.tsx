@@ -23,7 +23,7 @@ import type { PropsLocale, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-cli
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import { OutputList } from './OutputList.tsx'
 import { Player } from './Player.tsx'
-import { clipOfIntent, revertIntent, type EditIntent, type EditableClip } from './editor-model.ts'
+import { clipOfIntent, copyToEndIntent, revertIntent, type EditIntent, type EditableClip } from './editor-model.ts'
 import { ClipActions } from './ClipActions.tsx'
 import { Divider } from './Divider.tsx'
 import { SubtitleOverlay } from './SubtitleOverlay.tsx'
@@ -31,7 +31,7 @@ import { cueAt, previewCues, previewStyle, type PreviewCue } from './subtitle-pr
 import { RevisionList } from './RevisionList.tsx'
 import { EVIDENCE_LANES, type EvidenceLaneKey } from './evidence-model.ts'
 import { createWorkbenchLayoutStore, DEFAULT_LAYOUT, resolveDivision, resolveLowerHeight, type LayoutState } from './layout-store.ts'
-import { Timeline, availableLanes } from './Timeline.tsx'
+import { Timeline, availableLanes, type ZoomControls } from './Timeline.tsx'
 import { assetFromAddress, mediaUrl, readEvidence, readHistory, readLoudness, readRenders, readTimelines, type EvidencePayload, type HistoryPayload, type Read, type WorkbenchAsset } from './read.ts'
 import styles from './WorkbenchPanel.module.css'
 
@@ -187,6 +187,16 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
   const [preview, setPreview] = useState(false)
   // 舞台尺寸由覆盖层自己量出来：样式里的字号是画面高度的**占比**，没有真实尺寸就算不出像素。
   const [stageSize, setStageSize] = useState<{ width: number, height: number } | null>(null)
+  /**
+   * 快捷键复制过的那一段。
+   *
+   * 放在组件 state 而不是声明的 store 里：剪贴板是一次手势，不是一项偏好；放 store 会让它
+   * 跨重挂载活下来，那反而意外。
+   */
+  const [clipboard, setClipboard] = useState<EditableClip | null>(null)
+  /** 时间线交给面板的缩放控件；快捷键靠它触到缩放（见 Timeline 的 onZoomReady）。 */
+  const zoomRef = useRef<ZoomControls | null>(null)
+  const holdZoom = useCallback((controls: ZoomControls | null) => { zoomRef.current = controls }, [])
 
   if (target === null) {
     return (
@@ -209,6 +219,9 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
     ordinal: clip.ordinal, start_us: clip.start_us, end_us: clip.end_us, speed: clip.speed, muted: clip.muted, name: clip.name,
   }))
   const selectedClip = editableClips.find(clip => clip.ordinal === selectedOrdinal) ?? null
+  // 快捷键要用到这两个 id；活动时间线还没读到时它们是 null，快捷键于是整体不生效。
+  const timelineId = active?.id ?? null
+  const assetId = target.assetId
   const films = renders.status === 'ok' ? renders.value.renders : []
   const tracks = evidence.status === 'ok' ? evidence.value.tracks : null
   // 只提供这条素材**真的有**的轨道：给一条空轨道会让人以为「这里没有停顿」，
@@ -270,8 +283,71 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
     actions.setDivision(division, DEFAULT_LAYOUT[division])
   }, [actions])
 
+  /**
+   * Keyboard shortcuts for the selected clip and for zoom.
+   *
+   * Four rules, each for a reason that shows up in use:
+   *
+   * - **Nothing fires while a field has focus.** Otherwise typing a clip's name deletes clips. The
+   *   rename box, the zoom slider and the seek bar are all keyboard-reachable.
+   * - **Nothing fires outside this panel.** The workbench is one surface beside a conversation; a
+   *   shortcut that removed a clip while somebody typed in the composer would be a bug with a long
+   *   reach.
+   * - **Zoom keys carry a modifier** — `Ctrl/⌘` plus `=`, `-` or `0`. Without one they are ordinary
+   *   characters, and the rename box is not the only place somebody types.
+   * - **Delete and Space stay unclaimed.** The seek bar uses arrows and a video element uses Space;
+   *   taking those keys would break controls that already work.
+   *
+   * A shortcut produces the same tool call its button does, so it goes through the same channel and
+   * leaves the same "proposed, not applied yet" marker. Nothing here writes.
+   */
+  const panel = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent): void => {
+      const node = panel.current
+      const target = event.target
+      if (node === null || !(target instanceof HTMLElement)) return
+      // 输入类控件里不抢键；否则给片段改名时打字会变成删片段。
+      if (target.isContentEditable || target.closest('input, textarea, select, [role="textbox"]') !== null) return
+      if (!node.contains(target)) return
+      if (timelineId === null) return
+      const mod = event.ctrlKey || event.metaKey
+      const key = event.key.toLowerCase()
+      const clip = editableClips.find(candidate => candidate.ordinal === selectedOrdinal) ?? null
+
+      if (mod && (key === '=' || key === '+' || key === '-')) {
+        event.preventDefault()
+        if (key === '-') zoomRef.current?.out()
+        else zoomRef.current?.in()
+        return
+      }
+      if (mod && key === '0') { event.preventDefault(); zoomRef.current?.reset(); return }
+      if (key === 'escape') { setSelectedOrdinal(null); return }
+      if (clip === null) return
+
+      if (mod && (key === 'c' || key === 'x')) {
+        event.preventDefault()
+        setClipboard(clip)
+        // 剪切＝复制 + 删除。两步都走同一条通道，所以留下的待确认标记与按钮一致。
+        if (key === 'x') {
+          onEdit({ tool: 'video_timeline_remove', args: { timeline_id: timelineId, base_revision: active?.revision ?? 0, ordinal: clip.ordinal } })
+        }
+        return
+      }
+      if (mod && (key === 'v' || key === 'd')) {
+        // 粘贴与「复制一份」在宿主这里是同一个动作：追加一段同样的素材。见 copyToEndIntent。
+        const source = key === 'v' ? clipboard : clip
+        if (source === null || assetId === null) return
+        event.preventDefault()
+        onEdit(copyToEndIntent(source, assetId, timelineId, active?.revision ?? 0))
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [active?.revision, assetId, clipboard, editableClips, onEdit, selectedOrdinal, timelineId])
+
   return (
-    <div className={styles.workbench} data-workbench="">
+    <div className={styles.workbench} data-workbench="" ref={panel}>
       <div className={styles.stage} ref={stageBox}>
         <aside className={styles.side} style={{ width: layout.leftWidth }} data-area="clips">
           <h2 className={styles.heading}>{t('timeline.trackVideo')}</h2>
@@ -285,7 +361,13 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
                   className={styles.clipRow}
                   data-list-clip={clip.ordinal}
                   data-list-pending={pending.includes(clip.ordinal) ? '' : undefined}
-                  onClick={() => askSeek(clip.start_us)}
+                  /*
+                   * 点列表里的一行既选中它、也让画面跳到它开头。
+                   *
+                   * 原来只跳转不选中，于是「在列表里点一段、再按 Ctrl+C」什么都不会发生 ——
+                   * 而列表是选片段最自然的地方。动作条随之出现，否则看不出选中的是哪一段。
+                   */
+                  onClick={() => { setSelectedOrdinal(clip.ordinal); askSeek(clip.start_us) }}
                 >
                   <span className={styles.clipIndex}>{clip.ordinal + 1}</span>
                   {/* 人起的名字优先于序号：序号是位置，名字是这一段是什么。
@@ -388,6 +470,7 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
           onEdit={onEdit}
           onSeek={askSeek}
           onSelectClip={setSelectedOrdinal}
+          onZoomReady={holdZoom}
           pendingOrdinals={pending}
           playheadUs={playheadUs}
           t={t}
@@ -436,6 +519,12 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
           {t('subtitle.preview')}
         </button>
       </div>
+
+      {/*
+       * 快捷键写在这里而不是藏进帮助：没有提示的快捷键等于不存在，而这一行本来就空着 ——
+       * 所以它不占新的高度。
+       */}
+      <p className={styles.shortcuts} data-shortcuts="">{t('shortcuts.hint')}</p>
 
       {lastEdit !== null && (
         <p className={styles.pending} data-pending-edit="">

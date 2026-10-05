@@ -371,3 +371,123 @@ describe('the subtitle preview', () => {
     expect(container.querySelector('[data-subtitle-preview-toggle]')).not.toBeNull()
   })
 })
+describe('keyboard shortcuts', () => {
+  /**
+   * Press a key on an element inside the panel.
+   * @param container - the rendered tree.
+   * @param init - the keyboard event's fields.
+   */
+  function press(container: HTMLElement, init: KeyboardEventInit): void {
+    /*
+     * 派发在面板**内部的真实控件**上，而不是容器本身。
+     *
+     * 真实事件里 `event.target` 是被聚焦的那个元素；派发在容器上会让 target 变成容器，
+     * 而处理器只处理元素节点 —— 于是测出来的是「事件没到」而不是快捷键的行为。
+     */
+    const target = container.querySelector('[data-shortcut-anchor]')
+      ?? container.querySelector('button')
+      ?? container
+    fireEvent.keyDown(target, init)
+  }
+
+  /**
+   * Select the first clip, which every clip shortcut needs.
+   *
+   * The wait is for the **clip rows**, not for the action bar: the bar is in the tree from the first
+   * render, so waiting on it returns immediately and the click then lands on nothing — which is how
+   * this helper first failed, and it looked exactly like "the shortcut does not work".
+   */
+  async function selectFirst(container: HTMLElement): Promise<void> {
+    await waitFor(() => expect(container.querySelectorAll('[data-list-clip]').length).toBeGreaterThan(0))
+    fireEvent.click(container.querySelector('[data-list-clip="0"]') as Element)
+  }
+
+  it('copies the selected clip and pastes it as a new clip at the end', async () => {
+    /*
+     * 粘贴在宿主这里是**追加**：`video_timeline_add` 就是追加。
+     * 声称「插入到某个位置」需要 add + reorder 两次调用，而第二次的序号要等第一次落地才知道 ——
+     * 那属于掌握对话的 Agent，不属于一个快捷键。
+     */
+    stubReads()
+    const { container } = renderPanel(zh, { projectId: 'proj', assetId: 'asset' })
+    await selectFirst(container)
+    press(container, { key: 'c', ctrlKey: true })
+    press(container, { key: 'v', ctrlKey: true })
+    // 面板把提出的调用显示出来，而不是自己写数据。
+    await waitFor(() => expect(container.querySelector('[data-pending-edit]')).not.toBeNull())
+    expect(container.querySelector('[data-pending-edit]')?.textContent).toContain('video_timeline_add')
+  })
+
+  it('cuts by removing the clip as well as remembering it', async () => {
+    // 剪切 = 复制 + 删除。只复制不删就只是复制，那是另一个快捷键。
+    stubReads()
+    const { container } = renderPanel(zh, { projectId: 'proj', assetId: 'asset' })
+    await selectFirst(container)
+    press(container, { key: 'x', ctrlKey: true })
+    await waitFor(() => expect(container.querySelector('[data-pending-edit]')).not.toBeNull())
+    expect(container.querySelector('[data-pending-edit]')?.textContent).toContain('video_timeline_remove')
+  })
+
+  it('duplicates the selected clip without touching the clipboard', async () => {
+    // Ctrl+D 用的是选中的那一段，不是剪贴板 —— 否则它会悄悄粘贴一段更早复制的东西。
+    stubReads()
+    const { container } = renderPanel(zh, { projectId: 'proj', assetId: 'asset' })
+    await selectFirst(container)
+    press(container, { key: 'd', ctrlKey: true })
+    await waitFor(() => expect(container.querySelector('[data-pending-edit]')).not.toBeNull())
+    expect(container.querySelector('[data-pending-edit]')?.textContent).toContain('video_timeline_add')
+  })
+
+  it('does nothing when no clip is selected', async () => {
+    // 没有选中时按复制，复制的是「什么都没有」；不该产生任何调用。
+    stubReads()
+    const { container } = renderPanel(zh, { projectId: 'proj', assetId: 'asset' })
+    await waitFor(() => expect(container.querySelectorAll('[data-list-clip]')).toHaveLength(2))
+    press(container, { key: 'c', ctrlKey: true })
+    press(container, { key: 'v', ctrlKey: true })
+    expect(container.querySelector('[data-pending-edit]')).toBeNull()
+  })
+
+  it('leaves the keys alone while a field has focus', async () => {
+    /*
+     * 这一条最要紧：给片段改名时打字，若快捷键还在监听，敲一个 c 就会去复制、
+     * 敲 v 就会去粘贴 —— 打字变成了改时间线。
+     */
+    stubReads()
+    const { container } = renderPanel(zh, { projectId: 'proj', assetId: 'asset' })
+    await selectFirst(container)
+    const field = container.querySelector('[data-clip-rename]') as HTMLInputElement
+    fireEvent.keyDown(field, { key: 'c', ctrlKey: true })
+    fireEvent.keyDown(field, { key: 'v', ctrlKey: true })
+    expect(container.querySelector('[data-pending-edit]')).toBeNull()
+  })
+
+  it('leaves the keys alone outside the panel', async () => {
+    // 工作台是对话旁边的**一个**界面；在输入框里打字却删掉一个片段，是不能接受的。
+    stubReads()
+    const { container } = renderPanel(zh, { projectId: 'proj', assetId: 'asset' })
+    await selectFirst(container)
+    const outside = document.createElement('div')
+    document.body.append(outside)
+    fireEvent.keyDown(outside, { key: 'x', ctrlKey: true })
+    expect(container.querySelector('[data-pending-edit]')).toBeNull()
+  })
+
+  it('clears the selection on escape', async () => {
+    stubReads()
+    const { container } = renderPanel(zh, { projectId: 'proj', assetId: 'asset' })
+    await selectFirst(container)
+    expect(container.querySelector('[data-clip-actions-for]')).not.toBeNull()
+    press(container, { key: 'Escape' })
+    await waitFor(() => expect(container.querySelector('[data-clip-actions-for]')).toBeNull())
+    expect(container.querySelector('[data-clip-actions-hint]')).not.toBeNull()
+  })
+
+  it('names the shortcuts somewhere a person can find them', async () => {
+    // 没有提示的快捷键等于不存在。这一行本来就空着，所以它不占新的高度。
+    stubReads()
+    const { container } = renderPanel(zh, { projectId: 'proj', assetId: 'asset' })
+    await waitFor(() => expect(container.querySelector('[data-shortcuts]')).not.toBeNull())
+    expect(container.querySelector('[data-shortcuts]')?.textContent).toContain('Ctrl')
+  })
+})
