@@ -82,3 +82,17 @@ platform/dsh/worktrees/
 platform/dsh/.agents/worktrees/
 platform/dsh/.typert-*/
 platform/dsh/native/system/test/bin/
+# 编译产物本该落在 lib/。给一个包新加 tsconfig 引用后强制重建时，被引用包的
+# js/d.ts 会被写到它自己的 src/ 旁边（实测出现过两次：一次不可复现，一次在
+# `tsc -b --force` 之后稳定出现，两个包共 176 个文件）。这些不是源码。
+#
+# 模式里的 `**/` 是必须的：写成 `src/*.d.ts` 只匹配 src 的**直接**子项，
+# 而产物落在 src/components/、src/client/ 这些子目录里，一条都挡不住 ——
+# 实测 176 个文件全部漏网，只能事后手工清掉。
+platform/dsh/packages/**/src/**/*.js
+platform/dsh/packages/**/src/**/*.js.map
+platform/dsh/packages/**/src/**/*.d.ts
+platform/dsh/packages/**/src/**/*.d.ts.map
+
+# 浏览器检查的截图：每次跑都会重新生成，提交它们会让每次界面改动都多出几 MB。
+scripts/tools/verify/screens/

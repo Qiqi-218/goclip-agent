@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto'
+import { DEFAULT_SUBTITLE_STYLE, resolveSubtitleStyle, toAssStyle, type SubtitleStyle, type SubtitleStyleInput } from './subtitle-style.ts'
 import { createReadStream, createWriteStream, existsSync } from 'node:fs'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
@@ -138,6 +139,8 @@ export interface StageTiming {
   skipped?: boolean
   /** Why the step was skipped. Present only with `skipped`. */
   reason?: string
+  /** Whether the step finished or threw. Absent only on entries recorded before this field existed. */
+  outcome?: 'ok' | 'failed'
 }
 
 /**
@@ -151,13 +154,28 @@ export interface StageTiming {
 class StageRecorder {
   private readonly stages: StageTiming[] = []
   reset(): void { this.stages.length = 0 }
-  /** Time one step, recording it whether it succeeds or throws. */
+  /**
+   * Time one step, recording it whether it succeeds or throws.
+   *
+   * The outcome is recorded, not only the duration. A list that carries timings alone cannot answer
+   * "which step failed": the reader sees a pipeline that stops partway and cannot tell whether the
+   * last entry failed or was simply never reached. Marking the entry is what turns the list into a
+   * diagnosis.
+   */
   async timed<T>(stage: string, work: () => Promise<T>): Promise<T> {
     const started = Date.now()
     try {
-      return await work()
-    } finally {
-      this.stages.push({ stage, ms: Date.now() - started })
+      const result = await work()
+      this.stages.push({ stage, ms: Date.now() - started, outcome: 'ok' })
+      return result
+    } catch (error) {
+      this.stages.push({
+        stage,
+        ms: Date.now() - started,
+        outcome: 'failed',
+        reason: error instanceof Error ? error.message : String(error),
+      })
+      throw error
     }
   }
   snapshot(): StageTiming[] { return this.stages.map(entry => ({ ...entry })) }
@@ -170,6 +188,34 @@ class StageRecorder {
    * exists to provide.
    */
   skipped(stage: string, reason: string): void { this.stages.push({ stage, ms: 0, skipped: true, reason }) }
+}
+
+/**
+ * Read one render attempt's stored detail.
+ *
+ * A job's `detail` column holds two different things depending on when it was written: a sentence
+ * for a film that finished, and — since failures started being recorded in full — a JSON record of
+ * the error and the stages reached. Reading it as though it were always JSON would lose the note on
+ * every film rendered before that change; reading it as though it were always text would lose the
+ * stage a failure died at. So it is tried as JSON and otherwise reported as a plain note.
+ *
+ * @param status - the job's stored status.
+ * @param detail - the stored column, or null.
+ * @returns The fields to add to the report for this attempt.
+ */
+export function renderDetail(detail: string | null): Data {
+  if (detail === null || detail === '') return { note: null, failed_stage: null, stages: [] }
+  try {
+    const parsed = JSON.parse(detail) as { error?: unknown, failed_stage?: unknown, stages?: unknown }
+    return {
+      note: typeof parsed.error === 'string' ? parsed.error : null,
+      failed_stage: typeof parsed.failed_stage === 'string' ? parsed.failed_stage : null,
+      stages: Array.isArray(parsed.stages) ? parsed.stages : [],
+    }
+  } catch {
+    // 旧的纯文本 detail：只当作备注，不假装知道阶段。
+    return { note: detail, failed_stage: null, stages: [] }
+  }
 }
 
 type Data = Record<string, unknown>
@@ -382,8 +428,10 @@ export class VideoWorkspace {
     // 放在建表之前开，迁移期间的写入也受约束保护。
     db.exec('PRAGMA foreign_keys=ON')
     db.exec(SCHEMA)
-    // 两者都必须在表建好之后：一个要补列，一个要读 timeline_segments。
+    // 都必须在表建好之后：两个补列，一个要读 timeline_segments。
     this.addTimelineNameColumn(db)
+    this.addTimelineSubtitleStyleColumn(db)
+    this.addSegmentNameColumn(db)
     this.backfillSingleClipTimelines(db)
     // restore 依赖 this.db 已就位（它自己会去读），所以先赋值再恢复。
     this.db = db
@@ -419,6 +467,43 @@ export class VideoWorkspace {
       db.exec('ALTER TABLE timelines ADD COLUMN name TEXT')
       console.warn('video-workspace: 已为时间线补上 name 列')
     } catch (error) { console.warn(`video-workspace: 补 name 列失败：${error instanceof Error ? error.message : String(error)}`) }
+  }
+
+  /**
+   * Add the column that holds a timeline's subtitle style.
+   *
+   * Nullable with no default, like `name`: a timeline that never had a style set reports `null` and
+   * the burn step falls back to the deployment defaults, rather than this migration having to invent
+   * a style that would then be indistinguishable from one a person chose.
+   *
+   * @param db - the open database, with the schema already applied.
+   */
+  private addTimelineSubtitleStyleColumn(db: DatabaseSync): void {
+    try {
+      const columns = db.prepare('PRAGMA table_info(timelines)').all() as Array<{ name: string }>
+      if (columns.some(column => column.name === 'subtitle_style')) return
+      db.exec('ALTER TABLE timelines ADD COLUMN subtitle_style TEXT')
+      console.warn('video-workspace: 已为时间线补上 subtitle_style 列')
+    } catch (error) { console.warn(`video-workspace: 补 subtitle_style 列失败：${error instanceof Error ? error.message : String(error)}`) }
+  }
+
+  /**
+   * Add the column that holds a segment's name.
+   *
+   * A name is what a person calls one shot — "开场", "塔的特写" — so it belongs to the segment, not
+   * to the timeline: it labels one piece of one cut, and the same material reused elsewhere is a
+   * different piece. Nullable with no default, because a segment nobody named should read as
+   * unnamed rather than as carrying a label this code invented.
+   *
+   * @param db - the open database, with the schema already applied.
+   */
+  private addSegmentNameColumn(db: DatabaseSync): void {
+    try {
+      const columns = db.prepare('PRAGMA table_info(timeline_segments)').all() as Array<{ name: string }>
+      if (columns.some(column => column.name === 'name')) return
+      db.exec('ALTER TABLE timeline_segments ADD COLUMN name TEXT')
+      console.warn('video-workspace: 已为片段补上 name 列')
+    } catch (error) { console.warn(`video-workspace: 补片段 name 列失败：${error instanceof Error ? error.message : String(error)}`) }
   }
 
   /**
@@ -606,6 +691,455 @@ export class VideoWorkspace {
     }
   }
   async assets(projectId: string): Promise<Data[]> { const rows = (await this.open()).prepare('SELECT * FROM assets WHERE project_id=?').all(projectId) as AssetRow[]; return rows.map(row => ({ id: row.id, project_id: row.project_id, path: row.path, ...JSON.parse(row.meta) as Data })) }
+
+  /**
+   * Resolve one asset to the OSS object and a time-limited URL that reads it.
+   *
+   * The media route serves this URL to `<video>` element requests, and it needs the key as
+   * well as the URL: the key is what the route forwards a byte range against, and it must be
+   * derived from the stored row rather than from anything a caller supplies, so that an
+   * address cannot name an object outside the project it belongs to.
+   *
+   * @param projectId - project the asset must belong to.
+   * @param assetId - asset to resolve.
+   * @returns The OSS key and a signed URL valid for the configured lifetime.
+   * @throws when the project holds no such asset.
+   */
+  async assetSource(projectId: string, assetId: string): Promise<{ key: string, url: string }> {
+    const asset = await this.asset(projectId, assetId)
+    if (!asset.path.startsWith('oss://')) throw new Error(`asset ${assetId} is not stored on OSS`)
+    const key = asset.path.slice('oss://'.length)
+    return { key, url: this.signedUrl(key) }
+  }
+
+  /**
+   * The measured loudness curve for one asset, shaped for the workbench to draw.
+   *
+   * Positions are shares of the **whole asset**, not of the measured stretch: the
+   * asset whose audio ends at 1640s of a 2584s picture has to place its last sample at
+   * 0.63, or the curve would claim the audio runs the whole way. `audioEndAt` carries
+   * the same fact so the plot can narrow itself to the measured part.
+   *
+   * @param projectId - project the asset must belong to.
+   * @param assetId - asset whose acoustic evidence to read.
+   * @returns The curve, or null when that dimension was never measured.
+   */
+  async loudnessCurve(projectId: string, assetId: string): Promise<Data | null> {
+    await this.asset(projectId, assetId)
+    // 不传 expectedProviderVersion：响度有自己的 provider，不受转写那条链路版本号的约束，
+    // 传了反而会在版本不符时把一份有效读数吞掉，让曲线无端空掉。
+    const payload = await this.cachedEvidence(assetId, EVIDENCE_ACOUSTIC)
+    if (payload === undefined) return null
+    const levels = Array.isArray(payload.levelsDbfs) ? payload.levelsDbfs as number[] : []
+    const windowUs = Number(payload.windowUs)
+    if (levels.length === 0 || !Number.isFinite(windowUs)) return null
+    // 素材时长读不到时退回到音频自身的长度：这样 at 仍然落在 0…1，不会因为除零
+    // 画出一条位置全错的曲线。
+    const pictureUs = (await this.durationOf(assetId)) ?? 0
+    const audioUs = levels.length * windowUs
+    const span = pictureUs > 0 ? pictureUs : audioUs
+    return {
+      duration_us: span,
+      // 每个窗口一个读数，所以第 i 个读数落在 i 个窗口之后。
+      samples: levels.map((db, index) => ({ at: (index * windowUs) / span, db })),
+      floor_dbfs: Number.isFinite(Number(payload.floorDbfs)) ? Number(payload.floorDbfs) : null,
+      peak_dbfs: Number.isFinite(Number(payload.peakDbfs)) ? Number(payload.peakDbfs) : null,
+      loud_dbfs: Number.isFinite(Number(payload.loudDbfs)) ? Number(payload.loudDbfs) : null,
+      audio_end_at: audioUs / span,
+    }
+  }
+
+  /**
+   * The timelines cut from one asset, oldest first, each with its clips.
+   *
+   * Positions are shares of the asset, so the workbench draws every clip against the
+   * same axis the player and the loudness curve use — an absolute microsecond value
+   * would need the duration again at the other end and could disagree with it.
+   *
+   * @param projectId - project the asset must belong to.
+   * @param assetId - asset whose timelines to read.
+   * @returns The timelines, or null when the asset holds none.
+   */
+  async timelinesForAsset(projectId: string, assetId: string): Promise<Data | null> {
+    await this.asset(projectId, assetId)
+    const db = await this.open()
+    const rows = db.prepare('SELECT id, name, revision, start_us, end_us, subtitle_style FROM timelines WHERE project_id=? AND asset_id=? ORDER BY rowid').all(projectId, assetId) as Array<{ id: string, name: string | null, revision: number, start_us: number, end_us: number, subtitle_style: string | null }>
+    if (rows.length === 0) return null
+    const duration = (await this.durationOf(assetId)) ?? 0
+    const at = (us: number): number => (duration === 0 ? 0 : round4(Math.min(1, Math.max(0, us / duration))))
+    const segmentsOf = db.prepare('SELECT ordinal, start_us, end_us, speed, muted, name FROM timeline_segments WHERE timeline_id=? ORDER BY ordinal')
+    return {
+      duration_us: duration,
+      timelines: rows.map(row => {
+        const clips = (segmentsOf.all(row.id) as Array<{ ordinal: number, start_us: number, end_us: number, speed: number, muted: number, name: string | null }>)
+          .map(clip => ({
+            ordinal: clip.ordinal,
+            start_us: Math.round(clip.start_us),
+            end_us: Math.round(clip.end_us),
+            start: at(clip.start_us),
+            end: at(clip.end_us),
+            speed: clip.speed,
+            muted: clip.muted === 1,
+            // 没起过名就是 null，不是空串也不是「第 N 段」：界面要能区分
+            // 「人给它起了名字」与「它就是第 N 段」。
+            name: clip.name,
+          }))
+        const keptUs = clips.reduce((sum, clip) => sum + (clip.end_us - clip.start_us) / (clip.speed === 0 ? 1 : clip.speed), 0)
+        return {
+          id: row.id,
+          name: row.name,
+          revision: row.revision,
+          clips,
+          // 成片时长按变速率折算：2 倍速的一段在原片里占 10 秒，进成片只占 5 秒。
+          // 直接累加原片长度会让「成片多长」这个数字虚高。
+          output_seconds: round2(keptUs / 1e6),
+          /*
+           * 字幕样式随列表一起给出，而不是让界面为它再读一次。
+           *
+           * 界面要在画面上预览字幕，而它已经为了画时间线读了这个列表；分成两个地址读，
+           * 「改了样式但预览还是旧的」就成了可能 —— 两次读取，两个到达时刻。
+           * 没设置过时给 null 而不是一份默认值，界面才说得出「这条时间线还没设置过」。
+           */
+          subtitle_style: row.subtitle_style === null || row.subtitle_style === undefined
+            ? null
+            : JSON.parse(row.subtitle_style) as Data,
+        }
+      }),
+    }
+  }
+
+  /**
+   * Every render attempt on one asset, newest first — including the ones that failed.
+   *
+   * A failed attempt used to be filtered out, on the reasoning that a job with no output has nothing
+   * to play. That reasoning holds for a player and fails for a person: a render that died during
+   * the burn is exactly the thing someone needs to see, and a list that omits it reports "no films"
+   * for a timeline that was rendered three times. So failures are reported with the stage they died
+   * at, and `url` is present only when there is something to play.
+   *
+   * @param projectId - project the asset must belong to.
+   * @param assetId - asset whose renders to read.
+   * @returns The attempts, or null when the asset has none.
+   */
+  async rendersOf(projectId: string, assetId: string): Promise<Data | null> {
+    await this.asset(projectId, assetId)
+    const db = await this.open()
+    const rows = db.prepare(`SELECT j.id, j.status, j.output, j.detail, t.id AS timeline_id, t.name AS timeline_name
+      FROM jobs j JOIN timelines t ON t.id = j.timeline_id
+      WHERE t.project_id=? AND t.asset_id=?
+      ORDER BY j.rowid DESC`).all(projectId, assetId) as Array<{ id: string, status: string, output: string | null, detail: string | null, timeline_id: string, timeline_name: string | null }>
+    if (rows.length === 0) return null
+    return {
+      renders: rows.map(row => ({
+        job_id: row.id,
+        status: row.status,
+        timeline_id: row.timeline_id,
+        timeline_name: row.timeline_name,
+        // 播放地址交给媒体路由，而不是把 OSS 的签名地址发出去 ——
+        // 那会把 AccessKeyId 带进页面，而且签在一段时间后就过期。
+        // 只有真产出成片的任务才有地址；失败的任务给不出可播的东西。
+        url: row.output === null || row.output === ''
+          ? null
+          : `${this.config.mediaRoutePrefix.replace(/\/+$/, '')}/${encodeURIComponent(projectId)}/${encodeURIComponent(assetId)}/render/${encodeURIComponent(row.id)}`,
+        // 失败的任务带上它死在哪一步，以及走过的每一步。`detail` 是历史列：里面的内容
+        // 可能是旧的纯文本错误（这个字段是 JSON 之前写的），所以解析失败要退回成
+        // 「只有一条错误信息」，而不是把整条记录丢掉。
+        ...renderDetail(row.detail),
+      })),
+    }
+  }
+
+  /**
+   * Every measured evidence dimension for one asset, normalised into spans and readings.
+   *
+   * The six dimensions are stored under three different field conventions — `levelsDbfs` with a
+   * window, `startUs`/`endUs`, and `start_us`/`end_us` — because they were written by different
+   * measurers over time. Normalising here rather than in the browser keeps the browser from having
+   * to know which dimension spells its times which way, where one wrong guess would draw every
+   * mark in the wrong place.
+   *
+   * A dimension that was never measured is **absent** from the answer instead of empty, so the
+   * surface can say "not measured" rather than drawing a blank lane.
+   *
+   * @param projectId - project the asset must belong to.
+   * @param assetId - asset whose evidence to read.
+   * @returns The tracks, or null when the asset has no evidence at all.
+   */
+  async evidenceTracks(projectId: string, assetId: string): Promise<Data | null> {
+    await this.asset(projectId, assetId)
+    const durationUs = (await this.durationOf(assetId)) ?? 0
+    const tracks: Data = {}
+
+    /** Read one stored dimension's payload, or undefined when it was never measured. */
+    const payloadOf = async (kind: string): Promise<Data | undefined> => await this.cachedEvidence(assetId, kind) as Data | undefined
+
+    /**
+     * Normalise a span list whose ends are spelled `endUs` or `end_us`.
+     * @param raw - the stored list.
+     * @param startField - which field holds the start.
+     * @param extra - additional fields to carry over.
+     * @returns Spans with a uniform `start_us`/`end_us`, dropping malformed entries.
+     */
+    const spansFrom = (raw: unknown, startField: string, extra?: (item: Data) => Data): Data[] =>
+      (Array.isArray(raw) ? raw : []).flatMap((item: Data) => {
+        const start = Number(item?.[startField])
+        const end = Number(item?.endUs ?? item?.end_us)
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return []
+        return [{ start_us: start, end_us: end, ...(extra === undefined ? {} : extra(item)) }]
+      })
+
+    const loudness = await payloadOf(EVIDENCE_ACOUSTIC)
+    if (loudness !== undefined) {
+      const levels = Array.isArray(loudness.levelsDbfs) ? loudness.levelsDbfs as number[] : []
+      const windowUs = Number(loudness.windowUs)
+      if (levels.length > 0 && Number.isFinite(windowUs)) {
+        tracks.loudness = {
+          window_us: windowUs,
+          levels_dbfs: levels,
+          floor_dbfs: loudness.floorDbfs ?? null,
+          peak_dbfs: loudness.peakDbfs ?? null,
+          loud_spans: spansFrom(loudness.loud_spans, 'startUs', item => ({ peak_dbfs: item.peakDbfs ?? null })),
+        }
+      }
+    }
+
+    /**
+     * Read a text dimension, dropping blank rows.
+     * @param payload - the stored payload, or undefined when never measured.
+     * @param field - which field holds the rows.
+     * @returns The rows, or undefined when the dimension was never measured.
+     */
+    const textFrom = (payload: Data | undefined, field: string): Data[] | undefined => {
+      if (payload === undefined) return undefined
+      const items = Array.isArray(payload[field]) ? payload[field] as Data[] : []
+      // 有这一维但一行都没有，与「根本没测过」是两件事：前者是测了但空，照样报出去。
+      return spansFrom(items, 'start_us', item => ({ text: String(item.text ?? '') }))
+        .filter(item => item.text !== '')
+    }
+    const transcript = textFrom(await payloadOf(EVIDENCE_TRANSCRIPT), 'lines')
+    if (transcript !== undefined) tracks.transcript = transcript
+    const screenText = textFrom(await payloadOf(EVIDENCE_OCR), 'entries')
+    if (screenText !== undefined) tracks.screen_text = screenText
+
+    const shots = await payloadOf(EVIDENCE_SHOTS)
+    if (shots !== undefined) tracks.shots = spansFrom(shots.shots, 'startUs', item => ({ index: Number(item.index) }))
+
+    const timing = await payloadOf(EVIDENCE_TIMING)
+    if (timing !== undefined) tracks.silences = spansFrom(timing.silences, 'startUs')
+
+    const visual = await payloadOf(EVIDENCE_VISUAL)
+    if (visual !== undefined) {
+      // 画面描述只在悬停时读，所以只带首段，免得把整段描述塞进每一次响应。
+      tracks.scenes = spansFrom(visual.scenes, 'start_us', item => ({ description: String(item.description ?? '').slice(0, 80) }))
+        .filter(scene => scene.description !== '')
+    }
+
+    /*
+     * 高光与章节都不是独立维度，而是分析结果里的片段；这里把它们摊成区间列表。
+     *
+     * 两者来自同一份数据、回答的是两个问题：章节是「这一整片讲了哪几段」，
+     * 高光是「哪几段值得挑出来」。所以章节取全部片段，高光只取带标志的那些 ——
+     * 只给高光会让「这一段的上下文是什么」无处可看，而只给章节会让高光无从分辨。
+     */
+    const db = await this.open()
+    const analyses = db.prepare('SELECT data FROM analyses WHERE asset_id=?').all(assetId) as Array<{ data: string }>
+    /** Every analysed span, with the highlight flag left on it. */
+    const analysed: Data[] = analyses.flatMap(row => {
+      const segments = (JSON.parse(row.data) as { segments?: Data[] }).segments ?? []
+      return segments.flatMap(segment => {
+        const start = Number(segment.start_us)
+        const end = Number(segment.end_us)
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return []
+        return [{
+          start_us: start,
+          end_us: end,
+          summary: this.segmentText(segment).slice(0, 120),
+          is_highlight: segment.is_highlight === true,
+          reason: this.blankToNull(segment.highlight_reason) ?? null,
+          confidence: typeof segment.confidence === 'number' ? segment.confidence : null,
+        }]
+      })
+    })
+    if (analysed.length > 0) tracks.chapters = analysed
+    const highlights = analysed.flatMap(segment => (segment.is_highlight === true
+      ? [{
+          start_us: segment.start_us,
+          end_us: segment.end_us,
+          reason: segment.reason,
+          confidence: segment.confidence,
+        }]
+      : []))
+    if (highlights.length > 0) tracks.highlights = highlights
+
+    if (Object.keys(tracks).length === 0) return null
+    return { duration_us: durationUs, tracks }
+  }
+
+  /**
+   * Set a timeline's subtitle style from a description.
+   *
+   * Invalid fields are refused with the full list of what was wrong rather than the first problem,
+   * so a model that got three fields wrong is told all three instead of being sent round three
+   * times. The style is **not** part of the edit history: it changes how the film looks, not what
+   * the film is, and treating it as an edit would make a colour change look like a new cut.
+   *
+   * @param a - timeline, and the fields to set; omitted ones keep their current value.
+   * @returns The stored style, or the fields that could not be accepted.
+   */
+  async setSubtitleStyle(a: { timeline_id: string, style: SubtitleStyleInput }): Promise<Data> {
+    const db = await this.open()
+    const row = db.prepare('SELECT subtitle_style FROM timelines WHERE id=?').get(a.timeline_id) as { subtitle_style: string | null } | undefined
+    if (row === undefined) throw new Error(`时间线 ${a.timeline_id} 不存在`)
+    const current = row.subtitle_style === null ? {} : JSON.parse(row.subtitle_style) as SubtitleStyleInput
+    const resolved = resolveSubtitleStyle({ ...current, ...a.style })
+    if ('problems' in resolved) {
+      return {
+        accepted: false,
+        problems: resolved.problems,
+        note: '这些字段没有接受，时间线的字幕样式没有改变。整改后重新提交；只提有问题的字段即可，其余保持原样。',
+      }
+    }
+    db.prepare('UPDATE timelines SET subtitle_style=? WHERE id=?').run(JSON.stringify(resolved.style), a.timeline_id)
+    return { accepted: true, style: resolved.style, note: '样式已保存，下次导出（烧录字幕）时生效。' }
+  }
+
+  /**
+   * Name one segment, or clear its name.
+   *
+   * Advances the revision, unlike a timeline's own name: this label is stored on the segment, and
+   * the segment is part of what the film is. Calling a shot "开场" changes how the cut reads to
+   * whoever works on it next, which is a change to the edit rather than a note about it. An empty
+   * or whitespace-only name clears it, so a name can be taken back.
+   *
+   * @param a - timeline, which segment, and the name to set.
+   * @returns The stored name and the new revision.
+   */
+  async nameSegment(a: { timeline_id: string, base_revision: number, ordinal: number, name: string }): Promise<Data> {
+    const timeline = await this.assertRevision(a.timeline_id, a.base_revision)
+    const db = await this.open()
+    const row = db.prepare('SELECT ordinal FROM timeline_segments WHERE timeline_id=? AND ordinal=?').get(a.timeline_id, a.ordinal)
+    if (row === undefined) throw new Error(`没有第 ${a.ordinal} 段`)
+    const trimmed = a.name.trim()
+    const stored = trimmed === '' ? null : trimmed
+    db.prepare('UPDATE timeline_segments SET name=? WHERE timeline_id=? AND ordinal=?').run(stored, a.timeline_id, a.ordinal)
+    this.refreshTimeline(a.timeline_id, a.base_revision + 1)
+    await this.manifest(timeline.project_id)
+    return {
+      revision: a.base_revision + 1,
+      ordinal: a.ordinal,
+      name: stored,
+      note: stored === null ? `已清掉第 ${a.ordinal} 段的名字。` : `第 ${a.ordinal} 段现在叫「${stored}」。`,
+    }
+  }
+
+  /**
+   * Read a timeline's subtitle style.
+   *
+   * Reports `null` when none was ever set, which is not the same as the defaults: the caller can
+   * then say "no style chosen yet, these are the deployment defaults" instead of presenting a
+   * default as if somebody had picked it.
+   *
+   * @param timelineId - timeline to read.
+   * @returns The stored style, or null, with the defaults alongside for reference.
+   */
+  async subtitleStyle(timelineId: string): Promise<Data> {
+    const db = await this.open()
+    const row = db.prepare('SELECT subtitle_style FROM timelines WHERE id=?').get(timelineId) as { subtitle_style: string | null } | undefined
+    if (row === undefined) throw new Error(`时间线 ${timelineId} 不存在`)
+    const stored = row.subtitle_style === null ? null : JSON.parse(row.subtitle_style) as SubtitleStyle
+    return {
+      style: stored,
+      defaults: DEFAULT_SUBTITLE_STYLE,
+      // 没设置过时烧录用默认值；把这条说明白，免得调用方以为成片没字幕。
+      effective: stored ?? DEFAULT_SUBTITLE_STYLE,
+      note: stored === null ? '这条时间线还没有设置过字幕样式，导出时会用默认样式。' : null,
+    }
+  }
+
+  /**
+   * A signed URL for one stored object.
+   *
+   * The signature covers the HTTP method, so a caller that will send a different method needs
+   * a URL signed for that method: a GET-signed URL answered to HEAD is refused with 403.
+   *
+   * @param key - OSS object key.
+   * @param method - HTTP method the URL will be used with.
+   * @returns The signed URL.
+   */
+  signedAssetUrl(key: string, method = 'GET'): string { return this.signedUrl(key, method) }
+
+  /**
+   * Resolve one media-route address to the object it names.
+   *
+   * Address forms: `<projectId>/<assetId>` for an imported asset, and
+   * `<projectId>/<assetId>/render/<jobId>` for a finished film. Both are looked up in the
+   * database first, so the object key is derived from a stored row and a caller cannot name
+   * an object outside its own project.
+   *
+   * Returns `null` rather than throwing for anything unrecognised: the route answers 404, and
+   * an address must not reveal whether an object exists but the caller may not read it.
+   *
+   * @param path - path segments after the route prefix.
+   * @returns The target, or `null` when nothing matches.
+   */
+  async resolveMedia(path: readonly string[]): Promise<{ key: string, contentType: string } | null> {
+    const [projectId, assetId, kind, jobId] = path
+    if (projectId === undefined || assetId === undefined) return null
+    if (kind === undefined) {
+      const asset = (await this.open()).prepare('SELECT path FROM assets WHERE id=? AND project_id=?').get(assetId, projectId) as { path: string } | undefined
+      if (asset === undefined || !asset.path.startsWith('oss://')) return null
+      return { key: asset.path.slice('oss://'.length), contentType: 'video/mp4' }
+    }
+    // Anything past the two ids must be exactly the render form; no other shape is addressable.
+    if (kind !== 'render' || jobId === undefined || path.length !== 4) return null
+    const row = (await this.open()).prepare('SELECT j.output, t.name FROM jobs j JOIN timelines t ON t.id=j.timeline_id WHERE j.id=? AND t.project_id=? AND t.asset_id=?').get(jobId, projectId, assetId) as { output: string | null, name: string | null } | undefined
+    if (row === undefined || row.output === null || row.output === '') return null
+    // A finished film is stored as an OSS key, but older rows carry a signed URL. Take the
+    // key out of either form so the route always signs fresh rather than reusing a stale one.
+    const key = row.output.startsWith('oss://') ? row.output.slice('oss://'.length) : this.keyOfUrl(row.output)
+    if (key === null) return null
+    return { key, contentType: 'video/mp4' }
+  }
+
+  /**
+   * Extract the object key from one of this deployment's own URLs.
+   *
+   * Only keys under a prefix this plugin writes are accepted, so a stored URL that points at
+   * another bucket path cannot become a readable address through the media route.
+   *
+   * @param url - a stored output value.
+   * @returns The key, or `null` when the URL is not one this deployment produced.
+   */
+  private keyOfUrl(url: string): string | null {
+    const prefixes = [this.config.ossOutputPrefix, this.config.ossPrefix]
+      .map(prefix => prefix.replace(/\/+$/, '') + '/')
+      .filter(prefix => prefix !== '/')
+    for (const prefix of prefixes) {
+      const at = url.indexOf('/' + prefix)
+      if (at === -1) continue
+      // The key runs to the query string, which carries the signature.
+      const rest = url.slice(at + 1)
+      const key = rest.split('?').at(0) ?? ''
+      if (key.startsWith(prefix)) return key
+    }
+    return null
+  }
+
+  /**
+   * Whether a key is one this plugin is willing to serve.
+   *
+   * The route calls this before signing. Keys are already derived from stored rows, so this
+   * is a second, independent check on the same property: a future address form that forgets
+   * to validate would still not be able to reach a foreign object.
+   *
+   * @param key - OSS object key.
+   * @returns True when the key lies under a prefix this plugin writes.
+   */
+  ownsObjectKey(key: string): boolean {
+    return [this.config.ossOutputPrefix, this.config.ossPrefix, this.config.ossProjectPrefix]
+      .map(prefix => prefix.replace(/\/+$/, '') + '/')
+      .some(prefix => prefix !== '/' && key.startsWith(prefix))
+  }
   /**
    * Understand an asset with Qwen Omni, reusing the stored analysis when nothing changed.
    *
@@ -2596,17 +3130,29 @@ export class VideoWorkspace {
           const srt = join(work, 'burn.srt')
           await writeFile(srt, renderSrt(mapped.cues), 'utf8')
           const burned = join(work, `burned-${name}`)
-          // subtitles 滤镜把文件名当滤镜参数解析，路径里的冒号、反斜杠、单引号都要转义，
-          // 否则 Windows 路径会被当成选项分隔符。
+          // 样式存的是**占比**，所以要先知道成片真实的像素高度才能换算。
+          // 用配置里的名义值会在换画幅时把字号算错 —— 而错的是画面上的字，不是数字。
+          const picture = await this.stages.timed('读取成片尺寸', () => this.probe(output, signal))
+          const pictureWidth = Number(picture.width)
+          const pictureHeight = Number(picture.height)
+          if (pictureWidth === 0 || pictureHeight === 0) {
+            throw new Error('烧录字幕前读不到成片尺寸（导出中间产物没有视频流）。')
+          }
+          const styleRow = db.prepare('SELECT subtitle_style FROM timelines WHERE id=?').get(timelineId) as { subtitle_style: string | null } | undefined
+          const chosen = styleRow?.subtitle_style == null
+            ? null
+            : JSON.parse(styleRow.subtitle_style) as SubtitleStyle
+          const style: SubtitleStyle = { ...DEFAULT_SUBTITLE_STYLE, ...chosen }
           const escaped = srt.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'")
           await this.stages.timed('烧录字幕', () => this.run('ffmpeg', [
             '-nostdin', '-y', '-i', output,
-            '-vf', `subtitles='${escaped}':force_style='FontName=${this.config.subtitleFont ?? 'Microsoft YaHei'},FontSize=${this.config.subtitleFontSize ?? 22},Outline=2,Shadow=0,MarginV=${this.config.subtitleMarginV ?? 28}'`,
+            '-vf', `subtitles='${escaped}':force_style='${toAssStyle(style, pictureHeight, pictureWidth)}'`,
             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
             '-c:a', 'copy', burned,
           ], signal))
           await rename(burned, output)
-          notes.push(`已把 ${mapped.cues.length} 条字幕烧录进画面（${burnSource === 'screen-text' ? '屏幕文字' : '语音转写'}）。成片因此重编码了一次。`)
+          // 把实际用的样式写进备注：样式错了只能靠看画面发现，而备注是唯一能对上的线索。
+          notes.push(`已把 ${mapped.cues.length} 条字幕烧录进画面（${burnSource === 'screen-text' ? '屏幕文字' : '语音转写'}），样式 ${style.font} ${Math.round(style.size * pictureHeight)}px ${style.alignment}${chosen === null ? '（默认样式 —— 这条时间线没有设置过）' : ''}。成片因此重编码了一次。`)
         }
       }
       // 导出后必须确认成片里真的有画面。某些源文件（索引损坏的 AV1）能让 ffmpeg
@@ -2632,7 +3178,15 @@ export class VideoWorkspace {
       await this.manifest(timeline.project_id)
       return { id, status: 'completed', output: `oss://${key}`, oss_key: key, oss_url, segment_count: clips.length, duration_us: Math.round(totalUs), duration_seconds: round2(totalUs / 1e6), reencoded: accurate, keyframe_gap_seconds: Number(worstGap.toFixed(3)), aspect, focus, loudness_matched: matchLoudness && acousticPayload !== undefined, loudness_target_dbfs: targetDbfs, segment_gains_db: gains.map(gain => round2(gain)), note, notes, stages: this.stages.snapshot() }
     } catch (error) {
-      db.prepare('UPDATE jobs SET status=?,detail=? WHERE id=?').run('failed', String(error), id)
+      // 失败时把**已走过的阶段**一并存下来。只存 error 字符串的话，界面只能说「失败了」，
+      // 而「在哪一步失败」才是能据以行动的信息 —— 下载失败与烧录失败要采取的动作完全不同。
+      const stages = this.stages.snapshot()
+      const failedStage = [...stages].reverse().find(entry => entry.outcome === 'failed')
+      db.prepare('UPDATE jobs SET status=?,detail=? WHERE id=?').run('failed', JSON.stringify({
+        error: error instanceof Error ? error.message : String(error),
+        failed_stage: failedStage?.stage ?? null,
+        stages,
+      }), id)
       await this.manifest(timeline.project_id).catch(() => undefined)
       throw error
     } finally { await rm(work, { recursive: true, force: true }); await Promise.all(cleanup.map(fn => fn())) }

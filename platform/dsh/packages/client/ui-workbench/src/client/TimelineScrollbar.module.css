@@ -1,0 +1,73 @@
+/**
+ * The timeline's horizontal scrollbar.
+ *
+ * Two parts stacked: a coarse map of the whole recording, and the track with its thumb. The map
+ * sits directly above the track so a gap in the cut and the position that reaches it read as one
+ * object rather than two.
+ *
+ * The track is taller than the drawn line, for the same reason the pane dividers are: a two-pixel
+ * target cannot be grabbed. The thumb is filled with a semantic token rather than a literal colour,
+ * so it reads as chrome in either theme.
+ */
+
+.scrollbar {
+  flex: none;
+  padding: 0 10px 2px;
+}
+
+.map {
+  position: relative;
+  height: 10px;
+  border-radius: var(--dsw-radius-xs) var(--dsw-radius-xs) 0 0;
+  background: var(--dsw-alias-bg-layer-2);
+  overflow: hidden;
+}
+
+/* 被取用的区段：宽度按素材时长占比给，所以空隙就是没被用到的部分。 */
+.mapClip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: var(--dsw-alias-label-caption);
+  opacity: 0.55;
+}
+
+.track {
+  position: relative;
+  height: 12px;
+  border-radius: 0 0 var(--dsw-radius-xs) var(--dsw-radius-xs);
+  background: var(--dsw-alias-bg-layer-2);
+  cursor: pointer;
+  touch-action: none;
+  outline: none;
+}
+
+.track:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--dsw-alias-brand-primary);
+}
+
+/* 画出来的是一条细线，但整条 12px 都能抓 —— 两像素的目标抓不住。 */
+.track::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 0.5px;
+  background: var(--dsw-alias-border-l3);
+}
+
+.thumb {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  min-width: 12px;
+  border-radius: var(--dsw-radius-xs);
+  background: var(--dsw-alias-label-tertiary);
+  transition: background 120ms ease-out;
+}
+
+.track:hover .thumb,
+.track:focus-visible .thumb {
+  background: var(--dsw-alias-label-secondary);
+}

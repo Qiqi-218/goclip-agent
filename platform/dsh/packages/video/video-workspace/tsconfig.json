@@ -18,6 +18,9 @@
       "path": "../../core/tools"
     },
     {
+      "path": "../../host/webserver"
+    },
+    {
       "path": "../../util/values"
     }
   ]

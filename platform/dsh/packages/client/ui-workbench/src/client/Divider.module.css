@@ -1,0 +1,88 @@
+/**
+ * The division between two parts of the workbench.
+ *
+ * The visual language is the docking surface's, because these dividers sit on the same screen as
+ * its panes and a second way of drawing a split would read as a different kind of seam.
+ *
+ * Two lines, on the two pseudo-elements: `::before` is the seam itself — always visible, so the
+ * surface shows where its parts divide — and `::after` is the highlight that fades in on hover,
+ * which is what makes a six-pixel target findable as something draggable. The drawn line is half a
+ * pixel while the hit area is six: a 0.5px target cannot be grabbed by hand.
+ *
+ * The divider is also focusable, so the division can be moved without a pointer at all.
+ */
+
+.row,
+.column {
+  position: relative;
+  flex: none;
+  z-index: 1;
+  touch-action: none;
+  outline: none;
+}
+
+.row {
+  width: 6px;
+  margin: 0 -3px;
+  cursor: col-resize;
+}
+
+.column {
+  height: 6px;
+  margin: -3px 0;
+  cursor: row-resize;
+}
+
+/* 常驻的接缝：不悬停也看得出这里分开了两块。 */
+.row::before,
+.column::before {
+  content: '';
+  position: absolute;
+  background: var(--dsw-alias-border-l2);
+}
+
+.row::before {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 0.5px;
+}
+
+.column::before {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 0.5px;
+}
+
+/* 悬停或聚焦时的高亮：中央实、两端渐隐，与停靠布局同一条线。 */
+.row::after,
+.column::after {
+  content: '';
+  position: absolute;
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+
+.row::after {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: linear-gradient(to bottom, transparent, var(--dsw-alias-label-caption) 50%, transparent) center / 1px 100% no-repeat;
+}
+
+.column::after {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: linear-gradient(to right, transparent, var(--dsw-alias-label-caption) 50%, transparent) center / 100% 1px no-repeat;
+}
+
+.row:hover::after,
+.row:focus-visible::after,
+.column:hover::after,
+.column:focus-visible::after {
+  opacity: 1;
+}
