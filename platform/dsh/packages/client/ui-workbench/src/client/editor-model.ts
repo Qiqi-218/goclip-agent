@@ -18,7 +18,7 @@
  */
 import type { TimelineAction, TimelineRow } from '@xzdarcy/timeline-engine'
 import type { ClipSpan } from './timing.ts'
-import { layoutOnOutputAxis, outputSecondsOf, rateOf, trimDeltaFromOutput } from './timing.ts'
+import { layoutOnSourceAxis, trimDeltaFromAxis } from './timing.ts'
 
 /** One clip as the media route serialises it, plus the asset bounds its edits are limited by. */
 export interface EditableClip extends ClipSpan {
@@ -74,13 +74,10 @@ export function ordinalOfAction(id: string): number | null {
  * @returns One row holding every clip.
  */
 export function toRows(subject: EditSubject): TimelineRow[] {
-  const spans = layoutOnOutputAxis(subject.clips)
+  const spans = layoutOnSourceAxis(subject.clips)
+  const assetSeconds = subject.assetDurationUs / 1e6
   const actions: TimelineAction[] = subject.clips.map((clip, index) => {
     const span = spans[index] as { start: number, end: number }
-    const rate = rateOf(clip.speed)
-    // 左边能用掉多少素材、右边还剩多少素材 —— 都换算到成片坐标，才能作为轴上的边界。
-    const outputBefore = clip.start_us / 1e6 / rate
-    const outputAfter = (subject.assetDurationUs - clip.end_us) / 1e6 / rate
     return {
       id: actionIdOf(clip.ordinal),
       start: span.start,
@@ -88,10 +85,15 @@ export function toRows(subject: EditSubject): TimelineRow[] {
       effectId: CLIP_EFFECT,
       flexible: true,
       movable: false,
-      // 往左拖最多到「本段起点之前的素材用完」为止；0 是成片轴的起点。
-      minStart: Math.max(0, span.start - outputBefore),
-      // 往右拖最多到「素材结尾」为止。
-      maxEnd: span.end + outputAfter,
+      /*
+       * 边界就是**素材的边界**：往左最多到录制开头，往右最多到录制结尾。
+       *
+       * 这条轴是录制本身，所以「能用多少」不再需要换算 —— 素材 0 秒与 2584 秒就是轴的两端。
+       * 在成片轴上这里要按倍率折算，那是这一类错最容易出现的地方。
+       */
+      minStart: 0,
+      // 往右最多到录制结尾 —— 这条轴的右端就是它。
+      maxEnd: assetSeconds,
     }
   })
   return [{ id: CLIP_ROW, actions, rowHeight: 46 }]
@@ -234,16 +236,16 @@ export interface RevertIntent {
 }
 
 /**
- * The call that would cut one clip in two at a moment the person picked on the film.
+ * The call that would cut one clip in two at a moment the person picked.
  *
- * The conversion is the whole reason this function exists. The lane reports a position on the
- * **film**; the tool takes a moment in the **recording**. For a clip at 1× those differ by the
- * clip's own start, and at 2× also by the rate — and a cut placed at the wrong moment is invisible
- * until somebody watches the film and notices the shot changed in the middle of a sentence.
+ * On the recording's axis the position **is** the recording time, so this needs no conversion at
+ * all — which is the point of that axis: the cut lands where the pointer was, and no rate factor
+ * can be forgotten. What remains is the check that the moment is actually inside this clip, since
+ * a click two clips away names a moment this cut cannot be made at.
  *
  * @param clips - the clips, in output order.
  * @param ordinal - which clip to cut.
- * @param filmSeconds - where on the film the cut goes.
+ * @param atSeconds - where on the recording the cut goes.
  * @param timelineId - the timeline to edit.
  * @param baseRevision - the revision the caller last read.
  * @returns The call to make, or null when the moment is not inside that clip.
@@ -251,22 +253,19 @@ export interface RevertIntent {
 export function splitIntent(
   clips: readonly ClipSpan[],
   ordinal: number,
-  filmSeconds: number,
+  atSeconds: number,
   timelineId: string,
   baseRevision: number,
 ): SplitIntent | null {
   const index = clips.findIndex(clip => (clip as EditableClip).ordinal === ordinal)
   if (index < 0) return null
   const clip = clips[index] as ClipSpan
-  const span = layoutOnOutputAxis(clips)[index] as { start: number, end: number }
+  const atUs = Math.round(atSeconds * 1e6)
   // 落点在片段之外就没有「在这里切开」这回事；不要就近吸附到一个别的片段上。
-  if (filmSeconds <= span.start || filmSeconds >= span.end) return null
-  const assetUs = Math.round(clip.start_us + (filmSeconds - span.start) * 1e6 * rateOf(clip.speed))
-  // 切点落在素材区间之外说明换算错了；宁可什么都不做。
-  if (assetUs <= clip.start_us || assetUs >= clip.end_us) return null
+  if (atUs <= clip.start_us || atUs >= clip.end_us) return null
   return {
     tool: 'video_timeline_split',
-    args: { timeline_id: timelineId, base_revision: baseRevision, ordinal, asset_time_us: assetUs },
+    args: { timeline_id: timelineId, base_revision: baseRevision, ordinal, asset_time_us: atUs },
   }
 }
 
@@ -418,10 +417,10 @@ export function intentFromEditedAction(
   if (ordinal === null) return null
   const index = subject.clips.findIndex(candidate => candidate.ordinal === ordinal)
   if (index < 0) return null
-  const clip = subject.clips[index] as EditableClip
-  const before = layoutOnOutputAxis(subject.clips)[index] as { start: number, end: number }
+  const before = layoutOnSourceAxis(subject.clips)[index] as { start: number, end: number }
 
-  const deltaSourceUs = trimDeltaFromOutput(clip, outputSecondsOf(clip), edited.end - edited.start)
+  // 这条轴是录制本身，所以轴上的位移就是录制时间的位移 —— 倍率不参与。
+  const deltaSourceUs = trimDeltaFromAxis(before.end - before.start, edited.end - edited.start)
   if (deltaSourceUs === null) return null
 
   // 一秒的千分之一以内算没动 —— 浮点位置在拖动里必然有微小的抖动。

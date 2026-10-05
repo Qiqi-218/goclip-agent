@@ -1,3 +1,4 @@
+import { useSyncExternalStore } from 'react'
 // @vitest-environment jsdom
 /**
  * The workbench surface: what it shows, the asset it chooses, and the loop between the surface
@@ -14,6 +15,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { WorkbenchPanel } from '../src/client/WorkbenchPanel.tsx'
+import { createWorkbenchLayoutStore, type LayoutState } from '../src/client/layout-store.ts'
 import { assetFromAddress, mediaUrl } from '../src/client/read.ts'
 import { en, zh } from '../src/client/locales.ts'
 
@@ -42,7 +44,20 @@ function renderPanel(dict: Dict = zh, asset: { projectId: string, assetId: strin
     if (params === undefined) return template
     return template.replace(/\{(\w+)\}/g, (match, name: string) => (name in params ? String(params[name]) : match))
   }
-  return render(<WorkbenchPanel t={t as never} asset={asset} />)
+  /*
+   * store 用真实的那个，不用替身：这个 spec 要断言的正是「拖出来的尺寸真的改变了布局」，
+   * 替身只能证明「有人被调用」。`create()` 是测试里被允许的那条零机器路径。
+   *
+   * `useStore` 在框架里由渲染器在绑定处合成（`observableHook(store)`），所以这里也照
+   * 契约自己接一次：读 `getSnapshot`、订阅 `subscribe`。用 `useSyncExternalStore` 而不是
+   * `useState`，因为拖动的每一次移动都要立刻反映出来。
+   */
+  const store = createWorkbenchLayoutStore().create()
+  const useStore = ((selector: (state: LayoutState) => unknown) =>
+    useSyncExternalStore(store.subscribe, () => selector(store.getSnapshot()))) as never
+  return render(
+    <WorkbenchPanel actions={store.actions} asset={asset} t={t as never} useStore={useStore} />,
+  )
 }
 
 /** One measurement, shaped as the route serialises it. */

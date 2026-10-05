@@ -57,12 +57,40 @@ export function outputSecondsOf(clip: ClipSpan): number {
 }
 
 /**
+ * Where every clip sits on the recording's own axis.
+ *
+ * **The timeline's axis is the recording, not the film.** Each clip is drawn at the stretch of the
+ * source it actually uses, so a click anywhere on the axis names a moment of the video the player
+ * is showing — the ruler, the clips and the playhead all mean the same thing. The gaps between
+ * clips are the parts of the recording this cut leaves out, which is information an editor wants
+ * and cannot get from a packed film axis.
+ *
+ * An earlier version packed the clips end to end on the film's axis. That put two time systems on
+ * one screen: clicking the axis at 40 seconds moved the player to 40 seconds of the recording,
+ * which is a different moment entirely — the reported error. Dropping the second axis removes the
+ * class of mistake rather than this instance of it.
+ *
+ * @param clips - the clips in output order.
+ * @returns Each clip's position in recording seconds, aligned with the input order.
+ */
+export function layoutOnSourceAxis(clips: readonly ClipSpan[]): { readonly start: number, readonly end: number }[] {
+  return clips.map(clip => ({ start: clip.start_us / 1e6, end: clip.end_us / 1e6 }))
+}
+
+/**
+ * How long the finished film runs, with the playback rate applied.
+ * @param clips - the clips in output order.
+ * @returns Output seconds.
+ */
+export function filmSecondsOf(clips: readonly ClipSpan[]): number {
+  return clips.reduce((sum, clip) => sum + outputSecondsOf(clip), 0)
+}
+
+/**
  * Where every clip sits on the output axis, laid end to end.
  *
- * The editor's axis is the film, not the recording. Drawing source positions on it would
- * scatter ten clips across 2584 seconds when the film is 86 seconds long — which is exactly
- * what an earlier version of this surface did, and why every clip collapsed into a hairline
- * at the right edge.
+ * Still needed for the film's own clock — the exported length, and the subtitle cue times a burn
+ * writes — but no longer for the editor's axis.
  *
  * @param clips - the clips in output order.
  * @returns Each clip's output start and end in seconds, aligned with the input order.
@@ -78,21 +106,19 @@ export function layoutOnOutputAxis(clips: readonly ClipSpan[]): { readonly start
 }
 
 /**
- * Translate an editor edit into a source-time movement.
+ * Read an edge drag's new length as a movement in recording time.
  *
- * Both times are given so a caller cannot accidentally pass one where the other belongs: the
- * function's whole job is to relate them, so it asks for both explicitly rather than taking a
- * difference that is only meaningful in one of them.
+ * On the recording's axis a drag of a second is a second of footage, whatever the clip's playback
+ * rate: the ruler the person is reading is the recording. That is the opposite of the film axis,
+ * where a second of film is `speed` seconds of recording and the conversion had to multiply.
  *
- * @param clip - the clip as it stands, in source time.
- * @param outputBefore - the clip's output length before the edit, in seconds.
- * @param outputAfter - the clip's output length after the edit, in seconds.
- * @returns The source-time movement in microseconds, or null when the edit is below one frame.
+ * @param before - the clip's length on the axis before the edit, in seconds.
+ * @param after - the clip's length on the axis after the edit, in seconds.
+ * @returns The recording-time movement in microseconds, or null when the edit is below one frame.
  */
-export function trimDeltaFromOutput(clip: ClipSpan, outputBefore: number, outputAfter: number): number | null {
-  const deltaOutput = outputAfter - outputBefore
+export function trimDeltaFromAxis(before: number, after: number): number | null {
+  const delta = after - before
   // 小于一帧（按 30fps 取 1/30 秒）就不算一次编辑；否则每次点击都会产生一次空调用。
-  if (Math.abs(deltaOutput) < 1 / 30) return null
-  // 成片位移换算回素材位移要乘倍率：2 倍速下成片里 1 秒是素材里 2 秒。
-  return Math.round(deltaOutput * rateOf(clip.speed) * 1e6)
+  if (Math.abs(delta) < 1 / 30) return null
+  return Math.round(delta * 1e6)
 }

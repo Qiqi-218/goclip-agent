@@ -111,16 +111,22 @@ function renderTimeline(overrides: Partial<Parameters<typeof Timeline>[0]> = {})
 }
 
 describe('timeline wiring', () => {
-  it('lays the clips out on the film axis, end to end', () => {
+  it('lays the clips out where they sit in the recording, gaps and all', () => {
     renderTimeline()
     const actions = captured.props?.editorData?.[0]?.actions ?? []
-    // 成片轴：0 → 7.72 → 11.72 → 14.56。若把素材坐标当轴坐标，第一段会落在 21.74 而不是 0。
-    expect(actions[0]?.start).toBeCloseTo(0, 6)
-    expect(actions[0]?.end).toBeCloseTo(7.72, 6)
-    expect(actions[1]?.start).toBeCloseTo(7.72, 6)
-    expect(actions[1]?.end).toBeCloseTo(11.72, 6)
-    expect(actions[2]?.start).toBeCloseTo(11.72, 6)
-    expect(actions[2]?.end).toBeCloseTo(14.56, 6)
+    /*
+     * 轴是**录制本身**，所以三段停在它们真实的素材位置上：21.74→29.46、272.49→276.49、
+     * 296.58→302.26。中间没被取用的秒数就是空隙。
+     *
+     * 早先这里是首尾相接的成片轴（0→7.72→11.72→14.56）。那样轴与播放器是两个时间系统，
+     * 点轴的 40 秒会让画面跳到素材的 40 秒 —— 而那是另一个时刻。
+     */
+    expect(actions[0]?.start).toBeCloseTo(21.74, 6)
+    expect(actions[0]?.end).toBeCloseTo(29.46, 6)
+    expect(actions[1]?.start).toBeCloseTo(272.49, 6)
+    expect(actions[1]?.end).toBeCloseTo(276.49, 6)
+    expect(actions[2]?.start).toBeCloseTo(296.58, 6)
+    expect(actions[2]?.end).toBeCloseTo(302.26, 6)
   })
 
   it('turns line snapping off, which this recording would otherwise make destructive', () => {
@@ -132,28 +138,33 @@ describe('timeline wiring', () => {
 
   it('reports a drag as a tool call instead of applying it', () => {
     const { onEdit } = renderTimeline()
-    const action = { id: 'clip-1', start: 7.72, end: 11.72, effectId: 'clip' }
-    // 第二段在成片里 4.00 → 6.00 秒，即多取 2 秒素材。
-    captured.props?.onActionResizeEnd?.({ action: { ...action, end: 13.72 } })
+    // 第 2 段取自素材 272.49→276.49 秒。把右边界拉到 278.49 就是多取 2 秒素材。
+    const action = { id: 'clip-1', start: 272.49, end: 276.49, effectId: 'clip' }
+    captured.props?.onActionResizeEnd?.({ action: { ...action, end: 278.49 } })
     expect(onEdit).toHaveBeenCalledWith({
       tool: 'video_timeline_trim',
       args: { timeline_id: 'tl-1', base_revision: 2, ordinal: 1, edge: 'end', delta_us: 2_000_000 },
     })
   })
 
-  it('scales a drag back into source time through the clip playback rate', () => {
+  it('does not scale a drag by the playback rate, because the axis is the recording', () => {
     const { onEdit } = renderTimeline()
-    // 第 2 段是 2 倍速：成片里延长 1 秒等于素材里多取 2 秒。
-    const action = { id: 'clip-2', start: 11.72, end: 14.56, effectId: 'clip' }
-    captured.props?.onActionMoveEnd?.({ action: { ...action, end: 15.56 } })
+    /*
+     * 第 3 段是 2 倍速。轴是录制本身，所以拖 1 秒就是 1 秒素材 —— 倍率不参与。
+     *
+     * 在成片轴上这里要乘 2（成片 1 秒 = 素材 2 秒），而漏掉那个因子只会让取用区间短一半：
+     * 画面还在，只是少了一截，要看片才发现。这正是换成素材轴要消掉的那类错。
+     */
+    const action = { id: 'clip-2', start: 296.58, end: 302.26, effectId: 'clip' }
+    captured.props?.onActionMoveEnd?.({ action: { ...action, end: 303.26 } })
     expect(onEdit).toHaveBeenCalledWith(expect.objectContaining({
-      args: expect.objectContaining({ ordinal: 2, edge: 'end', delta_us: 2_000_000 }),
+      args: expect.objectContaining({ ordinal: 2, edge: 'end', delta_us: 1_000_000 }),
     }))
   })
 
   it('reports nothing when a drag left the clip alone', () => {
     const { onEdit } = renderTimeline()
-    captured.props?.onActionMoveEnd?.({ action: { id: 'clip-1', start: 7.72, end: 11.72, effectId: 'clip' } })
+    captured.props?.onActionMoveEnd?.({ action: { id: 'clip-1', start: 272.49, end: 276.49, effectId: 'clip' } })
     // 一字未改的拖动要报 null，好让上层的「待确认」标记被清掉；直接丢掉汇报会让它卡住。
     expect(onEdit).toHaveBeenCalledWith(null)
   })
@@ -284,16 +295,16 @@ describe('evidence lanes', () => {
     expect((captured.props?.editorData ?? []).map(row => row.id)).toEqual(['clips'])
   })
 
-  it('gives every evidence row one action covering the film, not a sliver of it', () => {
+  it('gives every evidence row one action covering the whole recording, not a sliver of it', () => {
     renderTimeline({ evidence: EVIDENCE, lanes: ALL_LANES })
     const lane = (captured.props?.editorData ?? []).find(row => row.id === 'transcript')
     expect(lane?.actions).toHaveLength(1)
     expect(lane?.actions[0]?.id).toBe('lane-transcript')
     expect(lane?.actions[0]?.effectId).toBe('evidence')
-    // 动作的像素宽度 = end × scaleWidth，所以 end 必须是**成片秒数**。
+    // 动作的像素宽度 = end × scaleWidth，所以 end 必须是**轴的秒数**，而轴就是录制。
     // 这两条守住两种都让轨道看起来是空的写法：end=1 把动作压成一秒宽，
-    // 而一个「很大」的 end 会把行撑到几百万像素、把成片挤成一条线。
-    expect(lane?.actions[0]?.end).toBeCloseTo(14.56, 6)
+    // 而一个「很大」的 end 会把行撑到几百万像素、把整条轴挤成一条线。
+    expect(lane?.actions[0]?.end).toBeCloseTo(ASSET_US / 1e6, 3)
     expect(lane?.actions[0]?.start).toBe(0)
   })
 
@@ -312,16 +323,20 @@ describe('evidence lanes', () => {
     expect(lane?.actions[0]?.flexible).toBe(false)
   })
 
-  it('places a spoken line where the film uses that stretch of the recording', () => {
+  it('places a spoken line at the moment it was spoken', () => {
     renderTimeline({ evidence: EVIDENCE, lanes: ALL_LANES })
     const rendered = captured.props?.getActionRender?.({ id: 'lane-transcript', start: 0, end: 1, effectId: 'evidence' })
     render(<div data-shot="">{rendered}</div>)
     const mark = document.querySelector('[data-shot] [data-evidence-text]') as HTMLElement | null
     expect(mark).not.toBeNull()
-    // 素材 22.74s 在第 1 段（成片 0→7.72s）里，落在 1.00s；成片总长 14.56s → 6.868%。
-    // 这条断的是「素材坐标被换算过」：直接拿素材秒数去除会被夹到 100%，
-    // 停在最右端，看上去像一个有意的位置。
-    expect(mark?.style.left).toBe('6.868131868131869%')
+    /*
+     * 素材 22.74 秒的标记画在轴的 22.74 秒处；轴总长就是素材时长 2584.13 秒。
+     *
+     * 这条断的是「标记的位置就是它被测量到的时刻」。在成片轴上它会被挪到 1.00 秒处
+     * （占 14.56 秒的 6.868%）—— 那个位置与它测量的时刻无关，而屏幕上看起来一样合理，
+     * 所以只有断言具体数值才分得出来。
+     */
+    expect(mark?.style.left).toBe('0.8799856663724351%')
   })
 
   it('never places an evidence mark past the right edge of the film', () => {

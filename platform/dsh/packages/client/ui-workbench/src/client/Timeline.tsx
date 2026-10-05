@@ -22,7 +22,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import { EVIDENCE_EFFECT, EvidenceLane, evidenceRows } from './EvidenceLanes.tsx'
 import { CLIP_EFFECT, intentFromEditedAction, ordinalOfAction, toRows, type EditIntent, type EditSubject } from './editor-model.ts'
 import { EVIDENCE_LANES, laneOfAction, type EvidenceLaneKey, type EvidenceVisibility } from './evidence-model.ts'
-import { layoutOnOutputAxis } from './timing.ts'
+import { filmSecondsOf } from './timing.ts'
 import type { EvidencePayload } from './read.ts'
 import styles from './Timeline.module.css'
 
@@ -80,19 +80,24 @@ export function availableLanes(tracks: EvidencePayload['tracks'] | null): Eviden
 /**
  * Seconds each ruler tick covers, and the default width of one tick in pixels.
  *
- * The two together set the scale: `scaleWidth / scale` is pixels per second. A one-second tick
- * drawn 30px wide is 30px per second, which puts the real 86-second cut in about 2600px — wide
- * enough to read a clip on, short enough to reach the end of.
+ * The two together set the scale: `scaleWidth / scale` is pixels per second. **The axis is the
+ * recording**, so the numbers are sized for a 43-minute one rather than for the 86-second cut: at
+ * 4px per second the whole recording is about 10,000px, which scrolls and still shows where each
+ * clip sits. The 30px per second this used to be was right for an 86-second film and would have
+ * made the same axis 77,000px wide.
  *
- * An earlier pairing of `scale: 1` with `scaleWidth: 40` is also 40px per second, but it asks for a
- * tick every second across the whole axis, and the library caps how many ticks it will draw — so
- * the whole film collapsed to a 40px sliver and every mark on it was squashed to nothing.
+ * A tick every second is deliberate, and the tick count is what the library caps: at this width the
+ * ruler asks for 2584 ticks. Zooming in is how somebody gets to frame level — 400px per second is
+ * about 18 frames across a 1080p viewport.
+ *
+ * An earlier pairing of `scale: 1` with `scaleWidth: 40` is also 40px per second, but the tick
+ * count cap then collapsed the whole axis to a 40px sliver with every mark squashed to nothing.
  */
 const SCALE_SECONDS = 1
-const DEFAULT_SCALE_WIDTH = 30
+const DEFAULT_SCALE_WIDTH = 4
 
 /** Pixels per second the zoom covers. */
-const MIN_SCALE_WIDTH = 1
+const MIN_SCALE_WIDTH = 0.5
 const MAX_SCALE_WIDTH = 400
 
 /** How much one press of a zoom button changes the scale. */
@@ -110,16 +115,22 @@ export function Timeline({
   const [scaleWidth, setScaleWidth] = useState(DEFAULT_SCALE_WIDTH)
 
   const subject = useMemo<EditSubject>(() => ({ clips, assetDurationUs }), [clips, assetDurationUs])
-  const filmSeconds = useMemo(() => {
-    const spans = layoutOnOutputAxis(clips)
-    return spans.length === 0 ? 0 : (spans[spans.length - 1] as { end: number }).end
-  }, [clips])
+  /*
+   * 轴的右端是**录制时长**，不是成片时长。
+   *
+   * 这一条是整个改动的地基：轴、刻度、片段位置、播放头、点击定位全都读同一个数。
+   * 之前轴是成片时长（86 秒）而播放头是素材时间（0→2584 秒），于是点轴的 40 秒会把
+   * 画面移到素材的 40 秒 —— 那是另一个时刻。
+   */
+  const assetSeconds = assetDurationUs / 1e6
+  // 成片时长仍然要报：它是这一刀的结果，只是不再当轴用。
+  const filmSeconds = useMemo(() => filmSecondsOf(clips), [clips])
   // 行只在时间线或所选轨道变化时重算。每次渲染都重建会让编辑器自己的数据与这份行互相覆盖 ——
   // 拖动刚拉长一段，随即被一份新算出的行按回原样。
   const rows = useMemo<TimelineRow[]>(() => [
     ...toRows(subject),
-    ...evidenceRows(EVIDENCE_LANES.filter(lane => lanes[lane]), filmSeconds),
-  ], [subject, lanes, filmSeconds])
+    ...evidenceRows(EVIDENCE_LANES.filter(lane => lanes[lane]), assetSeconds),
+  ], [subject, lanes, assetSeconds])
   const effects = useMemo(() => ({
     [CLIP_EFFECT]: { id: CLIP_EFFECT, name: t('column.timeline') },
     [EVIDENCE_EFFECT]: { id: EVIDENCE_EFFECT, name: t('evidence.lanes') },
@@ -158,7 +169,17 @@ export function Timeline({
     <div className={styles.timeline} data-timeline="">
       <div className={styles.bar}>
         <span className={styles.barLabel}>{t('column.timeline')}</span>
-        <span className={styles.barHint}>{t('timeline.hint')}</span>
+        {/*
+         * 两个长度并排显示，因为它们回答不同的问题：刻度上的轴是**录制**（素材多长、
+         * 哪几段被用了、中间空了哪些），而这个读数是**成片**（按倍速折算后有多长）。
+         * 只给一个数会让人以为轴就是成片，那正是先前那个错。
+         */}
+        <span className={styles.barHint} data-lengths="">
+          {t('timeline.lengths', {
+            source: (assetDurationUs / 1e6).toFixed(1),
+            film: filmSeconds.toFixed(1),
+          })}
+        </span>
         <span className={styles.barSpacer} />
         <button
           type="button" className={styles.zoomButton} data-zoom="out"
@@ -221,7 +242,7 @@ export function Timeline({
                   <EvidenceLane
                     assetDurationUs={assetDurationUs}
                     clips={clips}
-                    filmSeconds={filmSeconds}
+                    filmSeconds={assetSeconds}
                     lane={lane}
                     onSeek={onSeek}
                     t={t}

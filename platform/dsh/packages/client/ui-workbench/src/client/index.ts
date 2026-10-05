@@ -18,6 +18,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
+import { createWorkbenchLayoutStore } from './layout-store.ts'
 import { WorkbenchPanel } from './WorkbenchPanel.tsx'
 import { WorkbenchPanelIcon } from './WorkbenchPanelIcon.tsx'
 import { en, zh, type WorkbenchKey } from './locales.ts'
@@ -72,8 +73,16 @@ export const inject = ['slots', 'locale']
  */
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register('workbench', { zh, en }), 'ui-workbench: dictionaries')
+  /*
+   * 布局尺寸放在注册声明的 store 里，而不是面板自己的 state 里。
+   *
+   * 面板在切走时会卸载，组件内的 state 会跟着消失 —— 而「我把片段栏拉宽过」是一次
+   * 调整，不该每次回到工作台都重来一遍。store 正是跨重挂载存活的那一层。它在 root
+   * scope：这张面板是 root 级的 keyed 座位，尺寸不针对某一条会话。
+   */
   ctx.slots.inject('main', () => ctx.slots.register(
-    { name: 'main', key: PANEL_ID, locale: 'workbench' }, WorkbenchPanel,
+    { name: 'main', key: PANEL_ID, locale: 'workbench', store: createWorkbenchLayoutStore },
+    WorkbenchPanel,
   ))
   ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
     name: 'sidebar.panellist',

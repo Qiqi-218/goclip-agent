@@ -18,7 +18,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type { ClipSpan } from './timing.ts'
 import type { EvidenceSpan } from './read.ts'
 import type { EvidencePayload } from './read.ts'
-import { loudnessColumns, toFilmSpans, type EvidenceLaneKey } from './evidence-model.ts'
+import { loudnessColumns, toUsedSpans, type EvidenceLaneKey } from './evidence-model.ts'
 import styles from './EvidenceLanes.module.css'
 
 /** The effect id the evidence rows carry. */
@@ -136,7 +136,7 @@ function TextLane<M extends EvidenceSpan>({ marks, wordsOf, clips, filmSeconds, 
 }): ReactNode {
   return (
     <>
-      {toFilmSpans(clips, marks).map(piece => (
+      {toUsedSpans(clips, marks).map(piece => (
         <button
           key={`${piece.start}-${wordsOf(piece.value).slice(0, 12)}`}
           type="button"
@@ -170,14 +170,14 @@ function LoudnessLane({ tracks, clips, filmSeconds }: {
 }): ReactNode {
   const loudness = tracks.loudness
   if (loudness === undefined) return null
-  const columns = loudnessColumns(clips, loudness.levels_dbfs, loudness.window_us, LOUDNESS_BUCKETS)
+  const columns = loudnessColumns(loudness.levels_dbfs, loudness.window_us, LOUDNESS_BUCKETS)
   if (columns.length === 0) return null
   // 纵轴按本片实测动态范围；实测那条素材峰值只到 −12 dBFS，固定 −60…0 会让顶部一直空着。
   const floor = loudness.floor_dbfs ?? Math.min(...columns.map(column => column.db))
   const peak = loudness.peak_dbfs ?? Math.max(...columns.map(column => column.db))
   const spread = peak - floor
   // 「响」的区段仍以素材时间给出，所以它们要按素材坐标换算。
-  const loudSpans = toFilmSpans(clips, loudness.loud_spans)
+  const loudSpans = toUsedSpans(clips, loudness.loud_spans)
   return (
     <>
       {columns.map(column => (
@@ -243,7 +243,7 @@ export function EvidenceLane({ lane, tracks, clips, filmSeconds, onSeek, t }: La
         ? (tracks.silences ?? []).map(span => ({ ...span, title: t('evidence.silence') }))
         : (tracks.highlights ?? []).map(span => ({ ...span, title: span.reason ?? t('evidence.highlight') }))
 
-  const placed = toFilmSpans(clips, spans)
+  const placed = toUsedSpans(clips, spans)
   if (placed.length === 0) return null
   return (
     <>

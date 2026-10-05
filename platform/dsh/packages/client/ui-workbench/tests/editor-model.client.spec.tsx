@@ -29,7 +29,7 @@ import {
   type EditableClip,
   type EditSubject,
 } from '../src/client/editor-model.ts'
-import { layoutOnOutputAxis, outputSecondsOf, rateOf, trimDeltaFromOutput } from '../src/client/timing.ts'
+import { layoutOnSourceAxis, outputSecondsOf, rateOf, trimDeltaFromAxis } from '../src/client/timing.ts'
 
 /** Asset length in microseconds, as the media route reports it. */
 const ASSET_US = 2_584_133_000
@@ -73,66 +73,80 @@ describe('playback rate', () => {
   })
 })
 
-describe('layout on the output axis', () => {
-  it('lays clips end to end instead of at their source positions', () => {
-    // 素材坐标 21.74 / 272.49 / 296.58 直接当轴坐标用，三段会散在 2584 秒里；
-    // 成片轴上是首尾相接的 0 → 7.72 → 11.72 → 17.40。
-    const spans = layoutOnOutputAxis(SUBJECT.clips)
-    expect(spans[0]?.start).toBeCloseTo(0, 6)
-    expect(spans[0]?.end).toBeCloseTo(7.72, 6)
-    expect(spans[1]?.start).toBeCloseTo(7.72, 6)
-    expect(spans[1]?.end).toBeCloseTo(11.72, 6)
-    expect(spans[2]?.start).toBeCloseTo(11.72, 6)
+describe('layout on the recording axis', () => {
+  it('draws each clip where it sits in the recording, gaps and all', () => {
+    /*
+     * 轴是**录制本身**，所以三段停在它们真实的素材位置上：21.74→29.46、272.49→276.49、
+     * 296.58→302.26。中间那些没被用到的秒数就是空隙 —— 那正是「这一刀留下了什么」。
+     *
+     * 早先这里是首尾相接的成片轴（0→7.72→11.72→…）。那样轴与播放器用的是两个时间系统，
+     * 点轴的 40 秒会让画面跳到素材的 40 秒，而那是另一个时刻。
+     */
+    const spans = layoutOnSourceAxis(SUBJECT.clips)
+    expect(spans[0]?.start).toBeCloseTo(21.74, 6)
+    expect(spans[0]?.end).toBeCloseTo(29.46, 6)
+    expect(spans[1]?.start).toBeCloseTo(272.49, 6)
+    expect(spans[1]?.end).toBeCloseTo(276.49, 6)
+    expect(spans[2]?.start).toBeCloseTo(296.58, 6)
+    expect(spans[2]?.end).toBeCloseTo(302.26, 6)
   })
 
-  it('accounts for speed when deciding how much film a clip fills', () => {
-    const spans = layoutOnOutputAxis([clip(0, 0, 10, 2), clip(1, 100, 104, 1)])
-    expect(spans[0]?.end).toBeCloseTo(5, 6)
-    expect(spans[1]?.start).toBeCloseTo(5, 6)
-    expect(spans[1]?.end).toBeCloseTo(9, 6)
+  it('does not let the playback rate move a clip on this axis', () => {
+    // 倍率改变的是**成片**里占多长，不改变它取自素材的哪一段 —— 在素材轴上它不该移动。
+    const spans = layoutOnSourceAxis([clip(0, 0, 10, 2), clip(1, 100, 104, 1)])
+    expect(spans[0]?.start).toBeCloseTo(0, 6)
+    expect(spans[0]?.end).toBeCloseTo(10, 6)
+    expect(spans[1]?.start).toBeCloseTo(100, 6)
+    expect(spans[1]?.end).toBeCloseTo(104, 6)
   })
 
   it('returns nothing for no clips', () => {
-    expect(layoutOnOutputAxis([])).toEqual([])
+    expect(layoutOnSourceAxis([])).toEqual([])
   })
 })
 
 describe('trim delta', () => {
-  it('scales an output movement back into the source by the playback rate', () => {
-    // 2 倍速下成片里延长 1 秒，等于素材里多取 2 秒 —— 漏掉倍率就只取了一半。
-    expect(trimDeltaFromOutput(clip(0, 10, 14, 2), 2, 3)).toBe(2_000_000)
-    expect(trimDeltaFromOutput(clip(0, 10, 14, 1), 4, 5)).toBe(1_000_000)
+  it('reads a drag as the same number of recording seconds, whatever the rate', () => {
+    /*
+     * 轴是**录制本身**，所以轴上一秒就是一秒素材 —— 倍率不参与。
+     *
+     * 在成片轴上这里要乘倍率（2 倍速下成片 1 秒是素材 2 秒），而漏掉那个因子只会让取用
+     * 区间短一半：画面还在，只是少了一截。这正是换成素材轴要消掉的那类错。
+     */
+    expect(trimDeltaFromAxis(4, 5)).toBe(1_000_000)
+    expect(trimDeltaFromAxis(2, 3)).toBe(1_000_000)
   })
 
   it('reports a shortening as a negative movement', () => {
-    expect(trimDeltaFromOutput(clip(0, 10, 14, 1), 4, 3)).toBe(-1_000_000)
+    expect(trimDeltaFromAxis(4, 3)).toBe(-1_000_000)
   })
 
   it('refuses an edit smaller than a frame', () => {
     // 一次点击带来的浮点抖动不该变成一次编辑，否则每次点选都会发出一条工具调用。
-    expect(trimDeltaFromOutput(clip(0, 10, 14, 1), 4, 4)).toBeNull()
-    expect(trimDeltaFromOutput(clip(0, 10, 14, 1), 4, 4 + 1 / 60)).toBeNull()
+    expect(trimDeltaFromAxis(4, 4)).toBeNull()
+    expect(trimDeltaFromAxis(4, 4 + 1 / 60)).toBeNull()
   })
 })
 
 describe('rows for the editor', () => {
-  it('mints one action per clip, on the output axis', () => {
+  it('mints one action per clip, at the positions they hold in the recording', () => {
     const rows = toRows(SUBJECT)
     expect(rows).toHaveLength(1)
     const actions = rows[0]?.actions ?? []
     expect(actions.map(action => action.id)).toEqual(['clip-0', 'clip-1', 'clip-2'])
     expect(actions.every(action => action.effectId === CLIP_EFFECT)).toBe(true)
-    expect(actions[0]?.start).toBeCloseTo(0, 6)
-    expect(actions[0]?.end).toBeCloseTo(7.72, 6)
+    // 第 1 段取自素材 21.74→29.46 秒，于是它就画在那里 —— 不是画在轴的 0 秒处。
+    expect(actions[0]?.start).toBeCloseTo(21.74, 6)
+    expect(actions[0]?.end).toBeCloseTo(29.46, 6)
   })
 
   it('bounds a clip by the material actually available on each side', () => {
     const rows = toRows(SUBJECT)
     const first = rows[0]?.actions[0]
-    // 第 0 段从素材 21.74s 处开始，所以往左最多能拉回 21.74 秒；成片起点是 0，取不到负的。
+    // 这条轴的左端就是录制的开头，所以往左最多拉到 0 —— 不用按倍率折算。
     expect(first?.minStart).toBeCloseTo(0, 6)
-    // 它到素材 29.46s 结束，素材还剩 2584.13 − 29.46 秒可用，成片里就能往右长这么多。
-    expect(first?.maxEnd).toBeCloseTo(7.72 + (ASSET_US / 1e6 - 29.46), 3)
+    // 右端就是录制的结尾，所以往右最多到素材时长。
+    expect(first?.maxEnd).toBeCloseTo(ASSET_US / 1e6, 3)
   })
 
   it('lets a later clip reach back into the material before it', () => {
@@ -166,7 +180,8 @@ describe('reading an ordinal back from an action id', () => {
 describe('turning an edited action into a tool call', () => {
   it('trims the right edge when only the end moved', () => {
     const rows = toRows(SUBJECT)
-    const edited = { ...(rows[0]?.actions[0] as never as { id: string, start: number, end: number, effectId: string }), end: 9.72 }
+    // 第 1 段原本到素材 29.46 秒；把右边界拉到 31.46 就是多取 2 秒。轴上的秒数就是素材秒数。
+    const edited = { ...(rows[0]?.actions[0] as never as { id: string, start: number, end: number, effectId: string }), end: 31.46 }
     const intent = intentFromEditedAction(SUBJECT, edited, 'tl-1', 2)
     // 成片里 7.72 → 9.72，即多取 2 秒素材。
     expect(intent?.tool).toBe('video_timeline_trim')
@@ -181,12 +196,16 @@ describe('turning an edited action into a tool call', () => {
     expect(intent?.args).toMatchObject({ ordinal: 0, edge: 'start', delta_us: 1_000_000 })
   })
 
-  it('keeps the playback rate when reading a left-edge drag', () => {
+  it('reads a left-edge drag as recording seconds, with no rate factor', () => {
     const subject: EditSubject = { clips: [clip(0, 100, 110, 2)], assetDurationUs: ASSET_US }
     const rows = toRows(subject)
     const original = rows[0]?.actions[0] as never as { id: string, start: number, end: number, effectId: string }
-    // 成片原长 5 秒；左边界推到 1 秒 → 成片 4 秒，短了 1 秒 → 素材起点要前进 1×2 = 2 秒。
-    const intent = intentFromEditedAction(subject, { ...original, start: 1 }, 'tl-1', 1)
+    /*
+     * 这一段是 2 倍速，而**倍率在这里不参与**：轴是录制本身，把左边界从素材 100 秒推到
+     * 102 秒就是丢掉 2 秒素材。在成片轴上同样的拖动只等于 1 秒素材，因为成片里 1 秒是素材 2 秒
+     * —— 那个因子漏掉时取用区间会短一半，而画面还在，所以只有看片才发现少了一截。
+     */
+    const intent = intentFromEditedAction(subject, { ...original, start: 102 }, 'tl-1', 1)
     expect(intent?.args).toMatchObject({ edge: 'start', delta_us: 2_000_000 })
   })
 
@@ -209,26 +228,33 @@ describe('turning an edited action into a tool call', () => {
 })
 
 describe('cutting a clip in two', () => {
-  it('converts the moment from the film back into the recording', () => {
-    // 车道报的是**成片**位置，工具要的是**素材**时刻。第 1 段从素材 21.74s 起、在成片 0s 起，
-    // 所以在成片上 3s 处切开＝素材 21.74 + 3 = 24.74s。
-    const intent = splitIntent(SUBJECT.clips, 0, 3, 'tl-1', 4)
+  it('takes the moment on the axis as the moment in the recording', () => {
+    /*
+     * 轴就是录制，所以「点在哪里」**就是**素材时刻 —— 不需要换算。
+     *
+     * 早先这里要减掉片段的成片起点、再乘倍率；那个换算漏一项就会把切口放到别的地方，
+     * 而错的位置要到有人看片、发现一句话中间换了镜头才暴露。换成素材轴之后，
+     * 这一类错没有存在的地方。
+     */
+    const intent = splitIntent(SUBJECT.clips, 0, 24.74, 'tl-1', 4)
     expect(intent?.tool).toBe('video_timeline_split')
     expect(intent?.args).toMatchObject({ ordinal: 0, asset_time_us: 24_740_000 })
   })
 
-  it('accounts for the clip playback rate as well as its offset', () => {
-    // 第 3 段（ordinal 2）是 2 倍速、素材从 296.58s 起、成片从 11.72s 起。
-    // 成片上 12.72s 处＝这一段里过了 1s 的成片时间＝素材里过了 2s。
-    const intent = splitIntent(SUBJECT.clips, 2, 12.72, 'tl-1', 4)
+  it('ignores the playback rate, which changes the film and not the recording', () => {
+    // 第 3 段取自素材 296.58→302.26 秒（2 倍速）。切在素材 298.58 秒就是切在那一秒 ——
+    // 倍率不改变它取自哪里，只改变它在成片里占多长。
+    const intent = splitIntent(SUBJECT.clips, 2, 298.58, 'tl-1', 4)
     expect(intent?.args.asset_time_us).toBe(298_580_000)
   })
 
-  it('starts the cut from the right clip when earlier ones are longer', () => {
-    // 第 2 段（ordinal 1）在成片 7.72s 起；在成片 8.72s 处切＝素材 272.49 + 1 = 273.49s。
-    // 少减了这一段的成片起点，切点会落在上一段里 —— 而那是另一个位置的另一段素材。
-    const intent = splitIntent(SUBJECT.clips, 1, 8.72, 'tl-1', 4)
+  it('cuts the clip that actually contains the moment', () => {
+    // 第 2 段取自素材 272.49→276.49 秒。切点必须落在**这一段**的区间里；
+    // 落在一段没被使用的空隙上就不是「切这一段」。
+    const intent = splitIntent(SUBJECT.clips, 1, 273.49, 'tl-1', 4)
     expect(intent?.args.asset_time_us).toBe(273_490_000)
+    // 273.49 秒也落在第 1 段（21.74→29.46）之外，所以切第 1 段时它必须被拒绝。
+    expect(splitIntent(SUBJECT.clips, 0, 273.49, 'tl-1', 4)).toBeNull()
   })
 
   it('refuses a moment outside the clip instead of snapping to the nearest one', () => {

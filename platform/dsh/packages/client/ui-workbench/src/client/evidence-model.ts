@@ -103,66 +103,72 @@ export function filmPositionOf(clips: readonly ClipSpan[], atUs: number): number
 }
 
 /**
- * Place every span of one evidence track onto the film axis.
+ * Cut every span of one evidence track down to the parts the cut actually uses.
+ *
+ * On the recording's axis a mark's position **is** its recording time, so nothing is remapped:
+ * what this does is keep the marks that fall inside a used stretch and split the ones that straddle
+ * a boundary. A span the cut never uses is dropped — drawing it would say the film contains
+ * something it does not.
+ *
+ * This used to remap onto the film's axis, which is what made a mark's position depend on how many
+ * clips preceded it. Removing that remapping is what lets the lane, the ruler and the player all
+ * name the same moment.
  *
  * @param clips - the clips in output order.
  * @param spans - the measured spans, in recording time.
- * @returns One entry per piece that the cut actually uses, in film order.
+ * @returns One entry per used piece, in recording order.
  */
-export function toFilmSpans<T extends SourceSpan>(clips: readonly ClipSpan[], spans: readonly T[]): FilmSpan<T>[] {
-  const starts = filmStarts(clips)
+export function toUsedSpans<T extends SourceSpan>(clips: readonly ClipSpan[], spans: readonly T[]): FilmSpan<T>[] {
+  const used = clips
+    .filter(clip => clip.end_us > clip.start_us)
+    .map(clip => ({ start_us: clip.start_us, end_us: clip.end_us }))
+    .sort((left, right) => left.start_us - right.start_us)
   const placed: FilmSpan<T>[] = []
   for (const span of spans) {
-    for (let index = 0; index < clips.length; index += 1) {
-      const clip = clips[index] as ClipSpan
+    for (const clip of used) {
       const from = Math.max(span.start_us, clip.start_us)
       const to = Math.min(span.end_us, clip.end_us)
-      // 只有真正落在这一段取用区间里的部分才画；其余部分在这一段上没有位置。
+      // 只有真正落在取用区间里的部分才画；其余部分在成片里没有位置。
       if (to <= from) continue
-      const rate = rateOf(clip.speed)
-      const filmStart = (starts[index] as number) + (from - clip.start_us) / 1e6 / rate
-      const filmEnd = (starts[index] as number) + (to - clip.start_us) / 1e6 / rate
-      placed.push({ start: filmStart, end: filmEnd, sourceStartUs: from, sourceEndUs: to, value: span })
+      placed.push({ start: from / 1e6, end: to / 1e6, sourceStartUs: from, sourceEndUs: to, value: span })
     }
   }
   return placed.sort((left, right) => left.start - right.start)
 }
 
 /**
- * Reduce a loudness reading track to one peak per bucket of film time.
+ * Reduce a loudness reading track to one peak per bucket of recording time.
  *
- * Readings arrive one per window of the recording; drawn at the film's scale there can be far more
- * of them than pixels. Taking the **peak** of each bucket rather than the mean keeps a momentary
- * loudness rise visible, which is the reason to look at the track at all.
+ * Readings arrive one per window of the recording; drawn at the recording's scale there can be far
+ * more of them than pixels. Taking the **peak** of each bucket rather than the mean keeps a
+ * momentary loudness rise visible, which is the reason to look at the track at all.
  *
- * @param clips - the clips in output order.
+ * Buckets cover the whole recording rather than just the used stretches: the curve is a property
+ * of the material, and clipping it to the cut would make two different cuts look like they had
+ * different audio.
+ *
  * @param levels - one reading per window, in recording order.
  * @param windowUs - length of one window in microseconds.
- * @param buckets - how many columns the film may be reduced to.
- * @returns One peak per bucket, in film order.
+ * @param buckets - how many columns the axis may be reduced to.
+ * @returns One peak per bucket, positioned as a share of the recording.
  */
 export function loudnessColumns(
-  clips: readonly ClipSpan[],
   levels: readonly number[],
   windowUs: number,
   buckets: number,
 ): { readonly at: number, readonly db: number }[] {
   if (levels.length === 0 || windowUs <= 0 || buckets <= 0) return []
-  const starts = filmStarts(clips)
-  if (starts.length === 0) return []
-  const last = clips[clips.length - 1] as ClipSpan
-  const filmSeconds = (starts[starts.length - 1] as number) + (last.end_us - last.start_us) / 1e6 / rateOf(last.speed)
-  if (filmSeconds <= 0) return []
+  const totalSeconds = (levels.length * windowUs) / 1e6
+  if (totalSeconds <= 0) return []
 
   const peaks = new Array<number>(buckets).fill(Number.NEGATIVE_INFINITY)
   for (let index = 0; index < levels.length; index += 1) {
     const level = levels[index]
     if (level === undefined || !Number.isFinite(level)) continue
-    const atUs = index * windowUs
-    const filmAt = filmPositionOf(clips, atUs)
-    // 没被任何一段取用的时刻没有位置可画 —— 跳过，而不是塞到端点。
-    if (filmAt === null) continue
-    const bucket = Math.min(buckets - 1, Math.max(0, Math.floor((filmAt / filmSeconds) * buckets)))
+    // 读数本身就带位置：第 N 个窗口覆盖第 N 段素材时间。在素材轴上不再需要查「它落在哪一段里」，
+    // 于是这一段也不再有「某个时刻没有位置」这种情况 —— 每个读数都有位置，因为它就是素材的一部分。
+    const atSeconds = (index * windowUs) / 1e6
+    const bucket = Math.min(buckets - 1, Math.max(0, Math.floor((atSeconds / totalSeconds) * buckets)))
     if (level > (peaks[bucket] as number)) peaks[bucket] = level
   }
   return peaks.flatMap((db, index) => Number.isFinite(db)

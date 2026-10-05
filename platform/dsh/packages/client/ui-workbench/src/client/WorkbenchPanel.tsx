@@ -18,23 +18,28 @@
  * to "where are we" instead of several that can disagree.
  */
 import type { ReactNode } from 'react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { PropsLocale, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import { OutputList } from './OutputList.tsx'
 import { Player } from './Player.tsx'
 import { clipOfIntent, revertIntent, type EditIntent, type EditableClip } from './editor-model.ts'
 import { ClipActions } from './ClipActions.tsx'
+import { Divider } from './Divider.tsx'
 import { SubtitleOverlay } from './SubtitleOverlay.tsx'
 import { cueAt, previewCues, previewStyle, type PreviewCue } from './subtitle-preview.ts'
 import { RevisionList } from './RevisionList.tsx'
 import { EVIDENCE_LANES, type EvidenceLaneKey } from './evidence-model.ts'
+import { createWorkbenchLayoutStore, DEFAULT_LAYOUT, resolveDivision, resolveLowerHeight, type LayoutState } from './layout-store.ts'
 import { Timeline, availableLanes } from './Timeline.tsx'
 import { assetFromAddress, mediaUrl, readEvidence, readHistory, readLoudness, readRenders, readTimelines, type EvidencePayload, type HistoryPayload, type Read, type WorkbenchAsset } from './read.ts'
 import styles from './WorkbenchPanel.module.css'
 
-/** What the panel reads: the owner share and this package's dictionary. */
-type WorkbenchProps = PropsRuntime<'main'> & PropsLocale<'workbench'>
+/** What the panel reads: the owner share, this package's dictionary, and its layout store. */
+type WorkbenchProps =
+  & PropsRuntime<'main'>
+  & PropsLocale<'workbench'>
+  & PropsStore<ReturnType<typeof createWorkbenchLayoutStore>>
 
 /** Dictionary key naming each lane, so the toggle row reads from the one dictionary. */
 const EVIDENCE_LABELS = {
@@ -122,7 +127,7 @@ function historyLoader(timelineId: string): (asset: WorkbenchAsset, signal: Abor
  * @param props - the panel's owner share, its dictionary, and an optional asset override.
  * @returns the editing surface.
  */
-export function WorkbenchPanel({ t, asset }: WorkbenchProps & { readonly asset?: WorkbenchAsset | null }): ReactNode {
+export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps & { readonly asset?: WorkbenchAsset | null }): ReactNode {
   // 显式传 null 表示「未选中」，与「没传」不同 —— 用 ?? 会把前者也当成后者，
   // 于是调用方想说「什么都没有」时反而去读了地址。
   const target = useMemo(
@@ -213,10 +218,62 @@ export function WorkbenchPanel({ t, asset }: WorkbenchProps & { readonly asset?:
     EVIDENCE_LANES.map(lane => [lane, offered.includes(lane) && !hidden.includes(lane)]),
   ) as Record<EvidenceLaneKey, boolean>
 
+  const layout = useStore(state => state)
+  /*
+   * 舞台的框由这里量，而不是由窗口尺寸推。
+   *
+   * 侧栏、对话列以及面板外面的留白都会改变可用宽度；按窗口宽度算会让分界线停在指针
+   * 之外的位置，而那是这一处最容易出的错。
+   */
+  const stageBox = useRef<HTMLDivElement>(null)
+
+  /**
+   * 拖动开始时的指针位置与时间线高度。
+   *
+   * 两条竖直的分界线能从舞台自身的两条边直接解出宽度，所以不需要起点。横向那条不行 ——
+   * 它的缝是时间线的**上缘**，而时间线的下缘不是舞台的任何一条边。所以那一条按位移解，
+   * 位移只需要起点，不需要布局。
+   */
+  const lowerDrag = useRef<{ pointer: number, height: number } | null>(null)
+
+  const dragLeft = useCallback((clientX: number) => {
+    const box = stageBox.current?.getBoundingClientRect()
+    if (box === undefined) return
+    actions.setDivision('leftWidth', resolveDivision('leftWidth', clientX, box, layout))
+  }, [actions, layout])
+
+  const dragRight = useCallback((clientX: number) => {
+    const box = stageBox.current?.getBoundingClientRect()
+    if (box === undefined) return
+    actions.setDivision('rightWidth', resolveDivision('rightWidth', clientX, box, layout))
+  }, [actions, layout])
+
+  /** 按下时记下起点：之后每一次移动都相对它算。 */
+  const beginLower = useCallback((clientY: number) => {
+    lowerDrag.current = { pointer: clientY, height: layout.lowerHeight }
+  }, [layout.lowerHeight])
+
+  const dragLower = useCallback((clientY: number) => {
+    const start = lowerDrag.current
+    if (start === null) return
+    actions.setDivision('lowerHeight', resolveLowerHeight(start.height, start.pointer, clientY))
+  }, [actions])
+
+  const endLower = useCallback(() => { lowerDrag.current = null }, [])
+  const noop = useCallback(() => {}, [])
+
+  const step = useCallback((division: keyof LayoutState) => (delta: number) => {
+    actions.setDivision(division, layout[division] + delta)
+  }, [actions, layout])
+
+  const reset = useCallback((division: keyof LayoutState) => () => {
+    actions.setDivision(division, DEFAULT_LAYOUT[division])
+  }, [actions])
+
   return (
     <div className={styles.workbench} data-workbench="">
-      <div className={styles.stage}>
-        <aside className={styles.side} data-area="clips">
+      <div className={styles.stage} ref={stageBox}>
+        <aside className={styles.side} style={{ width: layout.leftWidth }} data-area="clips">
           <h2 className={styles.heading}>{t('timeline.trackVideo')}</h2>
           <div className={styles.rows}>
             {clips.length === 0
@@ -263,6 +320,16 @@ export function WorkbenchPanel({ t, asset }: WorkbenchProps & { readonly asset?:
           </div>
         </aside>
 
+        <Divider
+          axis="row"
+          label={t('layout.leftSplit')}
+          onDragEnd={noop}
+          onDragStart={noop}
+          onDragTo={dragLeft}
+          onReset={reset('leftWidth')}
+          onStep={step('leftWidth')}
+        />
+
         <section className={styles.viewer} data-area="viewer">
           {/*
            * 预览叠在画面上，位置就是它在成片里的位置 ——「底部居中」和「左上角」是不同的
@@ -283,7 +350,17 @@ export function WorkbenchPanel({ t, asset }: WorkbenchProps & { readonly asset?:
           </div>
         </section>
 
-        <aside className={styles.side} data-area="output">
+        <Divider
+          axis="row"
+          label={t('layout.rightSplit')}
+          onDragEnd={noop}
+          onDragStart={noop}
+          onDragTo={dragRight}
+          onReset={reset('rightWidth')}
+          onStep={step('rightWidth')}
+        />
+
+        <aside className={styles.side} style={{ width: layout.rightWidth }} data-area="output">
           <h2 className={styles.heading}>{t('column.output')}</h2>
           <div className={styles.rows}>
             <OutputList renders={films} t={t} />
@@ -291,7 +368,17 @@ export function WorkbenchPanel({ t, asset }: WorkbenchProps & { readonly asset?:
         </aside>
       </div>
 
-      <section className={styles.lower} data-area="timeline">
+      <Divider
+        axis="column"
+        label={t('layout.timelineSplit')}
+        onDragEnd={endLower}
+        onDragStart={beginLower}
+        onDragTo={dragLower}
+        onReset={reset('lowerHeight')}
+        onStep={step('lowerHeight')}
+      />
+
+      <section className={styles.lower} style={{ height: layout.lowerHeight }} data-area="timeline">
         <Timeline
           assetDurationUs={durationUs}
           baseRevision={active?.revision ?? 0}

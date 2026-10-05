@@ -21,28 +21,30 @@
 
 /* The viewer's row, above the timeline. */
 .stage {
-  display: grid;
+  /*
+   * 弹性行而不是网格：三栏的宽度由布局 store 给（可以拖），中间一栏吃掉剩下的。
+   * 写成网格时列宽在 CSS 里，拖动就只能改一个 CSS 变量 —— 那等于把尺寸放两个地方。
+   */
+  display: flex;
   flex: 1 1 auto;
-  grid-template-columns: 200px minmax(0, 1fr) 240px;
   min-height: 0;
-  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
 }
 
 .side {
   display: flex;
+  /* 宽度来自布局 store（可拖），所以这里只说「不参与伸缩」与「装不下就滚」。 */
+  flex: none;
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  border-right: 0.5px solid var(--dsw-alias-border-l2);
 }
 
-.side:last-child {
-  border-right: none;
-  border-left: 0.5px solid var(--dsw-alias-border-l2);
-}
+/* 边界线由两侧的分隔条画；边栏再画一条就会出现两条并排的线。 */
 
 .viewer {
   display: flex;
+  /* 中间一栏吃掉两侧定宽之后剩下的部分。 */
+  flex: 1 1 auto;
   align-items: center;
   justify-content: center;
   min-width: 0;
@@ -117,10 +119,10 @@
    时间线会把画面挤掉 —— 而画面是判断剪得对不对的依据。 */
 .lower {
   display: flex;
-  flex: 1 1 auto;
+  /* 高度由布局 store 给：它可以拖，写死在这里就等于两处都说了算。 */
+  flex: none;
   flex-direction: column;
-  min-height: 190px;
-  max-height: 62%;
+  min-height: 0;
   overflow: hidden;
 }
 
