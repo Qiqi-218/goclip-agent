@@ -32,11 +32,12 @@ goclip 反过来：先用多模态模型把长视频解析成**带时间戳的�
 ```
 浏览器
   └─ DSH Web（单进程）
-       ├─ dsh-video-workspace   插件：46 个 video_* 工具，全部在 DSH 进程内执行
+       ├─ dsh-video-workspace   插件：50 个 video_* 工具，全部在 DSH 进程内执行
        │    ├─ FFmpeg/ffprobe   本地：证据计算、切分、拼接、导出
        │    ├─ Qwen3.8-Omni     云端：视频理解（画面+声音同时）
        │    └─ 阿里云 OSS       云端：素材与成片的权威存储
-       └─ dsh-client-ui-evidence  插件：证据总览面板（只读）
+       ├─ dsh-client-ui-evidence  插件：证据总览面板（只读）
+       └─ dsh-client-ui-workbench 插件：剪辑工作台（时间线、播放器、证据轨道、成片）
 ```
 
 **关键设计：工具在 DSH 进程内跑。** 早期版本是一个独立的 Go 服务 + 8090 端口，
@@ -44,7 +45,7 @@ goclip 反过来：先用多模态模型把长视频解析成**带时间戳的�
 
 ### 证据总览面板
 
-界面里有一张**只读**的多轨时间轴卡片，把六个证据维度画在同一条轴上：
+界面里有一张**只读**的多轨时间轴卡片，把七个证据维度画在同一条轴上：
 
 ```
 证据总览 · 2:40
@@ -63,7 +64,7 @@ goclip 反过来：先用多模态模型把长视频解析成**带时间戳的�
 
 ---
 
-## 工具（46 个）
+## 工具（50 个）
 
 | 类别 | 工具 |
 | --- | --- |
@@ -75,11 +76,32 @@ goclip 反过来：先用多模态模型把长视频解析成**带时间戳的�
 | 证据汇总 | `video_evidence_view` |
 | 时间线编辑 | `video_timeline_create` `video_timeline_get` `video_timeline_list` `video_edit_apply` `video_timeline_add` `video_timeline_remove` `video_timeline_reorder` `video_timeline_trim` `video_timeline_adjust` `video_timeline_set` `video_timeline_split` `video_timeline_merge` `video_timeline_rename` |
 | 版本 | `video_timeline_history` `video_timeline_revert` |
+| 字幕样式 | `video_timeline_subtitle_style` `video_subtitle_style_get` |
 | 方案 | `video_proposal_create` `video_proposal_get` `video_proposal_revise` `video_proposal_accept` |
 | 导出 | `video_render_submit` `video_render_validate` `video_export_subtitles` |
-| 辅助 | `video_evidence_clip` `video_cover_pick` `video_jobs_list` `video_cost_report` |
+| 辅助 | `video_evidence_clip` `video_cover_pick` `video_jobs_list` `video_evidence_status` `video_cost_report` |
 
-### 六维证据
+---
+
+## 剪辑工作台
+
+工作台是中心区的独立面板，侧栏会出现「工作台」入口。它把一条素材的片段、画面、证据、时间线、版本和成片放在同一个编辑面上：
+
+- 时间线使用原片时间轴，片段之间的空隙就是未被使用的素材区间
+- 拖动片段边界、调整倍速/静音、切开、合并、重排、删除和起名，都会先生成带 `base_revision` 的工具意图，不会绕过宿主直接写库
+- 证据轨道显示台词、屏文字、镜头、停顿、响度、章节和高光，并可点击回到原片时刻
+- 版本列表支持提出 `video_timeline_revert`，成片列表保留失败任务及失败阶段
+- 字幕样式可在画面上近似预览，最终导出由 FFmpeg/libass 按成片真实尺寸烧录
+
+工作台通过地址片段指定素材：
+
+```text
+http://127.0.0.1:<port>/?token=…#project=<项目>&asset=<素材>
+```
+
+媒体字节、成片和测量数据都通过 `dsh-video-workspace` 的只读路由提供，视频播放支持 Range 请求。
+
+### 七维证据
 
 | 维度 | 来源 | 能回答 |
 | --- | --- | --- |
@@ -187,8 +209,10 @@ cd platform/dsh
 # 类型检查与打包 —— 改完源码两个都要跑
 node node_modules/typescript/bin/tsc -b packages/video/video-workspace/tsconfig.json --force
 node node_modules/typescript/bin/tsc -b packages/client/ui-evidence/tsconfig.json --force
+node node_modules/typescript/bin/tsc -b packages/client/ui-workbench/tsconfig.json --force
 node node_modules/tsdown/dist/run.mjs --config packages/video/video-workspace/tsdown.config.ts
 node node_modules/tsdown/dist/run.mjs --config packages/client/ui-evidence/tsdown.config.ts
+node node_modules/tsdown/dist/run.mjs --config packages/client/ui-workbench/tsdown.config.ts
 ```
 
 **只跑 tsc 会让线上继续跑旧代码** —— DSH 加载的是 tsdown 打包出的 `lib/index.js`，
@@ -201,8 +225,8 @@ cd platform/dsh
 pwsh -File ..\..\scripts\tools\verify\run-all.ps1      # Windows
 ```
 
-**9 套确定性探测、共 245 项断言**，用网络桩件拦截 OSS 与模型调用，因此不碰真实数据、
-不消耗模型额度。覆盖：运行时与表结构、关开往返、六维证据、证据总览、多素材拼接与导出、
+工作台与视频插件的回归测试共 **13 个测试文件、241 项断言**，并配有真实浏览器 CDP 验收脚本。确定性探测用网络桩件拦截 OSS 与模型调用，因此不碰真实数据、
+不消耗模型额度。覆盖：运行时与表结构、关开往返、七维证据、证据总览、多素材拼接与导出、
 检索、方案版本、云端证据、区间吸附精度。
 
 ---
@@ -212,8 +236,9 @@ pwsh -File ..\..\scripts\tools\verify\run-all.ps1      # Windows
 ```
 config/profile/          goclip 的 DSH profile（模型、persona、客户端插件行）
 platform/dsh/            DSH 基座（随仓库提交，保证可复现构建）
-  packages/video/video-workspace/     核心插件：46 个工具
+  packages/video/video-workspace/     核心插件：50 个工具
   packages/client/ui-evidence/        证据总览面板
+  packages/client/ui-workbench/       剪辑工作台
 scripts/tools/verify/    验收脚本（probe-* 确定性检查，cdp_* 真实界面驱动）
 docs-参赛/               参赛文档
 setup.sh / setup.ps1     安装

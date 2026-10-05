@@ -48,7 +48,7 @@ video_evidence_view 的返回值
 1. **元数据缺失时显示「无数据」而不是空画布。** 载荷里没有 `evidence_view`
    （老日志、或投影失败的调用）时给出明确说明。空画布看上去像「证据全空」，
    那是**另一种**、且不成立的结论。
-2. **`missing` 为 `null` 时不显示「六维齐全」。** 投影只保留面板要画的字段，
+2. **`missing` 为 `null` 时不显示「七维齐全」。** 投影只保留面板要画的字段，
    所以「说了没缺」和「没说」是两件事，面板不能替它下结论。
 3. **`on_this_axis` 直接读宿主的判定，不在界面里重新推导。** 载荷里没有 asset id，
    而「这一段属不属于这条时间轴」只有产出方知道。
@@ -61,3 +61,11 @@ video_evidence_view 的返回值
   恰好不会触发任何断言。
 - `scripts/tools/verify/cdp_panel.py` —— 在真实界面上读渲染结果，并做命中测试
   确认卡片真的被画出来（折叠分组里的元素照样有坐标）。
+
+## Model Experience
+
+None, as the browser draws measurements the host already computed; it contributes no tool, prompt text, or model-visible field, and its reads travel over the host plugin route rather than a model request.
+
+#### KV Cache effect
+
+Does not invalidate; the panel renders persisted evidence metadata and does not add anything to the model request prefix.

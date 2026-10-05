@@ -38,6 +38,8 @@ DSH 原生视频剪辑插件。它在 DSH 进程内注册 `video_*` 工具，调
 
 拒绝时一次列出**全部**有问题的字段：一次只报一个会让模型来回三轮。
 
+`@deepseek-ai/dsh-client-ui-workbench` 会读取同一份 `timelines.subtitle_style`，在播放器上提供近似预览；预览只用于选字体、颜色、描边、底框和位置，最终像素仍以导出阶段 FFmpeg/libass 的结果为准。
+
 ## Model Experience
 
 ### The `video_*` tool definitions
@@ -64,5 +66,5 @@ Append-only. A tool call appends its result, and this package never rewrites an 
 
 - **`verify-export-jsdoc` 在本包上有 63 处报告**，全部是 fork 之前就存在的导出缺 JSDoc，不是本次改动引入的。逐条补齐是一笔独立的工作。
 - **字幕样式的阴影只有偏移量，没有颜色** —— ASS 的 `Shadow` 只接受偏移，阴影颜色跟着 `BackColour` 走。因此有底框时阴影与底框二者只能取一，这一条写进了 `toAssStyle` 的注释；要真正的彩色阴影得改用 `drawtext` 滤镜逐条绘制。
-- **字幕只在导出时烧录，界面没有预览** —— 工作台不显示字幕，所以调样式要导出一次才能看到。预览需要把 ASS 样式在浏览器里重算一遍，与 ffmpeg 的那份保持一致是另一件事。
+- **浏览器预览不是最终成片** —— 工作台会在画面上提供字幕样式的近似预览，但浏览器字体替换、libass 字体和实际输出尺寸可能不同；最终效果以 `video_render_submit` 导出的成片为准。
 - **`video_understand` 单次上传有 192 秒上限**，更长的素材走的是分段窗口；这个上限是模型侧的限制，不是本包的选择。
