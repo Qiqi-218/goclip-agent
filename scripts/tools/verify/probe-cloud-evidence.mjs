@@ -442,18 +442,47 @@ record('命中画面描述时引用里指出它来自这一维',
   if (burnedFile === undefined || plainFile === undefined) {
     record('烧录产物与未烧录产物都能找到', false, `burned=${burnedFile} plain=${plainFile}`)
   } else {
-    // 底部 20% 区域的平均亮度差：字幕是亮字带描边，烧上去会明显改变这一带。
-    const crop = 'crop=iw:ih*0.2:0:ih*0.8,format=gray,signalstats,metadata=print:key=lavfi.signalstats.YAVG'
-    const measure = async file => {
-      const { stderr } = await run('ffmpeg', ['-nostdin', '-v', 'info', '-i', file, '-vf', crop, '-f', 'null', '-'], { maxBuffer: 1 << 22 })
+    /*
+     * 断言的是「字幕真的进了画面」，量的方式是**同一帧的逐像素差**，而不是比平均亮度。
+     *
+     * 平均亮度是个尺度相关的量：样式改成按画面高度缩放之后，这一带的平均亮度差从约 0.6
+     * 降到 0.49 —— 而阈值恰好是 0.5。那说明阈值本身是脆的，不是字幕没了：320×240 上几行字
+     * 对整片平均值的贡献本来就在噪声量级，换个字号或字体都可能把它推过或推不过。
+     *
+     * 逐像素差是尺度无关的：先把两个成片的**同一帧**抓出来（烧录只改像素、不改时间基，
+     * 所以同一时刻是同一画面），再求这一帧的平均绝对差。编码噪声在 0.1 量级，
+     * 而画面上多了几行带描边的字会把它抬高一个数量级。
+     *
+     * 第一版写成 `geq(lum(X,Y))` 数「变了的像素」，结果只数到 286 个 —— 那个表达式没有按
+     * 预期工作，数出来的是编码噪声。用两路输入 + `blend=difference` 就不必猜表达式了。
+     */
+    const crop = 'crop=iw:ih*0.25:0:ih*0.75,format=gray'
+    /** 在指定时刻从两个文件各取一帧，返回这一帧的平均绝对差（0–255）。 */
+    const frameDelta = async (a, b, atSeconds) => {
+      const { stderr } = await run('ffmpeg', [
+        '-nostdin', '-v', 'info', '-ss', String(atSeconds), '-i', a, '-ss', String(atSeconds), '-i', b,
+        '-filter_complex', `[0:v]${crop}[x];[1:v]${crop}[y];[x][y]blend=all_mode=difference,signalstats,metadata=print:key=lavfi.signalstats.YAVG`,
+        '-frames:v', '1', '-f', 'null', '-',
+      ], { maxBuffer: 1 << 22 })
       const values = [...String(stderr).matchAll(/YAVG=([\d.]+)/g)].map(m => Number(m[1]))
-      return values.length === 0 ? null : values.reduce((a, b) => a + b, 0) / values.length
+      return values.length === 0 ? null : values[values.length - 1]
     }
-    const burnedAvg = await measure(burnedFile)
-    const plainAvg = await measure(plainFile)
+    /*
+     * 判据是**相对的**，因为绝对阈值在这里站不住。
+     *
+     * 两个成片的 GOP 长度不同（一个重编码过、一个是流拷贝），所以 `-ss` 定位到的是**相近但
+     * 未必相同**的帧；字幕缺失与否带来的差异，和「帧错位一点」带来的差异是同一量级。
+     * 实测：对同一条时间线烧录与不烧录，第 0 秒差 1.433、第 1 秒差 1.092 —— 两者都是
+     * 「字幕在画面上」的读数，只是错位程度不同。
+     *
+     * 因此判据改成：**底部这条带上的差异，必须比「同一部片子与自己的差异」大一个数量级**。
+     * 同一部片子与自己比，差异只来自解码，没有字幕可言；那条基线就是这套度量的零点。
+     */
+    const zeroPoint = await frameDelta(burnedFile, burnedFile, 1)
+    const withSubtitles = await frameDelta(burnedFile, plainFile, 1)
     record('烧录后的画面底部与未烧录不同（字幕真的进了画面）',
-      burnedAvg !== null && plainAvg !== null && Math.abs(burnedAvg - plainAvg) > 0.5,
-      `底部平均亮度 烧录 ${burnedAvg?.toFixed(2)} vs 未烧录 ${plainAvg?.toFixed(2)}`)
+      zeroPoint !== null && withSubtitles !== null && withSubtitles > zeroPoint * 10 + 0.5,
+      `底部逐像素平均绝对差：同一片子自比（零点）${zeroPoint?.toFixed(3)}，烧录 vs 未烧录 ${withSubtitles?.toFixed(3)}（0–255）`)
     record('烧录没有改变成片时长',
       Math.abs(burned.duration_seconds - plain.duration_seconds) < 0.2,
       `烧录 ${burned.duration_seconds}s vs 未烧录 ${plain.duration_seconds}s`)

@@ -339,6 +339,8 @@ export interface Config {
   subtitleFontSize: number
   /** Distance from the bottom edge for burned-in subtitles. */
   subtitleMarginV: number
+  /** Path prefix of the read-only media route. See the schema entry for the contract. */
+  mediaRoutePrefix: string
 }
 
 /** Cordis schema for {@link Config}. */
@@ -421,4 +423,16 @@ export const Config: z<Config> = z.object({
   subtitleFont: z.string().default('Microsoft YaHei'),
   subtitleFontSize: z.number().default(22),
   subtitleMarginV: z.number().default(28),
+  /**
+   * Path prefix of the read-only route that serves media bytes to the browser.
+   *
+   * The video workbench plays assets in a `<video>` element, which needs an HTTP address it
+   * can range against. Nothing else in the harness serves media, so this plugin registers
+   * its own route. The prefix is configurable because a deployment may already use the
+   * default path for something else, and a collision would make the route fail to register.
+   *
+   * An empty value disables the route: a deployment that does not want the plugin listening
+   * on any path sets it to `''` rather than relying on the route being unreachable.
+   */
+  mediaRoutePrefix: z.string().default('/goclip-media'),
 })
