@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 96" role="img" aria-labelledby="title desc">
+  <title id="title">GoClip Frame</title>
+  <desc id="desc">A playful violet and cyan film-frame mark with a forward motion cut.</desc>
+  <g transform="translate(8 8)">
+    <rect width="80" height="80" rx="24" fill="#24153F"/>
+    <path d="M20 25a5 5 0 0 1 5-5h30a5 5 0 0 1 5 5v30a5 5 0 0 1-5 5H25a5 5 0 0 1-5-5z" fill="none" stroke="#C9B5FF" stroke-width="5"/>
+    <path d="M20 36h40M20 49h40" stroke="#6DE4DC" stroke-width="4" stroke-linecap="round"/>
+    <path d="m35 30 18 10-18 10z" fill="#FF7AB6"/>
+    <path d="M17 17h8M55 17h8M17 63h8M55 63h8" stroke="#6DE4DC" stroke-width="4" stroke-linecap="round"/>
+  </g>
+  <g fill="#24153F" font-family="Inter, ui-sans-serif, system-ui, -apple-system, sans-serif">
+    <text x="108" y="59" font-size="42" font-weight="800" letter-spacing="-2.7">go</text>
+    <text x="164" y="59" font-size="42" font-weight="800" letter-spacing="-2.7">clip</text>
+  </g>
+  <circle cx="112" cy="74" r="3.5" fill="#FF7AB6"/>
+  <circle cx="124" cy="74" r="3.5" fill="#6DE4DC"/>
+  <circle cx="136" cy="74" r="3.5" fill="#C9B5FF"/>
+</svg>

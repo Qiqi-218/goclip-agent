@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">GoClip C — Kinetic Ribbon</title>
+  <desc id="desc">A continuous S-shaped splice path turns a cut timeline into a compact abstract mark.</desc>
+  <path fill="#111111" fill-rule="evenodd" d="M52 42h100c36 0 60 22 60 54 0 31-24 54-60 54h-48c-16 0-26 10-26 26s10 26 26 26h100v28H104c-33 0-54-22-54-54s21-54 54-54h48c19 0 32-11 32-26s-13-26-32-26H52z"/>
+</svg>

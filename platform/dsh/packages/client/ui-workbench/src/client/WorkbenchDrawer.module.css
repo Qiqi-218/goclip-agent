@@ -7,6 +7,7 @@
   background: var(--dsw-alias-bg-layer-1, var(--dsw-alias-bg-base));
   border-left: 0.5px solid var(--dsw-alias-border-l2);
   color: var(--dsw-alias-label-primary);
+  animation: drawer-in 240ms ease-out both;
 }
 .header { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 12px; min-height: 52px; padding: 10px 14px; border-bottom: 0.5px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-base); }
 .breadcrumbs { display: flex; min-width: 0; align-items: center; gap: 8px; overflow: hidden; color: var(--dsw-alias-label-secondary); font-size: 13px; white-space: nowrap; }
@@ -57,6 +58,15 @@ input:focus-visible { border-color: var(--dsw-alias-brand-primary); outline: 2px
 .launcher { display: flex; width: 100%; align-items: center; gap: 8px; padding: 7px 10px; border: 0; background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer; font: inherit; font-size: 12px; text-align: left; }
 .launcher:hover, .launcher:focus-visible, .launcher[aria-current='page'] { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); outline: none; }
 .launcherIcon { display: inline-grid; width: 18px; place-items: center; color: var(--dsw-alias-brand-primary); font-size: 15px; }
+
+@keyframes drawer-in {
+  from { opacity: 0; transform: translateX(10px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .drawer { animation: none; }
+}
 @container (max-width: 520px) {
   .header { align-items: flex-start; flex-direction: column; gap: 8px; }
   .headerActions { width: 100%; justify-content: flex-end; }

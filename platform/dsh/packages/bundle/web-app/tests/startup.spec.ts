@@ -126,6 +126,7 @@ describe('web command-line provider', () => {
     expect(observed.out).toContain('dsh --profile web')
     expect(observed.out).toContain('--no-open')
     expect(observed.out).toContain('--trusted-host')
+    expect(observed.out).toContain('--allow-public-bind')
     expect(values).toBeUndefined()
     expect(observed.readerConfig).toBeUndefined()
     expect(observed.exits).toEqual([0])
@@ -145,5 +146,11 @@ describe('web command-line provider', () => {
     expect(values).toBeUndefined()
     expect(observed.readerConfig).toBeUndefined()
     expect(observed.exits).toEqual([1])
+  })
+
+  it('allows an explicit all-interfaces bind for a public deployment', async () => {
+    const { values, observed } = await bootProvider(['--host', '0.0.0.0', '--allow-public-bind', '--no-open'])
+    expect(values).toEqual({ host: '0.0.0.0', openBrowser: false, trustedHosts: [] })
+    expect(observed.exits).toEqual([])
   })
 })
