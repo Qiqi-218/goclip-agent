@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1600" height="840" viewBox="0 0 1600 840"><defs><filter id="grey"><feColorMatrix type="saturate" values="0"/></filter></defs><rect width="1600" height="840" fill="#f7f7f4"/><text x="60" y="78" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="40" font-weight="700" fill="#161616">Logo concepts</text><text x="60" y="116" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="20" fill="#6b6b6b">Concepts for review — pick a direction (or tell me what you like in each).</text><rect x="60" y="150" width="474.667" height="630" rx="18" fill="#fff" stroke="#e4e4e0" stroke-width="1"/><g filter="url(#grey)"><svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" viewBox="0 0 256 256" x="90" y="190" width="414.667" height="300" preserveAspectRatio="xMidYMid meet">
+  <title id="c0-title">GoClip A — Signal G</title>
+  <desc id="c0-desc">A geometric open G with a forward cut, representing a focused video workflow.</desc>
+  <path fill="#111111" fill-rule="evenodd" d="M208 87a82 82 0 1 0 6 45h-28a54 54 0 1 1-8-31z"/>
+  <path fill="#111111" d="M130 116h76v27h-76z"/>
+  <path fill="#111111" d="m178 105 42 24-42 24z"/>
+</svg>
+</g><g filter="url(#grey)"><svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" viewBox="0 0 256 256" x="90" y="516" width="64" height="64" preserveAspectRatio="xMidYMid meet">
+  <title id="s064-title">GoClip A — Signal G</title>
+  <desc id="s064-desc">A geometric open G with a forward cut, representing a focused video workflow.</desc>
+  <path fill="#111111" fill-rule="evenodd" d="M208 87a82 82 0 1 0 6 45h-28a54 54 0 1 1-8-31z"/>
+  <path fill="#111111" d="M130 116h76v27h-76z"/>
+  <path fill="#111111" d="m178 105 42 24-42 24z"/>
+</svg>
+</g><text x="122" y="600" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#8a8a8a" text-anchor="middle">64px</text><g filter="url(#grey)"><svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" viewBox="0 0 256 256" x="180" y="548" width="32" height="32" preserveAspectRatio="xMidYMid meet">
+  <title id="s032-title">GoClip A — Signal G</title>
+  <desc id="s032-desc">A geometric open G with a forward cut, representing a focused video workflow.</desc>
+  <path fill="#111111" fill-rule="evenodd" d="M208 87a82 82 0 1 0 6 45h-28a54 54 0 1 1-8-31z"/>
+  <path fill="#111111" d="M130 116h76v27h-76z"/>
+  <path fill="#111111" d="m178 105 42 24-42 24z"/>
+</svg>
+</g><text x="196" y="600" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#8a8a8a" text-anchor="middle">32px</text><g filter="url(#grey)"><svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" viewBox="0 0 256 256" x="238" y="564" width="16" height="16" preserveAspectRatio="xMidYMid meet">
+  <title id="s016-title">GoClip A — Signal G</title>
+  <desc id="s016-desc">A geometric open G with a forward cut, representing a focused video workflow.</desc>
+  <path fill="#111111" fill-rule="evenodd" d="M208 87a82 82 0 1 0 6 45h-28a54 54 0 1 1-8-31z"/>
+  <path fill="#111111" d="M130 116h76v27h-76z"/>
+  <path fill="#111111" d="m178 105 42 24-42 24z"/>
+</svg>
+</g><text x="246" y="600" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#8a8a8a" text-anchor="middle">16px</text><text x="90.0" y="636" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="26" font-weight="700" fill="#161616">A · Signal G</text><text x="90.0" y="670" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="19" fill="#555">A focused G opens into a forward edit cue.</text><rect x="562.667" y="150" width="474.667" height="630" rx="18" fill="#fff" stroke="#161616" stroke-width="2"/><g filter="url(#grey)"><svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" viewBox="0 0 256 256" x="592.667" y="190" width="414.667" height="300" preserveAspectRatio="xMidYMid meet">
+  <title id="c1-title">GoClip B — Frame Cut</title>
+  <desc id="c1-desc">Two squared film-frame corners form a compact C and reveal a cut path through the centre.</desc>
+  <path fill="#111111" fill-rule="evenodd" d="M44 42h74v28H72v116h46v28H44zm168 0h-74v28h46v116h-46v28h74z"/>
+  <path fill="#111111" d="M92 106h72v28H92z"/>
+  <path fill="#111111" d="m151 84 43 36-43 36z"/>
+</svg>
+</g><g filter="url(#grey)"><svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" viewBox="0 0 256 256" x="592.667" y="516" width="64" height="64" preserveAspectRatio="xMidYMid meet">
+  <title id="s164-title">GoClip B — Frame Cut</title>
+  <desc id="s164-desc">Two squared film-frame corners form a compact C and reveal a cut path through the centre.</desc>
+  <path fill="#111111" fill-rule="evenodd" d="M44 42h74v28H72v116h46v28H44zm168 0h-74v28h46v116h-46v28h74z"/>
+  <path fill="#111111" d="M92 106h72v28H92z"/>
+  <path fill="#111111" d="m151 84 43 36-43 36z"/>
+</svg>
+</g><text x="624.667" y="600" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#8a8a8a" text-anchor="middle">64px</text><g filter="url(#grey)"><svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" viewBox="0 0 256 256" x="682.667" y="548" width="32" height="32" preserveAspectRatio="xMidYMid meet">
+  <title id="s132-title">GoClip B — Frame Cut</title>
+  <desc id="s132-desc">Two squared film-frame corners form a compact C and reveal a cut path through the centre.</desc>
+  <path fill="#111111" fill-rule="evenodd" d="M44 42h74v28H72v116h46v28H44zm168 0h-74v28h46v116h-46v28h74z"/>
+  <path fill="#111111" d="M92 106h72v28H92z"/>
+  <path fill="#111111" d="m151 84 43 36-43 36z"/>
+</svg>
+</g><text x="698.667" y="600" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#8a8a8a" text-anchor="middle">32px</text><g filter="url(#grey)"><svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" viewBox="0 0 256 256" x="740.667" y="564" width="16" height="16" preserveAspectRatio="xMidYMid meet">
+  <title id="s116-title">GoClip B — Frame Cut</title>
+  <desc id="s116-desc">Two squared film-frame corners form a compact C and reveal a cut path through the centre.</desc>
+  <path fill="#111111" fill-rule="evenodd" d="M44 42h74v28H72v116h46v28H44zm168 0h-74v28h46v116h-46v28h74z"/>
+  <path fill="#111111" d="M92 106h72v28H92z"/>
+  <path fill="#111111" d="m151 84 43 36-43 36z"/>
+</svg>
+</g><text x="748.667" y="600" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#8a8a8a" text-anchor="middle">16px</text><text x="592.6666666666667" y="636" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="26" font-weight="700" fill="#161616">B · Frame Cut</text><text x="592.6666666666667" y="664" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="15" font-weight="700" fill="#161616" letter-spacing="1.5">RECOMMENDED</text><text x="592.6666666666667" y="698" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="19" fill="#555">Two frame corners create a shared cut path.</text><rect x="1065.33" y="150" width="474.667" height="630" rx="18" fill="#fff" stroke="#e4e4e0" stroke-width="1"/><g filter="url(#grey)"><svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" viewBox="0 0 256 256" x="1095.33" y="190" width="414.667" height="300" preserveAspectRatio="xMidYMid meet">
+  <title id="c2-title">GoClip C — Kinetic Ribbon</title>
+  <desc id="c2-desc">A continuous S-shaped splice path turns a cut timeline into a compact abstract mark.</desc>
+  <path fill="#111111" fill-rule="evenodd" d="M52 42h100c36 0 60 22 60 54 0 31-24 54-60 54h-48c-16 0-26 10-26 26s10 26 26 26h100v28H104c-33 0-54-22-54-54s21-54 54-54h48c19 0 32-11 32-26s-13-26-32-26H52z"/>
+</svg>
+</g><g filter="url(#grey)"><svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" viewBox="0 0 256 256" x="1095.33" y="516" width="64" height="64" preserveAspectRatio="xMidYMid meet">
+  <title id="s264-title">GoClip C — Kinetic Ribbon</title>
+  <desc id="s264-desc">A continuous S-shaped splice path turns a cut timeline into a compact abstract mark.</desc>
+  <path fill="#111111" fill-rule="evenodd" d="M52 42h100c36 0 60 22 60 54 0 31-24 54-60 54h-48c-16 0-26 10-26 26s10 26 26 26h100v28H104c-33 0-54-22-54-54s21-54 54-54h48c19 0 32-11 32-26s-13-26-32-26H52z"/>
+</svg>
+</g><text x="1127.33" y="600" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#8a8a8a" text-anchor="middle">64px</text><g filter="url(#grey)"><svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" viewBox="0 0 256 256" x="1185.33" y="548" width="32" height="32" preserveAspectRatio="xMidYMid meet">
+  <title id="s232-title">GoClip C — Kinetic Ribbon</title>
+  <desc id="s232-desc">A continuous S-shaped splice path turns a cut timeline into a compact abstract mark.</desc>
+  <path fill="#111111" fill-rule="evenodd" d="M52 42h100c36 0 60 22 60 54 0 31-24 54-60 54h-48c-16 0-26 10-26 26s10 26 26 26h100v28H104c-33 0-54-22-54-54s21-54 54-54h48c19 0 32-11 32-26s-13-26-32-26H52z"/>
+</svg>
+</g><text x="1201.33" y="600" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#8a8a8a" text-anchor="middle">32px</text><g filter="url(#grey)"><svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" viewBox="0 0 256 256" x="1243.33" y="564" width="16" height="16" preserveAspectRatio="xMidYMid meet">
+  <title id="s216-title">GoClip C — Kinetic Ribbon</title>
+  <desc id="s216-desc">A continuous S-shaped splice path turns a cut timeline into a compact abstract mark.</desc>
+  <path fill="#111111" fill-rule="evenodd" d="M52 42h100c36 0 60 22 60 54 0 31-24 54-60 54h-48c-16 0-26 10-26 26s10 26 26 26h100v28H104c-33 0-54-22-54-54s21-54 54-54h48c19 0 32-11 32-26s-13-26-32-26H52z"/>
+</svg>
+</g><text x="1251.33" y="600" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#8a8a8a" text-anchor="middle">16px</text><text x="1095.3333333333335" y="636" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="26" font-weight="700" fill="#161616">C · Kinetic Ribbon</text><text x="1095.3333333333335" y="670" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="19" fill="#555">A continuous splice path turns timeline</text><text x="1095.3333333333335" y="696" font-family="system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="19" fill="#555">motion into a mark.</text></svg>

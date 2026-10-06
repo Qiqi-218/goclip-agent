@@ -1,0 +1,17 @@
+.git
+.github
+.agents
+.codex
+node_modules
+**/node_modules
+**/dist
+**/lib
+**/.cache
+**/.dsh-build
+**/.sessions
+**/.storages
+**/coverage
+**/*.tsbuildinfo
+platform/dsh/apps/desktop
+platform/dsh/snapshots
+branding/concepts/renders

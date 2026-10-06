@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 96" role="img" aria-labelledby="title desc">
+  <title id="title">GoClip Signal</title>
+  <desc id="desc">A deep blue circular mark containing a G shaped signal and play cut.</desc>
+  <defs>
+    <linearGradient id="signal-blue" x1="12" y1="12" x2="78" y2="84" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5B7CFF"/>
+      <stop offset="1" stop-color="#3154E8"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(8 8)">
+    <rect width="80" height="80" rx="24" fill="#0E1733"/>
+    <path d="M58.8 29.2A23.5 23.5 0 1 0 61 54.5" fill="none" stroke="url(#signal-blue)" stroke-width="8" stroke-linecap="round"/>
+    <path d="M42 48h19" fill="none" stroke="#F7F9FF" stroke-width="7" stroke-linecap="round"/>
+    <path d="m51 40 12 8-12 8z" fill="#F7F9FF"/>
+    <circle cx="62" cy="24" r="4" fill="#8FA5FF"/>
+  </g>
+  <g fill="#0E1733" font-family="Inter, ui-sans-serif, system-ui, -apple-system, sans-serif">
+    <text x="108" y="59" font-size="42" font-weight="750" letter-spacing="-2.4">Go</text>
+    <text x="166" y="59" font-size="42" font-weight="750" letter-spacing="-2.4">Clip</text>
+  </g>
+  <rect x="110" y="70" width="86" height="3" rx="1.5" fill="#4D6BFE"/>
+</svg>

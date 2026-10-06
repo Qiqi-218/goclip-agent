@@ -17,7 +17,14 @@
   max-height: 100%;
   border-radius: var(--dsw-radius-md);
   background: var(--dsw-alias-bg-layer-1);
+  box-shadow: 0 0 0 0.5px color-mix(in srgb, var(--dsw-alias-border-l2) 70%, transparent), 0 18px 42px color-mix(in srgb, var(--dsw-alias-bg-base) 45%, transparent);
   object-fit: contain;
+  transition: box-shadow 180ms ease;
+}
+
+.video:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 3px;
 }
 
 .readout {
@@ -36,4 +43,8 @@
   color: var(--dsw-alias-label-tertiary);
   font-size: 12px;
   line-height: 1.6;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .video { transition: none; }
 }

@@ -14,7 +14,8 @@
   align-items: center;
   padding: 5px 10px;
   border-top: 0.5px solid var(--dsw-alias-border-l2);
-  background: var(--dsw-alias-bg-layer-1);
+  background: color-mix(in srgb, var(--dsw-alias-bg-layer-1) 94%, var(--dsw-alias-brand-primary));
+  box-shadow: 0 -8px 24px color-mix(in srgb, var(--dsw-alias-bg-base) 28%, transparent);
 }
 
 .which {
@@ -53,6 +54,7 @@
   cursor: pointer;
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
 }
 
 .action:hover:not(:disabled),
@@ -66,6 +68,14 @@
   color: var(--dsw-alias-label-tertiary);
   cursor: not-allowed;
   opacity: 0.5;
+}
+
+.action:focus-visible,
+.speed:focus-visible,
+.speedOn:focus-visible,
+.mutedOn:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 1px;
 }
 
 /* 当前的倍率与已静音状态：按下去是「已经是它」，所以画成选中而不是普通按钮。 */

@@ -17,12 +17,30 @@
   width: 100%;
   height: 100%;
   min-height: 0;
-  background: var(--dsw-alias-bg-base);
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 52% 18%, color-mix(in srgb, var(--dsw-alias-brand-primary) 7%, transparent), transparent 34%),
+    var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  isolation: isolate;
+}
+
+.workbench::after {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  pointer-events: none;
+  content: '';
+  opacity: .22;
+  background-image: linear-gradient(color-mix(in srgb, var(--dsw-alias-border-l2) 35%, transparent) 1px, transparent 1px);
+  background-size: 100% 48px;
+  mask-image: linear-gradient(to bottom, black, transparent 70%);
 }
 
 /* The editing target must be visible at all times: users should never need to infer
    whether they are watching source footage or the assembled film. */
 .editorHeader {
+  position: relative;
   display: grid;
   flex: none;
   align-items: center;
@@ -32,7 +50,9 @@
   min-height: 52px;
   padding: 10px 12px;
   border-bottom: 0.5px solid var(--dsw-alias-border-l2);
-  background: var(--dsw-alias-bg-base);
+  background: color-mix(in srgb, var(--dsw-alias-bg-base) 92%, transparent);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--dsw-alias-bg-base) 55%, transparent);
+  backdrop-filter: blur(12px);
 }
 
 .editorContext {
@@ -54,12 +74,24 @@
 
 .contextMode {
   flex: none;
+  position: relative;
   padding: 3px 7px;
   border-radius: var(--dsw-radius-xs);
   background: var(--dsw-alias-bg-layer-2);
   color: var(--dsw-alias-label-secondary);
   font-size: 11px;
   font-weight: 600;
+}
+
+.contextMode::before {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin: 0 5px 1px 0;
+  border-radius: 50%;
+  background: var(--dsw-alias-brand-primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--dsw-alias-brand-primary) 14%, transparent);
+  content: '';
 }
 
 .contextMeta {
@@ -119,6 +151,7 @@
 /* 边界线由两侧的分隔条画；边栏再画一条就会出现两条并排的线。 */
 
 .viewer {
+  position: relative;
   display: flex;
   /* 中间一栏吃掉两侧定宽之后剩下的部分。 */
   flex: 1 1 auto;
@@ -127,7 +160,19 @@
   min-width: 0;
   min-height: 0;
   padding: 16px;
-  background: var(--dsw-alias-bg-layer-1);
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse at 50% 42%, color-mix(in srgb, var(--dsw-alias-brand-primary) 9%, transparent), transparent 48%),
+    var(--dsw-alias-bg-layer-1);
+}
+
+.viewer::before {
+  position: absolute;
+  inset: 18px;
+  border: 0.5px solid color-mix(in srgb, var(--dsw-alias-border-l2) 55%, transparent);
+  border-radius: var(--dsw-radius-md);
+  pointer-events: none;
+  content: '';
 }
 
 .previewModes {
@@ -222,6 +267,7 @@
   color: var(--dsw-alias-label-primary);
   font-size: 13px;
   font-weight: 600;
+  letter-spacing: .01em;
 }
 
 .historyActions {
@@ -323,18 +369,21 @@
   color: inherit;
   cursor: pointer;
   text-align: left;
+  transition: background-color 160ms ease, padding-left 160ms ease, color 160ms ease;
 }
 
 .clipRow:hover,
 .clipRow:focus-visible {
   background: var(--dsw-alias-bg-layer-2);
   outline: none;
+  padding-left: 15px;
 }
 
 .clipRowSelected {
   composes: clipRow;
   background: var(--dsw-alias-bg-layer-2);
   box-shadow: inset 0 0 0 1px var(--dsw-alias-brand-primary);
+  padding-left: 15px;
 }
 
 .clipRowSelected:focus-visible {
@@ -522,6 +571,15 @@
 .laneOff {
   color: var(--dsw-alias-label-tertiary);
 }
+
+.laneOff:hover,
+.laneOn:hover,
+.laneOff:focus-visible,
+.laneOn:focus-visible {
+  background: var(--dsw-alias-bg-layer-2);
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 1px;
+}
 /* 片段的名字：比时间更醒目一点，因为它是人给的标签而不是测量值。 */
 .clipName {
   overflow: hidden;
@@ -535,8 +593,12 @@
 .stageWrap {
   position: relative;
   display: flex;
+  width: min(100%, 1080px);
   min-width: 0;
   min-height: 0;
+  border-radius: var(--dsw-radius-md);
+  box-shadow: 0 20px 60px color-mix(in srgb, var(--dsw-alias-bg-base) 50%, transparent);
+  animation: workbench-stage-in 420ms cubic-bezier(.2, .8, .2, 1) both;
 }
 
 /* 轨道开关与字幕预览之间的间隔：两者作用不同，挨在一起会被当成同一组。 */
@@ -552,4 +614,16 @@
   color: var(--dsw-alias-label-tertiary);
   font-size: 11px;
   line-height: 1.5;
+}
+
+@keyframes workbench-stage-in {
+  from { opacity: 0; transform: translateY(8px) scale(.99); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stageWrap,
+  .clipRow,
+  .laneOn,
+  .laneOff { animation: none; transition: none; }
 }
