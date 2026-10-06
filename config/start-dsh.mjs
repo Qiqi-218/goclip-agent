@@ -93,6 +93,22 @@ if (envFiles.length === 0) {
   )
 }
 
+// The shell launchers used to source this file, but this Node entrypoint is
+// also invoked directly by the development workflow. Load the portable .env
+// format here so profile values such as AUTOCLIP_TEXT_BASE_URL reach DSH.
+if (envFiles.includes('.env')) {
+  const envPath = join(runtimeDir, '.env')
+  for (const line of readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+    const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/)
+    if (!match || match[1] in process.env) continue
+    let value = match[2]
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1)
+    }
+    process.env[match[1]] = value
+  }
+}
+
 // DSH_HOME 决定 profiles 与 sessions 的位置。指向包内，避免和机器上其它 DSH 混在一起。
 process.env.DSH_HOME ??= join(runtimeDir, 'home')
 process.env.GOCLIP_RUNTIME ??= runtimeDir
