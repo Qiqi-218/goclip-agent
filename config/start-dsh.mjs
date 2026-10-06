@@ -8,7 +8,7 @@
  * 它做三件事：
  *   1. 设定 DSH_HOME 到本包的 runtime/home（profiles 与 sessions 全落在包里，不碰 ~/.dsh）
  *   2. 检查 profile 已安装、密钥文件存在，缺什么就明确报出来
- *   3. 用 tsx 启动基座源码并把参数透传给 web app
+ *   3. 从基座目录启动 CLI，确保 tsx 与工作区依赖能被 Node 解析
  *
  * 用法：node runtime/start-dsh.mjs [web 的参数…]
  * 例如：node runtime/start-dsh.mjs --host 127.0.0.1 --port 8099 --no-open
@@ -103,7 +103,7 @@ process.env.GOCLIP_RUNTIME ??= runtimeDir
 delete process.env.DSH_PROFILE
 
 const args = [
-  '--import', 'tsx/esm', 'apps/cli/src/bin.ts',
+  '--import', 'tsx/esm', join(platformDsh, 'apps', 'cli', 'src', 'bin.ts'),
   '--profile', 'video',
   ...process.argv.slice(2),
 ]
@@ -111,6 +111,7 @@ const args = [
 console.log(`goclip : ${root}`)
 console.log(`home   : ${process.env.DSH_HOME}`)
 console.log(`dsh    : ${platformDsh}`)
+console.log(`cwd    : ${platformDsh}`)
 
 const child = spawn(process.execPath, args, { cwd: platformDsh, stdio: 'inherit' })
 child.on('exit', code => process.exit(code ?? 0))

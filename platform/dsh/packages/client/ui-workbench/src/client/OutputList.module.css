@@ -36,6 +36,36 @@
   white-space: nowrap;
 }
 
+.download {
+  align-self: flex-start;
+  color: var(--dsw-alias-brand-primary);
+  font-size: 11px;
+  text-decoration: none;
+}
+
+.download:hover,
+.download:focus-visible { text-decoration: underline; }
+
+.cancel {
+  align-self: flex-start;
+  padding: 3px 7px;
+  border: 1px solid var(--dsw-alias-border-secondary);
+  border-radius: var(--dsw-radius-xs);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.cancel:disabled { cursor: wait; opacity: .65; }
+
+.stale {
+  margin: 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .notice {
   display: flex;
   flex-direction: column;

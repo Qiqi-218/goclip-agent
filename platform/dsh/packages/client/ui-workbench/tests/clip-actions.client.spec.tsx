@@ -109,10 +109,10 @@ describe('what the bar refuses to offer', () => {
     expect(merge.getAttribute('title')).toContain('首尾相接')
   })
 
-  it('does not offer to remove the last remaining clip', () => {
+  it('allows removing the final clip, which leaves an empty timeline rather than deleting source media', () => {
     const only = [clip(0, 10, 20)]
     const { container } = renderBar({ clips: only, clip: only[0] as EditableClip })
-    expect((action(container, 'remove') as HTMLButtonElement).disabled).toBe(true)
+    expect((action(container, 'remove') as HTMLButtonElement).disabled).toBe(false)
   })
 
   it('does not offer to move the first clip earlier or the last one later', () => {

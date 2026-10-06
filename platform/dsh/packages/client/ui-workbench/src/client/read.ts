@@ -1,9 +1,8 @@
 /**
  * Read the measured dimensions the workbench draws.
  *
- * The workbench is a root-scoped central panel, so it holds no Session binding and
- * cannot read tool results the way a Session-scoped panel does. It therefore asks
- * the host over the media route, addressed by project and asset.
+ * The workbench is a root-scoped drawer, so it holds no Session binding and
+ * reads project and asset context from the product-facing workspace route.
  *
  * A dimension that was never measured answers 404, which is a different fact from an
  * empty curve: it tells the caller to offer to compute the evidence rather than to
@@ -31,6 +30,10 @@ export interface LoudnessPayload {
 export interface TimelineClip {
   /** Position in the timeline, from zero. */
   readonly ordinal: number
+  /** Immutable identity; ordinal changes when a clip is moved. */
+  readonly clip_id: string
+  /** Source asset used by this clip. A timeline may concatenate project materials. */
+  readonly asset_id: string
   /** Start in asset microseconds. */
   readonly start_us: number
   /** End in asset microseconds. */
@@ -144,6 +147,12 @@ export interface Render {
   readonly timeline_id: string
   /** That timeline's name, or null when it was never named. */
   readonly timeline_name: string | null
+  /** Revision frozen when this export was submitted; null only for legacy attempts. */
+  readonly timeline_revision: number | null
+  /** Current revision of its timeline at read time. */
+  readonly current_revision: number
+  /** Whether this downloadable film is intentionally an earlier edit. */
+  readonly stale: boolean
   /**
    * Read-only route address to play it from, or null when there is nothing to play.
    *
@@ -158,6 +167,12 @@ export interface Render {
   readonly failed_stage: string | null
   /** The steps that ran, in order. */
   readonly stages: readonly RenderStage[]
+}
+
+/** Request cancellation of a queued/running export without touching any other queued film. */
+export async function cancelExport(projectId: string, jobId: string): Promise<void> {
+  const response = await fetch(`${WORKSPACE_PREFIX}/projects/${encodeURIComponent(projectId)}/exports/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' })
+  if (!response.ok) throw new Error((await response.json().catch(() => ({ error: response.statusText })) as { error?: string }).error ?? response.statusText)
 }
 
 /** The finished films rendered from one asset. */
@@ -176,6 +191,7 @@ export type Read<T> =
 
 /** Route prefix shared with the host plugin's `mediaRoutePrefix` default. */
 const DEFAULT_PREFIX = '/goclip-media'
+const WORKSPACE_PREFIX = '/goclip-workspace'
 
 /** The two ids that identify one asset. */
 export interface WorkbenchAsset {
@@ -185,6 +201,110 @@ export interface WorkbenchAsset {
   readonly assetId: string
 }
 
+/** A project shown by the workbench home screen. */
+export interface ProjectSummary {
+  readonly id: string
+  readonly name: string
+  readonly asset_count: number
+}
+
+/** One imported asset shown in a project. */
+export interface AssetSummary {
+  readonly id: string
+  readonly project_id: string
+  readonly projectId: string
+  readonly assetId: string
+  readonly source_name: string
+  readonly duration_us: number
+  readonly width: number
+  readonly height: number
+  readonly fps: string
+  readonly thumbnail_url: string | null
+  readonly thumbnail_status: 'pending' | 'ready' | 'failed'
+  readonly analysis_status: 'none' | 'partial' | 'ready'
+  readonly timeline_count: number
+}
+
+/** Read the projects available to the current local workspace. */
+export function readProjects(signal?: AbortSignal): Promise<Read<ProjectSummary[]>> {
+  return readWorkspace<ProjectSummary[]>('/projects', signal)
+}
+
+/** Read a compact list of assets across projects for the workbench home screen. */
+export function readRecentAssets(signal?: AbortSignal): Promise<Read<AssetSummary[]>> {
+  return readWorkspace<AssetSummary[]>('/assets/recent', signal)
+}
+
+/** Read the assets belonging to one project. */
+export function readAssets(projectId: string, signal?: AbortSignal): Promise<Read<AssetSummary[]>> {
+  return readWorkspace<AssetSummary[]>(`/projects/${encodeURIComponent(projectId)}/assets`, signal)
+}
+
+/** Create a project through the workbench's product-facing command. */
+export async function createProject(name: string, signal?: AbortSignal): Promise<ProjectSummary> {
+  const init: RequestInit = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  }
+  if (signal !== undefined) init.signal = signal
+  const response = await fetch(`${WORKSPACE_PREFIX}/projects`, init)
+  if (!response.ok) throw new Error(`project create failed (${response.status})`)
+  return await response.json() as ProjectSummary
+}
+
+/** Import one browser-selected video into a project. */
+export async function importAsset(projectId: string, file: File, signal?: AbortSignal): Promise<AssetSummary> {
+  const form = new FormData()
+  form.set('file', file, file.name)
+  const init: RequestInit = {
+    method: 'POST',
+    body: form,
+  }
+  if (signal !== undefined) init.signal = signal
+  const response = await fetch(`${WORKSPACE_PREFIX}/projects/${encodeURIComponent(projectId)}/import`, init)
+  if (!response.ok) throw new Error(`asset import failed (${response.status})`)
+  return await response.json() as AssetSummary
+}
+
+/** Create the initial full-length timeline for an imported asset. */
+export async function createTimeline(projectId: string, assetId: string, signal?: AbortSignal): Promise<void> {
+  const init: RequestInit = { method: 'POST' }
+  if (signal !== undefined) init.signal = signal
+  const response = await fetch(`${WORKSPACE_PREFIX}/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}/timeline`, init)
+  if (!response.ok) throw new Error(`timeline create failed (${response.status})`)
+}
+
+/** Submit one explicit workbench edit and let the host enforce its revision. */
+export async function applyTimelineEdit(asset: WorkbenchAsset, operation: import('./editor-model.ts').EditIntent, signal?: AbortSignal, operationId = crypto.randomUUID()): Promise<void> {
+  const init: RequestInit = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...operation, operation_id: operationId }),
+  }
+  if (signal !== undefined) init.signal = signal
+  const response = await fetch(`${WORKSPACE_PREFIX}/projects/${encodeURIComponent(asset.projectId)}/assets/${encodeURIComponent(asset.assetId)}/timeline/operations`, init)
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as { error?: unknown } | null
+    throw new Error(typeof payload?.error === 'string' ? payload.error : `timeline edit failed (${response.status})`)
+  }
+}
+
+/** Render the current timeline through the same FFmpeg pipeline the assistant uses. */
+export async function exportTimeline(asset: WorkbenchAsset, timelineId: string, options: { aspect: 'keep' | '16:9' | '9:16' | '1:1', burnSubtitles?: 'transcript' } , signal?: AbortSignal): Promise<void> {
+  const init: RequestInit = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ aspect: options.aspect, ...(options.burnSubtitles === undefined ? {} : { burn_subtitles: options.burnSubtitles }) }),
+  }
+  if (signal !== undefined) init.signal = signal
+  const response = await fetch(`${WORKSPACE_PREFIX}/projects/${encodeURIComponent(asset.projectId)}/assets/${encodeURIComponent(asset.assetId)}/timeline/${encodeURIComponent(timelineId)}/render`, init)
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as { error?: unknown } | null
+    throw new Error(typeof payload?.error === 'string' ? payload.error : `video export failed (${response.status})`)
+  }
+}
+
 /**
  * The read-only route address of one asset's bytes.
  * @param asset - the asset to address.
@@ -192,6 +312,18 @@ export interface WorkbenchAsset {
  */
 export function mediaUrl(asset: WorkbenchAsset): string {
   return `${DEFAULT_PREFIX}/${encodeURIComponent(asset.projectId)}/${encodeURIComponent(asset.assetId)}`
+}
+
+/** Read a product-facing workspace resource and preserve absent/failed states. */
+async function readWorkspace<T>(path: string, signal?: AbortSignal): Promise<Read<T>> {
+  let response: Response
+  try {
+    response = await fetch(`${WORKSPACE_PREFIX}${path}`, signal === undefined ? {} : { signal })
+  } catch {
+    return signal?.aborted === true ? { status: 'absent' } : { status: 'failed' }
+  }
+  if (!response.ok) return { status: 'failed' }
+  return { status: 'ok', value: await response.json() as T }
 }
 
 /**

@@ -24,6 +24,9 @@ export type OutputListProps =
   & {
     /** The render attempts, in the order the host returned them. */
     readonly renders: readonly Render[]
+    /** Cancelling is explicit: closing the workbench must not cancel a background export. */
+    readonly onCancel?: (jobId: string) => void
+    readonly cancellingJobId?: string | null
   }
 
 /**
@@ -31,7 +34,7 @@ export type OutputListProps =
  * @param props - the attempts to list.
  * @returns the list, or an explanation when there is nothing at all.
  */
-export function OutputList({ renders, t }: OutputListProps): ReactNode {
+export function OutputList({ renders, t, onCancel, cancellingJobId = null }: OutputListProps): ReactNode {
   if (renders.length === 0) {
     return (
       <div className={styles.notice} data-output="none">
@@ -70,7 +73,15 @@ export function OutputList({ renders, t }: OutputListProps): ReactNode {
             <p className={styles.meta}>
               <span className={styles.name}>{render.timeline_name ?? render.timeline_id}</span>
               <span>{t('output.job', { job: render.job_id.slice(0, 8) })}</span>
+              {render.timeline_revision !== null && <span data-render-revision="">r{render.timeline_revision}</span>}
             </p>
+            {render.stale && <p className={styles.stale} data-render-stale="">{t('output.stale', { revision: String(render.current_revision) })}</p>}
+            {render.url !== null && <a className={styles.download} data-render-download={render.job_id} href={`${render.url}?download=1`}>{t('output.download')}</a>}
+            {(render.status === 'queued' || render.status === 'running' || render.status === 'cancelling') && onCancel !== undefined && (
+              <button type="button" className={styles.cancel} disabled={cancellingJobId === render.job_id || render.status === 'cancelling'} onClick={() => onCancel(render.job_id)}>
+                {render.status === 'cancelling' || cancellingJobId === render.job_id ? t('output.cancelling') : t('output.cancel')}
+              </button>
+            )}
             {/*
              * 走过的步骤折在 details 里：成功时没人看它，失败时它是唯一的线索。
              * 成功的尝试不给折叠面板 —— 那会让一列成片各挂一串没人展开的时间。

@@ -29,6 +29,8 @@ export interface MediaTarget {
   readonly key: string
   /** Content type to report; OSS also sends one, which is preferred when present. */
   readonly contentType: string
+  /** A safe attachment filename when the caller explicitly requests a download. */
+  readonly downloadName?: string
 }
 
 /**
@@ -198,6 +200,12 @@ async function serve(source: MediaSource, path: readonly string[], req: Incoming
   }
 
   const headers: Record<string, string> = { 'Accept-Ranges': 'bytes', 'Content-Type': contentType }
+  // Playback remains inline; only an explicit query made by the Download button changes the
+  // disposition. The bytes still travel through this same owned, range-capable route.
+  if (new URL(req.url ?? '/', 'http://goclip.local').searchParams.get('download') === '1') {
+    const name = (target.downloadName ?? 'goclip-export.mp4').replace(/[\\"\r\n]/g, '_')
+    headers['Content-Disposition'] = `attachment; filename="${name}"`
+  }
   if (range.kind === 'ok') {
     headers['Content-Range'] = `bytes ${range.from}-${range.to}/${size}`
     headers['Content-Length'] = String(range.to - range.from + 1)

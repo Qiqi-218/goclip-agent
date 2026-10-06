@@ -20,7 +20,7 @@ import '@xzdarcy/react-timeline-editor/dist/react-timeline-editor.css'
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import { EVIDENCE_EFFECT, EvidenceLane, evidenceRows } from './EvidenceLanes.tsx'
-import { CLIP_EFFECT, intentFromEditedAction, ordinalOfAction, toRows, type EditIntent, type EditSubject } from './editor-model.ts'
+import { CLIP_EFFECT, intentFromEditedAction, intentFromFilmEditedAction, ordinalOfAction, toFilmRows, toRows, type EditIntent, type EditSubject } from './editor-model.ts'
 import { EVIDENCE_LANES, laneOfAction, type EvidenceLaneKey, type EvidenceVisibility } from './evidence-model.ts'
 import { filmSecondsOf } from './timing.ts'
 import { TimelineScrollbar } from './TimelineScrollbar.tsx'
@@ -35,7 +35,9 @@ export type TimelineProps =
     readonly clips: readonly EditSubject['clips'][number][]
     /** Length of the recording the clips were cut from, in microseconds. */
     readonly assetDurationUs: number
-    /** Where the player currently is, in asset microseconds. */
+    /** Coordinate system currently shown. Source is for selecting material; film is the cut. */
+    readonly axis: 'source' | 'film'
+    /** Where the player currently is, in the active axis's microseconds. */
     readonly playheadUs: number
     /** Called when the person asks to hear or see a moment; the caller moves the player. */
     readonly onSeek: (assetUs: number) => void
@@ -102,7 +104,10 @@ export function availableLanes(tracks: EvidencePayload['tracks'] | null): Eviden
  * count cap then collapsed the whole axis to a 40px sliver with every mark squashed to nothing.
  */
 const SCALE_SECONDS = 1
-const DEFAULT_SCALE_WIDTH = 4
+// The source ruler labels every second. Four pixels made the labels collide in the real 5-minute
+// assets; 16px keeps the default readable while the scrollbar still handles long recordings.
+const DEFAULT_SCALE_WIDTH = 16
+const FILM_SCALE_WIDTH = 32
 
 /** Pixels per second the zoom covers. */
 const MIN_SCALE_WIDTH = 0.5
@@ -126,7 +131,7 @@ export interface ZoomControls {
 }
 
 export function Timeline({
-  clips, assetDurationUs, playheadUs, onSeek, onEdit, onSelectClip, onZoomReady, timelineId, baseRevision, pendingOrdinals, evidence, lanes, t,
+  clips, assetDurationUs, axis, playheadUs, onSeek, onEdit, onSelectClip, onZoomReady, timelineId, baseRevision, pendingOrdinals, evidence, lanes, t,
 }: TimelineProps): ReactNode {
   const editorRef = useRef<TimelineState>(null)
   const [scaleWidth, setScaleWidth] = useState(DEFAULT_SCALE_WIDTH)
@@ -263,6 +268,11 @@ export function Timeline({
   }, [onZoomReady, zoomBy, zoomTo])
 
   const subject = useMemo<EditSubject>(() => ({ clips, assetDurationUs }), [clips, assetDurationUs])
+  // Source recordings span many minutes, while a finished cut is usually around one minute.
+  // Sharing the source density made every film tick collide and reduced clips to unreadable slivers.
+  useEffect(() => {
+    setScaleWidth(axis === 'film' ? FILM_SCALE_WIDTH : DEFAULT_SCALE_WIDTH)
+  }, [axis])
   /*
    * 轴的右端是**录制时长**，不是成片时长。
    *
@@ -275,10 +285,12 @@ export function Timeline({
   const filmSeconds = useMemo(() => filmSecondsOf(clips), [clips])
   // 行只在时间线或所选轨道变化时重算。每次渲染都重建会让编辑器自己的数据与这份行互相覆盖 ——
   // 拖动刚拉长一段，随即被一份新算出的行按回原样。
-  const rows = useMemo<TimelineRow[]>(() => [
-    ...toRows(subject),
-    ...evidenceRows(EVIDENCE_LANES.filter(lane => lanes[lane]), assetSeconds),
-  ], [subject, lanes, assetSeconds])
+  const rows = useMemo<TimelineRow[]>(() => axis === 'film'
+    ? toFilmRows(subject)
+    : [
+        ...toRows(subject),
+        ...evidenceRows(EVIDENCE_LANES.filter(lane => lanes[lane]), assetSeconds),
+      ], [axis, subject, lanes, assetSeconds])
   const effects = useMemo(() => ({
     [CLIP_EFFECT]: { id: CLIP_EFFECT, name: t('column.timeline') },
     [EVIDENCE_EFFECT]: { id: EVIDENCE_EFFECT, name: t('evidence.lanes') },
@@ -325,8 +337,10 @@ export function Timeline({
    */
   const reportEdit = useCallback((action: TimelineAction) => {
     if (timelineId === null) { onEdit(null); return }
-    onEdit(intentFromEditedAction(subject, action, timelineId, baseRevision))
-  }, [subject, timelineId, baseRevision, onEdit])
+    onEdit(axis === 'film'
+      ? intentFromFilmEditedAction(subject, action, timelineId, baseRevision)
+      : intentFromEditedAction(subject, action, timelineId, baseRevision))
+  }, [axis, subject, timelineId, baseRevision, onEdit])
 
   const clipOf = useCallback((id: string) => {
     const ordinal = Number(id.slice('clip-'.length))
@@ -369,7 +383,7 @@ export function Timeline({
   return (
     <div className={styles.timeline} data-timeline="">
       <div className={styles.bar}>
-        <span className={styles.barLabel}>{t('column.timeline')}</span>
+        <span className={styles.barLabel}>{t(axis === 'film' ? 'timeline.filmAxis' : 'timeline.sourceAxis')}</span>
         {/*
          * 「边界可以拖、刻度可以点」这条提示必须留着。
          *
@@ -377,17 +391,16 @@ export function Timeline({
          * 而那正是这一处唯一发现得它的途径（实测：那条断言的缺失让 `timeline.hint`
          * 变成了孤儿键，谁也没发现）。
          */}
-        <span className={styles.barHint} data-timeline-hint="">{t('timeline.hint')}</span>
+        <span className={styles.barHint} data-timeline-hint="">{t(axis === 'film' ? 'timeline.filmHint' : 'timeline.hint')}</span>
         {/*
          * 两个长度并排显示，因为它们回答不同的问题：刻度上的轴是**录制**（素材多长、
          * 哪几段被用了、中间空了哪些），而这个读数是**成片**（按倍速折算后有多长）。
          * 只给一个数会让人以为轴就是成片，那正是先前那个错。
          */}
         <span className={styles.barHint} data-lengths="">
-          {t('timeline.lengths', {
-            source: (assetDurationUs / 1e6).toFixed(1),
-            film: filmSeconds.toFixed(1),
-          })}
+          {axis === 'film'
+            ? t('timeline.filmLength', { film: filmSeconds.toFixed(1) })
+            : t('timeline.lengths', { source: (assetDurationUs / 1e6).toFixed(1), film: filmSeconds.toFixed(1) })}
         </span>
         <span className={styles.barSpacer} />
         <button
@@ -490,8 +503,9 @@ export function Timeline({
        * 滑轴画在车道**下面**：库把自己的滚动条藏了起来，而这条轴有近万像素宽，
        * 没有任何可见的方式能沿着它移动。滚轮能移动它，但滚轮既不可发现、也抓不住。
        */}
-            <TimelineScrollbar
-        assetSeconds={assetSeconds}
+      <TimelineScrollbar
+        assetSeconds={axis === 'film' ? filmSeconds : assetSeconds}
+        axis={axis}
         clips={clips}
         contentWidth={geometry.contentWidth}
         onScrollTo={pixels => { scrollTo(pixels); measure() }}

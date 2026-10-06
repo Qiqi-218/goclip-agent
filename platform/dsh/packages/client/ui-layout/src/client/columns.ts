@@ -23,8 +23,14 @@ export const SIDEBAR_COLLAPSED = 56
 export const SIDEBAR_AUTO_COLLAPSE = 1024
 /** Right column drag clamp floor. */
 export const RIGHTBAR_MIN = 300
-/** Maximum normal right panel width as a fraction of the frame. */
-export const RIGHTBAR_MAX_RATIO = 0.7
+/**
+ * Maximum normal right panel width as a fraction of the frame.
+ *
+ * The center column's `CENTER_MIN` is the real guardrail. A separate 70%
+ * ceiling made a wide workbench stop growing for no product reason, so the
+ * divider could not keep moving left as users expected.
+ */
+export const RIGHTBAR_MAX_RATIO = 1
 /** First-open right panel preference as a fraction of the frame. */
 export const RIGHTBAR_DEFAULT_RATIO = 0.45
 

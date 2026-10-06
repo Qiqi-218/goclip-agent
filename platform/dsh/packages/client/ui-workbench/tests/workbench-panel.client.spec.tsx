@@ -33,9 +33,6 @@ afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
 type Dict = typeof zh
 
-/** The panel does not read the global session/workspace seats; keep those framework props inert. */
-const unusedHook = (() => { throw new Error('工作台测试不应读取全局席位') }) as never
-
 /**
  * Render the panel with one dictionary and an optional asset.
  * @param dict - the dictionary to answer keys with.
@@ -62,8 +59,6 @@ function renderPanel(dict: Dict = zh, asset: { projectId: string, assetId: strin
   return render(
     <WorkbenchPanel
       actions={store.actions} asset={asset} t={t as never} useStore={useStore}
-      usePanelInfo={unusedHook} useSessions={unusedHook} useSessionStatus={unusedHook}
-      useSessionRetainInfo={unusedHook} useWorkspaces={unusedHook} useResource={unusedHook}
     />,
   )
 }
@@ -88,8 +83,8 @@ const TIMELINES = {
     clips: [
       // 一段有名字、一段没有：界面要能区分「人给它起了名」与「它就是第 N 段」，
       // 两段都写 null 的话那条区分就没有任何断言走到。
-      { ordinal: 0, start_us: 0, end_us: 10_000_000, start: 0, end: 1 / 6, speed: 1, muted: false, name: '开场' },
-      { ordinal: 1, start_us: 30_000_000, end_us: 45_000_000, start: 0.5, end: 0.75, speed: 2, muted: true, name: null },
+      { ordinal: 0, clip_id: 'clip-a', asset_id: 'asset', start_us: 0, end_us: 10_000_000, start: 0, end: 1 / 6, speed: 1, muted: false, name: '开场' },
+      { ordinal: 1, clip_id: 'clip-b', asset_id: 'asset', start_us: 30_000_000, end_us: 45_000_000, start: 0.5, end: 0.75, speed: 2, muted: true, name: null },
     ],
     output_seconds: 17.5,
   }],
@@ -219,10 +214,11 @@ describe('workbench reads one asset', () => {
     stubReads()
     const { container } = renderPanel(zh, { projectId: 'proj', assetId: 'asset' })
     await waitFor(() => expect(container.querySelectorAll('[data-list-clip]')).toHaveLength(2))
-    const video = container.querySelector('video') as HTMLVideoElement
     // 第 2 段在原片 30 秒处开始。
     fireEvent.click(container.querySelectorAll('[data-list-clip]')[1] as Element)
-    await waitFor(() => expect(video.currentTime).toBeCloseTo(30, 3))
+    // 列表定位的是原片坐标，点击会从默认的成片预览切到原片预览；因此取切换后的
+    // video，而不是保留成片播放器已经卸载的 DOM 引用。
+    await waitFor(() => expect((container.querySelector('video') as HTMLVideoElement).currentTime).toBeCloseTo(30, 3))
   })
 
   it('plays every finished film from the read-only route', async () => {
@@ -355,6 +351,42 @@ describe('naming and reordering a clip', () => {
     expect(container.querySelector('[data-clip-rename]')).toBeNull()
   })
 })
+
+describe('exporting a film', () => {
+  it('submits the active timeline to the product-facing export route', async () => {
+    stubReads()
+    const { container } = renderPanel(zh, { projectId: 'proj', assetId: 'asset' })
+    await waitFor(() => expect(container.querySelector('[data-export-film]')).not.toBeNull())
+    fireEvent.click(container.querySelector('[data-export-film]') as Element)
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url, init]) =>
+      String(url).endsWith('/timeline/tl-1/render') && (init as RequestInit).method === 'POST',
+    )).toBe(true))
+  })
+})
+
+describe('selecting a source range', () => {
+  it('adds the marked source range after the selected timeline clip', async () => {
+    stubReads()
+    const { container, getByText } = renderPanel(zh, { projectId: 'proj', assetId: 'asset' })
+    await waitFor(() => expect(container.querySelectorAll('[data-list-clip]')).toHaveLength(2))
+    fireEvent.click(getByText(zh['preview.source']))
+    const video = container.querySelector('video') as HTMLVideoElement
+    Object.defineProperty(video, 'currentTime', { configurable: true, value: 5, writable: true })
+    fireEvent.timeUpdate(video)
+    fireEvent.click(getByText(zh['sourceRange.setIn']))
+    Object.defineProperty(video, 'currentTime', { configurable: true, value: 8, writable: true })
+    fireEvent.timeUpdate(video)
+    fireEvent.click(getByText(zh['sourceRange.setOut']))
+    fireEvent.click(container.querySelector('[data-list-clip="0"]') as Element)
+    fireEvent.click(getByText(zh['sourceRange.insert']))
+
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url, init]) =>
+      String(url).endsWith('/timeline/operations')
+        && String((init as RequestInit).body).includes('video_timeline_insert')
+        && String((init as RequestInit).body).includes('"ordinal":1'),
+    )).toBe(true))
+  })
+})
 describe('the subtitle preview', () => {
   it('is off until somebody turns it on, and draws nothing while it is off', async () => {
     // 它覆盖在画面上，而画面的主要用途是看素材；默认打开会让每次播放都多一层文字。
@@ -421,9 +453,10 @@ describe('keyboard shortcuts', () => {
     await selectFirst(container)
     press(container, { key: 'c', ctrlKey: true })
     press(container, { key: 'v', ctrlKey: true })
-    // 面板把提出的调用显示出来，而不是自己写数据。
-    await waitFor(() => expect(container.querySelector('[data-pending-edit]')).not.toBeNull())
-    expect(container.querySelector('[data-pending-edit]')?.textContent).toContain('video_timeline_add')
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url, init]) =>
+      String(url).endsWith('/timeline/operations') && (init as RequestInit).method === 'POST',
+    )).toBe(true))
+    expect(container.querySelector('[data-pending-edit]')).toBeNull()
   })
 
   it('cuts by removing the clip as well as remembering it', async () => {
@@ -432,8 +465,9 @@ describe('keyboard shortcuts', () => {
     const { container } = renderPanel(zh, { projectId: 'proj', assetId: 'asset' })
     await selectFirst(container)
     press(container, { key: 'x', ctrlKey: true })
-    await waitFor(() => expect(container.querySelector('[data-pending-edit]')).not.toBeNull())
-    expect(container.querySelector('[data-pending-edit]')?.textContent).toContain('video_timeline_remove')
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url, init]) =>
+      String(url).endsWith('/timeline/operations') && (init as RequestInit).method === 'POST',
+    )).toBe(true))
   })
 
   it('duplicates the selected clip without touching the clipboard', async () => {
@@ -442,8 +476,9 @@ describe('keyboard shortcuts', () => {
     const { container } = renderPanel(zh, { projectId: 'proj', assetId: 'asset' })
     await selectFirst(container)
     press(container, { key: 'd', ctrlKey: true })
-    await waitFor(() => expect(container.querySelector('[data-pending-edit]')).not.toBeNull())
-    expect(container.querySelector('[data-pending-edit]')?.textContent).toContain('video_timeline_add')
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url, init]) =>
+      String(url).endsWith('/timeline/operations') && (init as RequestInit).method === 'POST',
+    )).toBe(true))
   })
 
   it('does nothing when no clip is selected', async () => {

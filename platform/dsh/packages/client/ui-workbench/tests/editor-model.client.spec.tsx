@@ -20,12 +20,14 @@ import {
   canMergeWithNext,
   clipOfIntent,
   intentFromEditedAction,
+  intentFromFilmEditedAction,
   removeIntent,
   renameIntent,
   revertIntent,
   splitIntent,
   ordinalOfAction,
   toRows,
+  toFilmRows,
   type EditableClip,
   type EditSubject,
 } from '../src/client/editor-model.ts'
@@ -165,6 +167,31 @@ describe('rows for the editor', () => {
   })
 })
 
+describe('rows for the finished-film editor', () => {
+  it('packs output clips in playback order and permits moving them', () => {
+    const actions = toFilmRows(SUBJECT)[0]?.actions ?? []
+    expect(actions).toHaveLength(3)
+    expect(actions[0]?.start).toBeCloseTo(0, 6)
+    expect(actions[1]?.start).toBeCloseTo(7.72, 6)
+    expect(actions[2]?.start).toBeCloseTo(11.72, 6)
+    expect(actions[2]?.end).toBeCloseTo(14.56, 6)
+    expect(actions.every(action => action.movable === true)).toBe(true)
+  })
+
+  it('applies playback rate when a film-axis edge is trimmed', () => {
+    const subject: EditSubject = { clips: [clip(0, 100, 110, 2)], assetDurationUs: ASSET_US }
+    const action = toFilmRows(subject)[0]?.actions[0] as never as { id: string, start: number, end: number, effectId: string }
+    const intent = intentFromFilmEditedAction(subject, { ...action, end: 6 }, 'tl-1', 3)
+    expect(intent?.args).toMatchObject({ ordinal: 0, edge: 'end', delta_us: -2_000_000 })
+  })
+
+  it('turns a film-strip move into an order change instead of a trim', () => {
+    const action = toFilmRows(SUBJECT)[0]?.actions[0] as never as { id: string, start: number, end: number, effectId: string }
+    const intent = intentFromFilmEditedAction(SUBJECT, { ...action, start: 12, end: 19.72 }, 'tl-1', 3)
+    expect(intent).toMatchObject({ tool: 'video_timeline_reorder', args: { from: 0, to: 2 } })
+  })
+})
+
 describe('reading an ordinal back from an action id', () => {
   it('reads the ordinal rather than assuming a position in the array', () => {
     expect(ordinalOfAction('clip-0')).toBe(0)
@@ -185,7 +212,7 @@ describe('turning an edited action into a tool call', () => {
     const intent = intentFromEditedAction(SUBJECT, edited, 'tl-1', 2)
     // 成片里 7.72 → 9.72，即多取 2 秒素材。
     expect(intent?.tool).toBe('video_timeline_trim')
-    expect(intent?.args).toMatchObject({ timeline_id: 'tl-1', base_revision: 2, ordinal: 0, edge: 'end', delta_us: 2_000_000 })
+    expect(intent?.args).toMatchObject({ timeline_id: 'tl-1', base_revision: 2, ordinal: 0, edge: 'end', delta_us: -2_000_000 })
   })
 
   it('trims the left edge with the opposite sign when the start moved', () => {

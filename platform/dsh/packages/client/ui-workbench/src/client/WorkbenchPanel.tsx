@@ -7,10 +7,8 @@
  * whole recording; and the clip list and the finished film sit at the edges where they can be
  * scanned without competing for the middle.
  *
- * The panel is registered into the keyed `main` slot, whose owner passes no props and whose
- * scope is `root` — so it holds no Session binding and cannot read tool results the way a
- * Session-scoped panel does. It learns which asset to show from the page address and reads the
- * measurements over the plugin's own read-only route.
+ * The editor is rendered inside the root-scoped workbench drawer. It receives its selected asset
+ * from the drawer and continues to read editor data through the plugin's own routes.
  *
  * The playhead is owned here rather than by the player, because the surfaces around it ask for
  * moments: a click on a clip or a bar becomes a seek request, the player performs it, and it
@@ -19,11 +17,12 @@
  */
 import type { ReactNode } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { PropsLocale, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
+import type { PropsLocale, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import { OutputList } from './OutputList.tsx'
 import { Player } from './Player.tsx'
-import { clipOfIntent, copyToEndIntent, revertIntent, type EditIntent, type EditableClip } from './editor-model.ts'
+import { CompositionPlayer } from './CompositionPlayer.tsx'
+import { copyAtIntent, revertIntent, type EditIntent, type EditableClip } from './editor-model.ts'
 import { ClipActions } from './ClipActions.tsx'
 import { Divider } from './Divider.tsx'
 import { SubtitleOverlay } from './SubtitleOverlay.tsx'
@@ -32,13 +31,12 @@ import { RevisionList } from './RevisionList.tsx'
 import { EVIDENCE_LANES, type EvidenceLaneKey } from './evidence-model.ts'
 import { createWorkbenchLayoutStore, DEFAULT_LAYOUT, resolveDivision, resolveLowerHeight, type LayoutState } from './layout-store.ts'
 import { Timeline, availableLanes, type ZoomControls } from './Timeline.tsx'
-import { assetFromAddress, mediaUrl, readEvidence, readHistory, readLoudness, readRenders, readTimelines, type EvidencePayload, type HistoryPayload, type Read, type WorkbenchAsset } from './read.ts'
+import { applyTimelineEdit, assetFromAddress, cancelExport, createTimeline, exportTimeline, mediaUrl, readEvidence, readHistory, readLoudness, readRenders, readTimelines, type EvidencePayload, type HistoryPayload, type Read, type WorkbenchAsset } from './read.ts'
 import styles from './WorkbenchPanel.module.css'
 
 /** What the panel reads: the owner share, this package's dictionary, and its layout store. */
 type WorkbenchProps =
-  & PropsRuntime<'main'>
-  & PropsLocale<'workbench'>
+  PropsLocale<'workbench'>
   & PropsStore<ReturnType<typeof createWorkbenchLayoutStore>>
 
 /** Dictionary key naming each lane, so the toggle row reads from the one dictionary. */
@@ -122,12 +120,19 @@ function historyLoader(timelineId: string): (asset: WorkbenchAsset, signal: Abor
   return (asset, signal) => readHistory(asset, timelineId, signal)
 }
 
+function messageOf(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  if (message.includes('revision conflict')) return '这条时间线刚刚有新修改，已刷新到最新版本。请基于当前内容再试一次。'
+  if (message.includes('UNIQUE constraint') || message.includes('timeline_segments')) return '这次编辑没有保存。时间线已刷新，请再试一次；如果持续出现，请告诉助手你刚才执行的操作。'
+  return message
+}
+
 /**
  * Render the workbench.
  * @param props - the panel's owner share, its dictionary, and an optional asset override.
  * @returns the editing surface.
  */
-export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps & { readonly asset?: WorkbenchAsset | null }): ReactNode {
+export function WorkbenchPanel({ t, asset, initialTimelineId, onTimelineChange, useStore, actions }: WorkbenchProps & { readonly asset?: WorkbenchAsset | null, readonly initialTimelineId?: string | null, readonly onTimelineChange?: (timelineId: string | null) => void }): ReactNode {
   // 显式传 null 表示「未选中」，与「没传」不同 —— 用 ?? 会把前者也当成后者，
   // 于是调用方想说「什么都没有」时反而去读了地址。
   const target = useMemo(
@@ -135,47 +140,71 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
     [asset],
   )
   const curve = useDimension(target, readLoudness)
-  const timelines = useDimension(target, readTimelines)
-  const renders = useDimension(target, readRenders)
+  const [timelineRefresh, setTimelineRefresh] = useState(0)
+  const [renderRefresh, setRenderRefresh] = useState(0)
+  const [pollRenders, setPollRenders] = useState(false)
+  const timelines = useDimension(target, readTimelines, String(timelineRefresh))
+  const renders = useDimension(target, readRenders, String(renderRefresh))
   const evidence = useDimension(target, readEvidence)
   // 历史按时间线读，所以要等 active 拿到才知道读哪一条；`active?.id` 作为第二重身份，
   // 它一变就重读，而加载函数按 id 记忆化，避免每次渲染都换一个新函数。
-  const activeId = timelines.status === 'ok' ? timelines.value.timelines[0]?.id ?? null : null
+  const [selectedTimelineId, setSelectedTimelineId] = useState<string | null>(null)
+  useEffect(() => {
+    if (timelines.status !== 'ok') return
+    const ids = timelines.value.timelines.map(timeline => timeline.id)
+    setSelectedTimelineId(current => {
+      if (initialTimelineId !== null && initialTimelineId !== undefined && ids.includes(initialTimelineId)) return initialTimelineId
+      return current !== null && ids.includes(current) ? current : ids[0] ?? null
+    })
+  }, [initialTimelineId, timelines.status === 'ok' ? timelines.value.timelines.map(timeline => timeline.id).join('\u0000') : ''])
+  const activeId = selectedTimelineId
+  const films = renders.status === 'ok' ? renders.value.renders : []
+  const currentRenderIsActive = activeId !== null && films.some(film => film.timeline_id === activeId && (film.status === 'queued' || film.status === 'running'))
   const loadHistory = useMemo(() => (activeId === null ? null : historyLoader(activeId)), [activeId])
-  const history = useDimension(target, loadHistory ?? (() => Promise.resolve({ status: 'absent' as const })), activeId)
+  const history = useDimension(target, loadHistory ?? (() => Promise.resolve({ status: 'absent' as const })), activeId === null ? null : `${activeId}:${timelineRefresh}`)
   const [seek, setSeek] = useState<{ atUs: number, token: number } | null>(null)
   const [playheadUs, setPlayheadUs] = useState(0)
-  const [pending, setPending] = useState<readonly number[]>([])
-  const [hidden, setHidden] = useState<readonly EvidenceLaneKey[]>([])
+  const [filmPlayheadUs, setFilmPlayheadUs] = useState(0)
+  const [filmSeek, setFilmSeek] = useState<{ atUs: number, token: number } | null>(null)
+  const [previewMode, setPreviewMode] = useState<'source' | 'composition'>('composition')
+  const [sourceInUs, setSourceInUs] = useState<number | null>(null)
+  const [sourceOutUs, setSourceOutUs] = useState<number | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [editError, setEditError] = useState<string | null>(null)
+  // The exact state before this session's last undo. A fresh edit clears redo, so it
+  // can never silently overwrite a newer cut.
+  const [redoRevision, setRedoRevision] = useState<number | null>(null)
+  const [exporting, setExporting] = useState(false)
+  const [exportError, setExportError] = useState<string | null>(null)
+  const [cancellingJobId, setCancellingJobId] = useState<string | null>(null)
+  const [exportAspect, setExportAspect] = useState<'keep' | '16:9' | '9:16' | '1:1'>('keep')
+  const [burnSubtitles, setBurnSubtitles] = useState(false)
+  // Evidence is supporting material, not the default editing surface. Showing every transcript,
+  // OCR, chapter and highlight row on first open made the actual cut disappear below a wall of text.
+  const [hidden, setHidden] = useState<readonly EvidenceLaneKey[]>([...EVIDENCE_LANES])
   // 每次请求带一个变化的 token，所以「再跳回同一秒」也会重新执行。
-  const askSeek = useCallback((atUs: number) => setSeek({ atUs, token: Date.now() }), [])
-  /**
-   * Record what the person asked for, without applying it.
-   *
-   * The message names the tool and its arguments so a person can see that the gesture was
-   * understood, and marks the affected clip — or the proposed revision — so the surface shows it
-   * as not yet the host's state. Sending the call is deliberately not done here: the tool layer is
-   * the only writer, and it carries the revision check that keeps two editors from overwriting
-   * each other.
-   *
-   * @param intent - the call the gesture implies, or null when it changed nothing.
-   */
-  const onEdit = useCallback((intent: EditIntent | null) => {
-    if (intent === null) { setPending([]); setProposedRevision(null); setLastEdit(null); return }
-    // 两种时间线级的意图影响的不是某一段：回滚标在某个版本上，改名根本不针对片段。
-    // 一律当成「序号」会让回滚把某个无关的片段标成待确认。
-    if (intent.tool === 'video_timeline_revert') {
-      setPending([])
-      setProposedRevision(intent.args.target_revision)
-    } else {
-      setProposedRevision(null)
-      const ordinal = clipOfIntent(intent)
-      setPending(ordinal === null ? [] : [ordinal])
-    }
-    setLastEdit(intent)
+  const askSeek = useCallback((atUs: number) => {
+    // Evidence is indexed in source time. Switching mode here makes a click on a transcript or
+    // loudness mark truthful rather than seeking a similarly numbered moment in the finished film.
+    setPreviewMode('source')
+    setSeek({ atUs, token: Date.now() })
   }, [])
-  const [lastEdit, setLastEdit] = useState<EditIntent | null>(null)
-  const [proposedRevision, setProposedRevision] = useState<number | null>(null)
+  /** The packed cut has its own coordinate system; keep it separate from source seeking. */
+  const askFilmSeek = useCallback((atUs: number) => {
+    setPreviewMode('composition')
+    setFilmSeek({ atUs, token: Date.now() })
+  }, [])
+  /** Persist a deliberate editor gesture, then re-read the authoritative timeline. */
+  const onEdit = useCallback((intent: EditIntent | null, preserveRedo = false) => {
+    if (intent === null || target === null || saving) return
+    if (!preserveRedo) setRedoRevision(null)
+    setSaving(true)
+    setEditError(null)
+    void applyTimelineEdit(target, intent)
+      .then(() => { setSelectedOrdinal(null); setTimelineRefresh(current => current + 1) })
+      .catch(error => setEditError(messageOf(error)))
+      .finally(() => setSaving(false))
+  }, [saving, target])
   // 选中的片段由面板持有：时间线只报告「点了哪一段」，动作条是面板的一部分。
   const [selectedOrdinal, setSelectedOrdinal] = useState<number | null>(null)
   /*
@@ -194,9 +223,50 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
    * 跨重挂载活下来，那反而意外。
    */
   const [clipboard, setClipboard] = useState<EditableClip | null>(null)
+  const [creatingTimeline, setCreatingTimeline] = useState(false)
+  const [timelineCreateError, setTimelineCreateError] = useState<string | null>(null)
   /** 时间线交给面板的缩放控件；快捷键靠它触到缩放（见 Timeline 的 onZoomReady）。 */
   const zoomRef = useRef<ZoomControls | null>(null)
   const holdZoom = useCallback((controls: ZoomControls | null) => { zoomRef.current = controls }, [])
+  const makeInitialTimeline = useCallback(async () => {
+    if (target === null || curve.status !== 'ok' || curve.value.duration_us <= 0 || creatingTimeline) return
+    setCreatingTimeline(true)
+    setTimelineCreateError(null)
+    try {
+      await createTimeline(target.projectId, target.assetId)
+      setTimelineRefresh(current => current + 1)
+    } catch (error) {
+      setTimelineCreateError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setCreatingTimeline(false)
+    }
+  }, [creatingTimeline, curve, target])
+  const exportFilm = useCallback(() => {
+    if (target === null || activeId === null || exporting) return
+    setExporting(true)
+    setExportError(null)
+    void exportTimeline(target, activeId, { aspect: exportAspect, ...(burnSubtitles ? { burnSubtitles: 'transcript' as const } : {}) })
+      .then(() => { setPollRenders(true); setRenderRefresh(current => current + 1) })
+      .catch(error => setExportError(messageOf(error)))
+      .finally(() => setExporting(false))
+  }, [activeId, burnSubtitles, exportAspect, exporting, target])
+  const cancelFilm = useCallback((jobId: string) => {
+    if (target === null || cancellingJobId !== null) return
+    setCancellingJobId(jobId)
+    void cancelExport(target.projectId, jobId)
+      .then(() => { setPollRenders(true); setRenderRefresh(current => current + 1) })
+      .catch(error => setExportError(messageOf(error)))
+      .finally(() => setCancellingJobId(null))
+  }, [cancellingJobId, target])
+  useEffect(() => {
+    if (!pollRenders) return
+    if (!currentRenderIsActive && films.some(film => film.timeline_id === activeId)) {
+      setPollRenders(false)
+      return
+    }
+    const timer = window.setInterval(() => setRenderRefresh(current => current + 1), 2_000)
+    return () => window.clearInterval(timer)
+  }, [activeId, currentRenderIsActive, films, pollRenders])
 
   if (target === null) {
     return (
@@ -212,17 +282,36 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
   const durationUs = curve.status === 'ok' ? curve.value.duration_us : 0
   // 一次只编辑一条时间线。把所有时间线的片段摊平会让不同时间线的序号相撞
   // （每条都从第 0 段开始），而编辑是按序号定位的 —— 那会改错片子。
-  const active = timelines.status === 'ok' ? timelines.value.timelines[0] ?? null : null
+  const active = timelines.status === 'ok' ? timelines.value.timelines.find(timeline => timeline.id === activeId) ?? null : null
   const clips = active?.clips ?? []
   // 时间线要的片段形态与读取结果不同：读取结果带的是份额（start/end），这里要的是微秒区间。
   const editableClips = clips.map(clip => ({
     ordinal: clip.ordinal, start_us: clip.start_us, end_us: clip.end_us, speed: clip.speed, muted: clip.muted, name: clip.name,
   }))
   const selectedClip = editableClips.find(clip => clip.ordinal === selectedOrdinal) ?? null
+  const selectedRange = sourceInUs !== null && sourceOutUs !== null && sourceOutUs > sourceInUs
+    ? { startUs: sourceInUs, endUs: sourceOutUs }
+    : null
+  const setSourceIn = useCallback(() => {
+    setSourceInUs(playheadUs)
+    if (sourceOutUs !== null && sourceOutUs <= playheadUs) setSourceOutUs(null)
+  }, [playheadUs, sourceOutUs])
+  const setSourceOut = useCallback(() => {
+    setSourceOutUs(playheadUs)
+    if (sourceInUs !== null && sourceInUs >= playheadUs) setSourceInUs(null)
+  }, [playheadUs, sourceInUs])
+  const appendSourceRange = useCallback(() => {
+    if (selectedRange === null || active === null) return
+    onEdit({ tool: 'video_timeline_add', args: { timeline_id: active.id, base_revision: active.revision, asset_id: target.assetId, start_us: selectedRange.startUs, end_us: selectedRange.endUs, speed: 1 } })
+  }, [active, onEdit, selectedRange, target.assetId])
+  const insertSourceRange = useCallback(() => {
+    if (selectedRange === null || active === null) return
+    const ordinal = selectedClip === null ? active.clips.length : selectedClip.ordinal + 1
+    onEdit({ tool: 'video_timeline_insert', args: { timeline_id: active.id, base_revision: active.revision, asset_id: target.assetId, start_us: selectedRange.startUs, end_us: selectedRange.endUs, ordinal, speed: 1 } })
+  }, [active, onEdit, selectedClip, selectedRange, target.assetId])
   // 快捷键要用到这两个 id；活动时间线还没读到时它们是 null，快捷键于是整体不生效。
   const timelineId = active?.id ?? null
   const assetId = target.assetId
-  const films = renders.status === 'ok' ? renders.value.renders : []
   const tracks = evidence.status === 'ok' ? evidence.value.tracks : null
   // 只提供这条素材**真的有**的轨道：给一条空轨道会让人以为「这里没有停顿」，
   // 而实际是「停顿还没测过」—— 那是两个不同的结论。
@@ -323,6 +412,21 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
       }
       if (mod && key === '0') { event.preventDefault(); zoomRef.current?.reset(); return }
       if (key === 'escape') { setSelectedOrdinal(null); return }
+      if (mod && key === 'z' && active !== null && history.status === 'ok') {
+        event.preventDefault()
+        if (event.shiftKey) {
+          if (redoRevision === null) return
+          const targetRevision = redoRevision
+          setRedoRevision(null)
+          onEdit(revertIntent(active.id, active.revision, targetRevision), true)
+          return
+        }
+        const previous = history.value.entries.find(entry => entry.revision < active.revision)
+        if (previous === undefined) return
+        setRedoRevision(active.revision)
+        onEdit(revertIntent(active.id, active.revision, previous.revision), true)
+        return
+      }
       if (clip === null) return
 
       if (mod && (key === 'c' || key === 'x')) {
@@ -335,32 +439,101 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
         return
       }
       if (mod && (key === 'v' || key === 'd')) {
-        // 粘贴与「复制一份」在宿主这里是同一个动作：追加一段同样的素材。见 copyToEndIntent。
+        // 粘贴与「复制一份」放在当前选择之后；不再悄悄追加到成片末尾。
         const source = key === 'v' ? clipboard : clip
         if (source === null || assetId === null) return
         event.preventDefault()
-        onEdit(copyToEndIntent(source, assetId, timelineId, active?.revision ?? 0))
+        onEdit(copyAtIntent(source, assetId, timelineId, active?.revision ?? 0, clip.ordinal + 1))
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [active?.revision, assetId, clipboard, editableClips, onEdit, selectedOrdinal, timelineId])
+  }, [active, assetId, clipboard, editableClips, history, onEdit, redoRevision, selectedOrdinal, timelineId])
 
   return (
     <div className={styles.workbench} data-workbench="" ref={panel}>
+      <header className={styles.editorHeader} data-editor-context="">
+        <div className={styles.editorContext}>
+          <span className={styles.contextMode}>{previewMode === 'composition' ? t('preview.composition') : t('preview.source')}</span>
+          <strong>{active?.name ?? (active === null ? t('timeline.none') : t('timeline.unnamed', { ordinal: '1' }))}</strong>
+          {active !== null && <span className={styles.contextMeta}>{t('timeline.lengths', { source: (durationUs / 1e6).toFixed(1), film: active.output_seconds.toFixed(1) })}</span>}
+        </div>
+        <div className={styles.headerPreviewModes} role="group" aria-label={t('preview.mode')}>
+          <button type="button" className={previewMode === 'composition' ? styles.previewModeOn : styles.previewMode} aria-pressed={previewMode === 'composition'} onClick={() => setPreviewMode('composition')}>
+            {t('preview.composition')}
+          </button>
+          <button type="button" className={previewMode === 'source' ? styles.previewModeOn : styles.previewMode} aria-pressed={previewMode === 'source'} onClick={() => setPreviewMode('source')}>
+            {t('preview.source')}
+          </button>
+        </div>
+        <div className={styles.headerExport} data-export-controls="">
+          <label className={styles.exportLabel}>
+            <span>{t('export.aspect')}</span>
+            <select value={exportAspect} disabled={active === null || exporting} onChange={event => setExportAspect(event.target.value as typeof exportAspect)}>
+              <option value="keep">{t('export.keep')}</option>
+              <option value="9:16">{t('export.portrait')}</option>
+              <option value="16:9">{t('export.landscape')}</option>
+              <option value="1:1">{t('export.square')}</option>
+            </select>
+          </label>
+          <label className={styles.exportCheckbox}>
+            <input type="checkbox" checked={burnSubtitles} disabled={active === null || exporting} onChange={event => setBurnSubtitles(event.target.checked)} />
+            {t('export.subtitles')}
+          </label>
+          <button type="button" className={styles.exportButton} data-export-film="" disabled={active === null || exporting} onClick={exportFilm}>
+            {exporting ? t('export.exporting') : t('export.button')}
+          </button>
+        </div>
+        {exportError !== null && <p className={styles.exportHeaderError} role="alert">{t('export.failed', { reason: exportError })}</p>}
+        {previewMode === 'source' && (
+          <div className={styles.sourceRange} data-source-range="">
+            <button type="button" className={styles.rangeButton} onClick={setSourceIn}>{t('sourceRange.setIn')}</button>
+            <span className={styles.rangeReadout}>
+              {selectedRange === null
+                ? t('sourceRange.empty')
+                : t('sourceRange.selected', { start: (selectedRange.startUs / 1e6).toFixed(2), end: (selectedRange.endUs / 1e6).toFixed(2) })}
+            </span>
+            <button type="button" className={styles.rangeButton} onClick={setSourceOut}>{t('sourceRange.setOut')}</button>
+            <button type="button" className={styles.rangeAction} disabled={selectedRange === null || active === null || saving} onClick={appendSourceRange}>{t('sourceRange.append')}</button>
+            <button type="button" className={styles.rangeAction} disabled={selectedRange === null || active === null || saving} onClick={insertSourceRange}>{t('sourceRange.insert')}</button>
+          </div>
+        )}
+      </header>
       <div className={styles.stage} ref={stageBox}>
         <aside className={styles.side} style={{ width: layout.leftWidth }} data-area="clips">
           <h2 className={styles.heading}>{t('timeline.trackVideo')}</h2>
+          {timelines.status === 'ok' && timelines.value.timelines.length > 1 && (
+            <label className={styles.timelinePicker}>
+              <span>{t('timeline.choose')}</span>
+              <select value={selectedTimelineId ?? ''} onChange={event => { const next = event.target.value || null; setSelectedTimelineId(next); onTimelineChange?.(next); setSelectedOrdinal(null) }}>
+                {timelines.value.timelines.map((timeline, index) => <option key={timeline.id} value={timeline.id}>{timeline.name ?? t('timeline.unnamed', { ordinal: String(index + 1) })}</option>)}
+              </select>
+            </label>
+          )}
           <div className={styles.rows}>
             {clips.length === 0
-              ? <p className={styles.note}>{t('timeline.none.hint')}</p>
+              ? <>
+                <p className={styles.note}>{active === null ? t('timeline.none.hint') : t('timeline.empty.hint')}</p>
+                <button
+                  type="button"
+                  className={styles.createTimeline}
+                  disabled={active === null ? creatingTimeline || curve.status !== 'ok' : saving || durationUs <= 0}
+                  onClick={() => {
+                    if (active === null) { void makeInitialTimeline(); return }
+                    onEdit({ tool: 'video_timeline_add', args: { timeline_id: active.id, base_revision: active.revision, asset_id: target.assetId, start_us: 0, end_us: durationUs, speed: 1 } })
+                  }}
+                >
+                  {active === null ? (creatingTimeline ? t('timeline.creating') : t('timeline.create')) : t('timeline.empty.add')}
+                </button>
+                {timelineCreateError !== null && <p className={styles.note} role="alert">{timelineCreateError}</p>}
+              </>
               : clips.map(clip => (
                 <button
                   key={clip.ordinal}
                   type="button"
-                  className={styles.clipRow}
+                  className={clip.ordinal === selectedOrdinal ? styles.clipRowSelected : styles.clipRow}
                   data-list-clip={clip.ordinal}
-                  data-list-pending={pending.includes(clip.ordinal) ? '' : undefined}
+                  aria-pressed={clip.ordinal === selectedOrdinal}
                   /*
                    * 点列表里的一行既选中它、也让画面跳到它开头。
                    *
@@ -387,6 +560,31 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
           {/* 版本列表放在片段下面：它回答的是「改坏了怎么回去」，
               而片段列表回答的是「现在是什么」。两者都属于这一列。 */}
           <h2 className={styles.heading} data-history-heading="">{t('revision.heading')}</h2>
+          <div className={styles.historyActions} role="group" aria-label={t('revision.heading')}>
+            <button
+              type="button"
+              className={styles.historyAction}
+              disabled={saving || active === null || history.status !== 'ok' || !history.value.entries.some(entry => entry.revision < active.revision)}
+              onClick={() => {
+                if (active === null || history.status !== 'ok') return
+                const previous = history.value.entries.find(entry => entry.revision < active.revision)
+                if (previous === undefined) return
+                setRedoRevision(active.revision)
+                onEdit(revertIntent(active.id, active.revision, previous.revision), true)
+              }}
+            >{t('revision.undo')}</button>
+            <button
+              type="button"
+              className={styles.historyAction}
+              disabled={saving || active === null || redoRevision === null}
+              onClick={() => {
+                if (active === null || redoRevision === null) return
+                const targetRevision = redoRevision
+                setRedoRevision(null)
+                onEdit(revertIntent(active.id, active.revision, targetRevision), true)
+              }}
+            >{t('revision.redo')}</button>
+          </div>
           <div className={styles.rows}>
             <RevisionList
               currentRevision={active?.revision ?? 0}
@@ -396,7 +594,7 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
               onRestore={target => onEdit(
                 target === null || active === null ? null : revertIntent(active.id, active.revision, target),
               )}
-              proposed={proposedRevision}
+              proposed={null}
               t={t}
             />
           </div>
@@ -419,9 +617,11 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
            *
            * 显示哪一句由**成片坐标**决定，与导出、烧录用的是同一条换算路径；三者共用它，
            * 才能保证「看到的」和「烧出来的」是同一句话落在同一个时刻。
-           */}
+          */}
           <div className={styles.stageWrap}>
-            <Player src={mediaUrl(target)} seek={seek} durationUs={durationUs} onTime={setPlayheadUs} t={t} />
+            {previewMode === 'composition' && active !== null
+              ? <CompositionPlayer asset={target} clips={active.clips} onFilmTime={setFilmPlayheadUs} onSourceTime={setPlayheadUs} seek={filmSeek} t={t} />
+              : <Player src={mediaUrl(target)} seek={seek} durationUs={durationUs} onTime={setPlayheadUs} t={t} />}
             {preview ? (
               <SubtitleOverlay
                 cue={cueAt(previewCuesOf(tracks, editableClips), playheadUs / 1e6)}
@@ -445,7 +645,7 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
         <aside className={styles.side} style={{ width: layout.rightWidth }} data-area="output">
           <h2 className={styles.heading}>{t('column.output')}</h2>
           <div className={styles.rows}>
-            <OutputList renders={films} t={t} />
+            <OutputList renders={films} onCancel={cancelFilm} cancellingJobId={cancellingJobId} t={t} />
           </div>
         </aside>
       </div>
@@ -463,16 +663,17 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
       <section className={styles.lower} style={{ height: layout.lowerHeight }} data-area="timeline">
         <Timeline
           assetDurationUs={durationUs}
+          axis={previewMode === 'composition' ? 'film' : 'source'}
           baseRevision={active?.revision ?? 0}
           clips={editableClips}
-          evidence={evidence.status === 'ok' ? evidence.value.tracks : null}
-          lanes={laneVisibility}
+          evidence={previewMode === 'source' && evidence.status === 'ok' ? evidence.value.tracks : null}
+          lanes={previewMode === 'source' ? laneVisibility : Object.fromEntries(EVIDENCE_LANES.map(lane => [lane, false])) as Record<EvidenceLaneKey, boolean>}
           onEdit={onEdit}
-          onSeek={askSeek}
+          onSeek={previewMode === 'composition' ? askFilmSeek : askSeek}
           onSelectClip={setSelectedOrdinal}
           onZoomReady={holdZoom}
-          pendingOrdinals={pending}
-          playheadUs={playheadUs}
+          pendingOrdinals={[]}
+          playheadUs={previewMode === 'composition' ? filmPlayheadUs : playheadUs}
           t={t}
           timelineId={active?.id ?? null}
         />
@@ -483,41 +684,40 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
         clip={selectedClip}
         clips={editableClips}
         onIntent={onEdit}
+        playheadUs={playheadUs}
+        saving={saving}
         t={t}
         timelineId={active?.id ?? null}
       />
 
       <div className={styles.lanes} data-lane-controls="">
-        <span className={styles.lanesLabel}>{t('evidence.lanes')}</span>
-        {offered.length === 0
-          ? <span className={styles.lanesNone} data-evidence-none="">{t('evidence.none')}</span>
-          : offered.map(lane => (
-            <button
-              key={lane}
-              type="button"
-              className={hidden.includes(lane) ? styles.laneOff : styles.laneOn}
-              data-lane-toggle={lane}
-              aria-pressed={!hidden.includes(lane)}
-              onClick={() => setHidden(current => current.includes(lane) ? current.filter(item => item !== lane) : [...current, lane])}
-            >
-              {t(EVIDENCE_LABELS[lane])}
-            </button>
-          ))}
-        {/*
-         * 字幕预览的开关放在这一行末端，与证据轨道之间留一段空：它不改变时间线，
-         * 只决定画面上要不要多一层文字 —— 混在轨道开关里会让人以为它也会改时间线。
-         */}
-        <span className={styles.lanesGap} />
-        <button
-          type="button"
-          className={preview ? styles.laneOn : styles.laneOff}
-          data-subtitle-preview-toggle=""
-          aria-pressed={preview}
-          onClick={() => setPreview(current => !current)}
-          title={t('subtitle.previewHint')}
-        >
-          {t('subtitle.preview')}
-        </button>
+          <span className={styles.lanesLabel}>{t('evidence.lanes')}</span>
+          {offered.length === 0
+            ? <span className={styles.lanesNone} data-evidence-none="">{t('evidence.none')}</span>
+            : offered.map(lane => (
+              <button
+                key={lane}
+                type="button"
+                className={hidden.includes(lane) ? styles.laneOff : styles.laneOn}
+                data-lane-toggle={lane}
+                aria-pressed={!hidden.includes(lane)}
+                onClick={() => setHidden(current => current.includes(lane) ? current.filter(item => item !== lane) : [...current, lane])}
+              >
+                {t(EVIDENCE_LABELS[lane])}
+              </button>
+            ))}
+          {/* 字幕预览只影响画面，不改变证据或时间线。 */}
+          <span className={styles.lanesGap} />
+          <button
+            type="button"
+            className={preview ? styles.laneOn : styles.laneOff}
+            data-subtitle-preview-toggle=""
+            aria-pressed={preview}
+            onClick={() => setPreview(current => !current)}
+            title={t('subtitle.previewHint')}
+          >
+            {t('subtitle.preview')}
+          </button>
       </div>
 
       {/*
@@ -526,14 +726,8 @@ export function WorkbenchPanel({ t, asset, useStore, actions }: WorkbenchProps &
        */}
       <p className={styles.shortcuts} data-shortcuts="">{t('shortcuts.hint')}</p>
 
-      {lastEdit !== null && (
-        <p className={styles.pending} data-pending-edit="">
-          {t('timeline.pendingEdit', {
-            tool: lastEdit.tool,
-            args: JSON.stringify(lastEdit.args),
-          })}
-        </p>
-      )}
+      {saving && <p className={styles.pending} data-save-state="saving">{t('timeline.saving')}</p>}
+      {editError !== null && <p className={styles.note} data-save-error="" role="alert">{t('timeline.saveFailed', { reason: editError })}</p>}
 
       {curve.status === 'absent' && (
         <p className={styles.note}>

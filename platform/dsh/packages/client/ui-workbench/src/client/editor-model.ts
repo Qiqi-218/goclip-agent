@@ -18,7 +18,7 @@
  */
 import type { TimelineAction, TimelineRow } from '@xzdarcy/timeline-engine'
 import type { ClipSpan } from './timing.ts'
-import { layoutOnSourceAxis, rateOf, trimDeltaFromAxis } from './timing.ts'
+import { layoutOnOutputAxis, layoutOnSourceAxis, rateOf, trimDeltaFromAxis } from './timing.ts'
 
 /** One clip as the media route serialises it, plus the asset bounds its edits are limited by. */
 export interface EditableClip extends ClipSpan {
@@ -99,6 +99,26 @@ export function toRows(subject: EditSubject): TimelineRow[] {
   return [{ id: CLIP_ROW, actions, rowHeight: 46 }]
 }
 
+/** Build the editable lane for the finished film: clips are packed in playback order. */
+export function toFilmRows(subject: EditSubject): TimelineRow[] {
+  const spans = layoutOnOutputAxis(subject.clips)
+  const actions: TimelineAction[] = subject.clips.map((clip, index) => {
+    const span = spans[index] as { start: number, end: number }
+    return {
+      id: actionIdOf(clip.ordinal),
+      start: span.start,
+      end: span.end,
+      effectId: CLIP_EFFECT,
+      flexible: true,
+      // A move on the packed film strip has one unambiguous meaning: move this clip in the cut.
+      movable: true,
+      minStart: 0,
+      maxEnd: Number.MAX_SAFE_INTEGER,
+    }
+  })
+  return [{ id: CLIP_ROW, actions, rowHeight: 46 }]
+}
+
 /**
  * A tool call that would carry out one change the person asked for.
  *
@@ -107,7 +127,7 @@ export function toRows(subject: EditSubject): TimelineRow[] {
  * instruction the tool cannot carry out — is a mistake the compiler should catch rather than the
  * host.
  */
-export type EditIntent = AddIntent | TrimIntent | RevertIntent | SplitIntent | MergeIntent | RemoveIntent | RenameIntent | ReorderIntent | NameSegmentIntent | AdjustIntent
+export type EditIntent = AddIntent | InsertIntent | TrimIntent | RevertIntent | SplitIntent | MergeIntent | RemoveIntent | RenameIntent | ReorderIntent | NameSegmentIntent | AdjustIntent
 
 /** Add a copy of a stretch of the recording to the end of the timeline. */
 export interface AddIntent {
@@ -120,6 +140,20 @@ export interface AddIntent {
     readonly asset_id: string
     readonly start_us: number
     readonly end_us: number
+    readonly speed: number
+  }
+}
+
+/** Insert a source range before a visible timeline position. */
+export interface InsertIntent {
+  readonly tool: 'video_timeline_insert'
+  readonly args: {
+    readonly timeline_id: string
+    readonly base_revision: number
+    readonly asset_id: string
+    readonly start_us: number
+    readonly end_us: number
+    readonly ordinal: number
     readonly speed: number
   }
 }
@@ -401,6 +435,28 @@ export function copyToEndIntent(
   }
 }
 
+/** Copy a clip into a specific cut position (used by paste/duplicate in the film editor). */
+export function copyAtIntent(
+  clip: ClipSpan,
+  assetId: string,
+  timelineId: string,
+  baseRevision: number,
+  ordinal: number,
+): InsertIntent {
+  return {
+    tool: 'video_timeline_insert',
+    args: {
+      timeline_id: timelineId,
+      base_revision: baseRevision,
+      asset_id: assetId,
+      start_us: clip.start_us,
+      end_us: clip.end_us,
+      speed: rateOf(clip.speed),
+      ordinal,
+    },
+  }
+}
+
 /**
  * The clip an intent is about, or null when it is not about a clip.
  *
@@ -417,6 +473,7 @@ export function clipOfIntent(intent: EditIntent): number | null {
     case 'video_timeline_rename':
     // 追加一段不针对已有的某一段，所以没有待确认的序号。
     case 'video_timeline_add':
+    case 'video_timeline_insert':
       return null
     // 重排说的是「把第 from 段挪走」，受影响的正是 from 那一段。
     case 'video_timeline_reorder':
@@ -481,12 +538,64 @@ export function intentFromEditedAction(
   if (!startMoved) {
     return {
       tool: 'video_timeline_trim',
-      args: { timeline_id: timelineId, base_revision: baseRevision, ordinal, edge: 'end', delta_us: deltaSourceUs },
+      // The runtime defines end as `end_us - delta_us`; extending the right edge is therefore
+      // a negative delta, unlike a start-edge move.
+      args: { timeline_id: timelineId, base_revision: baseRevision, ordinal, edge: 'end', delta_us: -deltaSourceUs },
     }
   }
   // 左边界动了：位移方向与右边界相反 —— 往左拖是「多用前面的素材」，长度变长。
   return {
     tool: 'video_timeline_trim',
     args: { timeline_id: timelineId, base_revision: baseRevision, ordinal, edge: 'start', delta_us: -deltaSourceUs },
+  }
+}
+
+/**
+ * Translate an edit made on the packed film axis. Edge drags trim source material after
+ * applying the clip's playback rate; moving a whole block changes only its output order.
+ */
+export function intentFromFilmEditedAction(
+  subject: EditSubject,
+  edited: TimelineAction,
+  timelineId: string,
+  baseRevision: number,
+): EditIntent | null {
+  const ordinal = ordinalOfAction(edited.id)
+  if (ordinal === null) return null
+  const index = subject.clips.findIndex(candidate => candidate.ordinal === ordinal)
+  if (index < 0) return null
+  const clip = subject.clips[index] as EditableClip
+  const before = layoutOnOutputAxis(subject.clips)[index] as { start: number, end: number }
+  const tolerance = 1e-3
+  const beforeLength = before.end - before.start
+  const afterLength = edited.end - edited.start
+
+  // Moving without changing duration is a reorder. Insert before the first clip whose centre is
+  // to the right of the dropped block; removing the moving block first keeps indices stable.
+  if (Math.abs(afterLength - beforeLength) <= tolerance && Math.abs(edited.start - before.start) > tolerance) {
+    const without = subject.clips.filter(candidate => candidate.ordinal !== ordinal)
+    const centres = layoutOnOutputAxis(without).map(span => (span.start + span.end) / 2)
+    const target = centres.findIndex(centre => edited.start < centre)
+    const to = target < 0 ? without.length : target
+    return to === index ? null : {
+      tool: 'video_timeline_reorder',
+      args: { timeline_id: timelineId, base_revision: baseRevision, from: ordinal, to },
+    }
+  }
+
+  const deltaOutputUs = trimDeltaFromAxis(beforeLength, afterLength)
+  if (deltaOutputUs === null) return null
+  const deltaSourceUs = Math.round(deltaOutputUs * rateOf(clip.speed))
+  const startMoved = Math.abs(edited.start - before.start) > tolerance
+  return {
+    tool: 'video_timeline_trim',
+    args: {
+      timeline_id: timelineId,
+      base_revision: baseRevision,
+      ordinal,
+      edge: startMoved ? 'start' : 'end',
+      // `trimSegment` stores end as `end - delta`, so match its signed contract here.
+      delta_us: startMoved ? -deltaSourceUs : -deltaSourceUs,
+    },
   }
 }

@@ -19,7 +19,7 @@ describe('computeColumns', () => {
   })
 
   it('clamps sidebar preferences and limits the right panel to 70% of the frame', () => {
-    expect(computeColumns(3000, 9999, 9999)).toEqual({ sidebar: 420, center: 480, rightbar: 2100 })
+    expect(computeColumns(3000, 9999, 9999)).toEqual({ sidebar: 420, center: 400, rightbar: 2180 })
     expect(computeColumns(1920, 1, 1)).toEqual({ sidebar: 264, center: 1356, rightbar: 300 })
   })
 

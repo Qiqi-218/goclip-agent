@@ -240,7 +240,9 @@ platform/dsh/            DSH 基座（随仓库提交，保证可复现构建）
   packages/client/ui-evidence/        证据总览面板
   packages/client/ui-workbench/       剪辑工作台
 scripts/tools/verify/    验收脚本（probe-* 确定性检查，cdp_* 真实界面驱动）
-docs-参赛/               参赛文档
+docs/                    架构演进与产品设计文档
+media/source/            本地待导入素材（忽略，不提交）
+runtime/                 本地配置、会话与工作数据（忽略，不提交）
 setup.sh / setup.ps1     安装
 start.sh / start.ps1     启动
 ```

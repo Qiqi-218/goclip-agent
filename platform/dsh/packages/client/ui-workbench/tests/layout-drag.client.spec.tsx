@@ -65,9 +65,6 @@ const t = (key: keyof typeof zh, params?: Record<string, unknown>): string => {
   return template.replace(/\{(\w+)\}/g, (match, name: string) => (name in params ? String(params[name]) : match))
 }
 
-/** The panel does not read the global session/workspace seats; keep those framework props inert. */
-const unusedHook = (() => { throw new Error('布局测试不应读取全局席位') }) as never
-
 /**
  * Render the panel against a real layout store.
  * @param asset - the asset to open, or null for the empty state.
@@ -80,8 +77,6 @@ function renderPanel(asset: { projectId: string, assetId: string } | null) {
   const result = render(
     <WorkbenchPanel
       actions={store.actions} asset={asset} t={t as never} useStore={useStore}
-      usePanelInfo={unusedHook} useSessions={unusedHook} useSessionStatus={unusedHook}
-      useSessionRetainInfo={unusedHook} useWorkspaces={unusedHook} useResource={unusedHook}
     />,
   )
   return { ...result, store }

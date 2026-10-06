@@ -40,6 +40,10 @@ export type ClipActionsProps =
     readonly timelineId: string | null
     /** Revision the caller last read. */
     readonly baseRevision: number
+    /** Current source-media playhead; splitting happens at this moment. */
+    readonly playheadUs?: number
+    /** True while an edit is being persisted. */
+    readonly saving?: boolean
   }
 
 /**
@@ -48,7 +52,7 @@ export type ClipActionsProps =
  * @param props - the clip, its neighbours, and the channel that reports intents.
  * @returns The bar, or a hint when nothing is selected.
  */
-export function ClipActions({ clip, clips, onIntent, timelineId, baseRevision, t }: ClipActionsProps): ReactNode {
+export function ClipActions({ clip, clips, onIntent, timelineId, baseRevision, playheadUs, saving = false, t }: ClipActionsProps): ReactNode {
   // 草稿跟着选中的片段走：换一段时要是还留着上一段的名字，按回车就会把它写到这一段上。
   const [draft, setDraft] = useState(clip?.name ?? '')
   useEffect(() => { setDraft(clip?.name ?? '') }, [clip?.ordinal, clip?.name])
@@ -64,8 +68,12 @@ export function ClipActions({ clip, clips, onIntent, timelineId, baseRevision, t
   const next = clips[index + 1] ?? null
   const mergeable = next !== null && canMergeWithNext(clip, next)
   const splittable = clip.end_us - clip.start_us > 1_000_000
-  // 只剩一段时不能删：时间线至少要有一段，宿主会拒绝。
-  const removable = clips.length > 1
+  // `playheadUs` was added after this component became independently reusable in tests and
+  // extensions. Its absence keeps the old, deterministic midpoint behaviour; the workbench
+  // always supplies the actual playhead.
+  const splitAtUs = playheadUs ?? Math.round((clip.start_us + clip.end_us) / 2)
+  // 删除最后一段会留下可撤销的空时间线；源素材从不随这个操作删除。
+  const removable = clips.length > 0
   // 时间线名字不在片段上；改名按钮把它放在这里，因为它是这张卡上唯一能改名字的地方。
   const send = (intent: EditIntent | null): void => { onIntent(intent) }
 
@@ -75,19 +83,16 @@ export function ClipActions({ clip, clips, onIntent, timelineId, baseRevision, t
 
       <button
         type="button" className={styles.action} data-clip-action="split"
-        disabled={!splittable}
+        disabled={!splittable || saving || splitAtUs <= clip.start_us || splitAtUs >= clip.end_us}
         title={splittable ? undefined : t('clip.splitTooShort')}
-        // 切点取片段正中：按下按钮时没有「指针在哪」这回事，而中点在任何片段上都存在。
-        // 想切别的位置用时间线上的双击（见 getActionRender 的说明）。
         onClick={() => {
-          const middle = (clip.start_us + clip.end_us) / 2
           send({
             tool: 'video_timeline_split',
             args: {
               timeline_id: timelineId,
               base_revision: baseRevision,
               ordinal: clip.ordinal,
-              asset_time_us: Math.round(middle),
+              asset_time_us: Math.round(splitAtUs),
             },
           })
         }}
@@ -95,7 +100,7 @@ export function ClipActions({ clip, clips, onIntent, timelineId, baseRevision, t
 
       <button
         type="button" className={styles.action} data-clip-action="merge"
-        disabled={!mergeable}
+        disabled={!mergeable || saving}
         title={mergeable ? undefined : t('clip.mergeNeedsNext')}
         onClick={() => send({
           tool: 'video_timeline_merge',
@@ -105,7 +110,7 @@ export function ClipActions({ clip, clips, onIntent, timelineId, baseRevision, t
 
       <button
         type="button" className={styles.action} data-clip-action="remove"
-        disabled={!removable}
+        disabled={!removable || saving}
         title={removable ? undefined : t('clip.lastOne')}
         onClick={() => send({
           tool: 'video_timeline_remove',
@@ -120,7 +125,7 @@ export function ClipActions({ clip, clips, onIntent, timelineId, baseRevision, t
        */}
       <button
         type="button" className={styles.action} data-clip-action="earlier"
-        disabled={index <= 0}
+        disabled={index <= 0 || saving}
         onClick={() => send({
           tool: 'video_timeline_reorder',
           args: { timeline_id: timelineId, base_revision: baseRevision, from: clip.ordinal, to: clip.ordinal - 1 },
@@ -129,7 +134,7 @@ export function ClipActions({ clip, clips, onIntent, timelineId, baseRevision, t
 
       <button
         type="button" className={styles.action} data-clip-action="later"
-        disabled={index < 0 || index >= clips.length - 1}
+        disabled={index < 0 || index >= clips.length - 1 || saving}
         onClick={() => send({
           tool: 'video_timeline_reorder',
           args: { timeline_id: timelineId, base_revision: baseRevision, from: clip.ordinal, to: clip.ordinal + 1 },
@@ -146,6 +151,7 @@ export function ClipActions({ clip, clips, onIntent, timelineId, baseRevision, t
           className={clip.speed === speed ? styles.speedOn : styles.speed}
           data-clip-speed={speed}
           aria-pressed={clip.speed === speed}
+          disabled={saving}
           onClick={() => send({
             tool: 'video_timeline_adjust',
             args: { timeline_id: timelineId, base_revision: baseRevision, ordinal: clip.ordinal, speed },
@@ -158,6 +164,7 @@ export function ClipActions({ clip, clips, onIntent, timelineId, baseRevision, t
         className={clip.muted ? styles.mutedOn : styles.action}
         data-clip-action="mute"
         aria-pressed={clip.muted}
+        disabled={saving}
         onClick={() => send({
           tool: 'video_timeline_adjust',
           args: { timeline_id: timelineId, base_revision: baseRevision, ordinal: clip.ordinal, muted: !clip.muted },
@@ -184,9 +191,10 @@ export function ClipActions({ clip, clips, onIntent, timelineId, baseRevision, t
           data-clip-rename=""
           placeholder={t('clip.namePlaceholder')}
           value={draft}
+          disabled={saving}
           onChange={event => setDraft(event.target.value)}
         />
-        <button type="submit" className={styles.action} data-clip-action="rename">{t('clip.rename')}</button>
+        <button type="submit" disabled={saving} className={styles.action} data-clip-action="rename">{t('clip.rename')}</button>
       </form>
     </div>
   )

@@ -21,7 +21,7 @@
 import { useCallback, useRef, type ReactNode } from 'react'
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
-import type { ClipSpan } from './timing.ts'
+import { layoutOnOutputAxis, type ClipSpan } from './timing.ts'
 import styles from './TimelineScrollbar.module.css'
 
 /** What the scrollbar draws and reports. */
@@ -36,6 +36,8 @@ export type TimelineScrollbarProps =
     readonly contentWidth: number
     /** Length of the recording in seconds; the map is drawn against it. */
     readonly assetSeconds: number
+    /** Whether this map represents source positions or the packed finished film. */
+    readonly axis?: 'source' | 'film'
     /** The clips, so the map shows which stretches the cut uses. */
     readonly clips: readonly ClipSpan[]
     /** Move the lane to an absolute scroll offset, in pixels. */
@@ -49,7 +51,7 @@ export type TimelineScrollbarProps =
  * @returns The scrollbar, or nothing when the axis fits on screen.
  */
 export function TimelineScrollbar({
-  scrollLeft, viewportWidth, contentWidth, assetSeconds, clips, onScrollTo, t,
+  scrollLeft, viewportWidth, contentWidth, assetSeconds, axis = 'source', clips, onScrollTo, t,
 }: TimelineScrollbarProps): ReactNode {
   const track = useRef<HTMLDivElement>(null)
   /*
@@ -130,9 +132,10 @@ export function TimelineScrollbar({
        * 详细到能编辑就会变成第二条时间线。
        */}
       <div className={styles.map} data-scrollbar-map="" aria-hidden="true">
-        {assetSeconds > 0 && clips.map(clip => {
-          const from = Math.max(0, Math.min(assetSeconds, clip.start_us / 1e6))
-          const to = Math.max(from, Math.min(assetSeconds, clip.end_us / 1e6))
+        {assetSeconds > 0 && clips.map((clip, index) => {
+          const output = axis === 'film' ? layoutOnOutputAxis(clips)[index] : null
+          const from = Math.max(0, Math.min(assetSeconds, output?.start ?? clip.start_us / 1e6))
+          const to = Math.max(from, Math.min(assetSeconds, output?.end ?? clip.end_us / 1e6))
           return (
             <span
               key={`${clip.start_us}-${clip.end_us}`}

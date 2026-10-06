@@ -168,7 +168,7 @@ describe('timeline wiring', () => {
     captured.props?.onActionResizeEnd?.({ action: { ...action, end: 278.49 } })
     expect(onEdit).toHaveBeenCalledWith({
       tool: 'video_timeline_trim',
-      args: { timeline_id: 'tl-1', base_revision: 2, ordinal: 1, edge: 'end', delta_us: 2_000_000 },
+      args: { timeline_id: 'tl-1', base_revision: 2, ordinal: 1, edge: 'end', delta_us: -2_000_000 },
     })
   })
 
@@ -183,7 +183,7 @@ describe('timeline wiring', () => {
     const action = { id: 'clip-2', start: 296.58, end: 302.26, effectId: 'clip' }
     captured.props?.onActionMoveEnd?.({ action: { ...action, end: 303.26 } })
     expect(onEdit).toHaveBeenCalledWith(expect.objectContaining({
-      args: expect.objectContaining({ ordinal: 2, edge: 'end', delta_us: 1_000_000 }),
+      args: expect.objectContaining({ ordinal: 2, edge: 'end', delta_us: -1_000_000 }),
     }))
   })
 
@@ -440,7 +440,7 @@ describe('zooming the timeline', () => {
     const lane = container.querySelector('[data-timeline-viewport]') as HTMLElement
     scrollTo(container, 400)
     fireEvent.wheel(lane, { deltaY: -100, ctrlKey: true, clientX: 400 })
-    expect(captured.props?.scaleWidth).toBe(6)
+    expect(captured.props?.scaleWidth).toBe(24)
     expect(captured.scrollLeft).toEqual([800])
   })
 
@@ -450,7 +450,7 @@ describe('zooming the timeline', () => {
     const { container } = renderTimeline()
     scrollTo(container, 200)
     fireEvent.click(container.querySelector('[data-zoom="in"]') as Element)
-    expect(captured.props?.scaleWidth).toBe(6)
+    expect(captured.props?.scaleWidth).toBe(24)
     expect(captured.scrollLeft).toEqual([550])
   })
 

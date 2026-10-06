@@ -306,10 +306,10 @@ describe('AppFrame normal width concessions', () => {
     resize(1200)
     // The template carries the ratio-clamped preference; the panel (rightOwner
     // width) reports the resolved squeeze.
-    expect(tracks(frame)).toEqual([420, 840])
+    expect(tracks(frame)).toEqual([420, 380])
     expect(rightOwner()).toEqual({ width: 380, viewportWidth: 1200, canShow: true })
     resize(1120)
-    expect(tracks(frame)).toEqual([420, 784])
+    expect(tracks(frame)).toEqual([420, 300])
     resize(1119)
     expect(tracks(frame)).toEqual([420, 0])
     expect(rightOwner()).toEqual({ width: 0, viewportWidth: 1119, canShow: false })
@@ -329,7 +329,7 @@ describe('AppFrame normal width concessions', () => {
     expect(tracks(frame)).toEqual([280, 0])
     expect(rightOwner()).toEqual({ width: 344, viewportWidth: 800, canShow: true })
     act(() => { instance.actions.openRightbar(true, false) })
-    expect(tracks(frame)).toEqual([56, 360])
+    expect(tracks(frame)).toEqual([56, 344])
     expect(instance.getSnapshot().layoutInfo).toMatchObject({ narrowExpanded: false, rightbar: 360 })
     expect(rightOwner().canShow).toBe(true)
   })
@@ -552,7 +552,7 @@ describe('AppFrame pointer resizing', () => {
     resize(1100)
     const handle = handleFor(frame, 'rightbar')
     expect(rightOwner().width).toBe(420)
-    expect(tracks(frame)[1]).toBe(770)
+    expect(tracks(frame)[1]).toBe(420)
     expect(handle.style.left).toBe('680px')
     drag(handle, 680, 690)
     expect(instance.getSnapshot().layoutInfo.rightbar).toBe(410)
@@ -561,16 +561,16 @@ describe('AppFrame pointer resizing', () => {
     expect(handle.style.left).toBe('690px')
   })
 
-  it('widens to the 70% limit and shrinks to 300px through pointer input', () => {
+  it('widens to the available frame limit and shrinks to 300px through pointer input', () => {
     frameWidth = 3000
     const { frame, instance, rightOwner } = mountFrame()
     act(() => { instance.actions.toggleSidebar(); instance.actions.openRightbar(true, false) })
     drag(handleFor(frame, 'rightbar'), 1650, 0)
-    expect(rightOwner().width).toBe(2100)
-    expect(tracks(frame)[1]).toBe(2100)
+    expect(rightOwner().width).toBe(2544)
+    expect(tracks(frame)[1]).toBe(2544)
     drag(handleFor(frame, 'rightbar'), 900, 3000)
-    expect(rightOwner().width).toBe(300)
-    expect(tracks(frame)[1]).toBe(300)
+    expect(rightOwner().width).toBe(444)
+    expect(tracks(frame)[1]).toBe(444)
   })
 
   it('commits the pointerup coordinate and cancels its pending animation frame', () => {

@@ -177,14 +177,14 @@ describe('right panel', () => {
     expect(store.getSnapshot().layoutInfo.rightbar).toBe(1100)
   })
 
-  it('clamps drag preferences to 300px and 70% of the current frame', () => {
+  it('clamps drag preferences to 300px and the available frame width', () => {
     const { store, actions } = createLayoutStore().create()
     actions.setViewportWidth(1600)
     actions.setRightbar(9999)
-    expect(store.getSnapshot().layoutInfo.rightbar).toBe(1120)
+    expect(store.getSnapshot().layoutInfo.rightbar).toBe(1600)
     actions.setViewportWidth(1000)
     actions.setRightbar(9999)
-    expect(store.getSnapshot().layoutInfo.rightbar).toBe(700)
+    expect(store.getSnapshot().layoutInfo.rightbar).toBe(1000)
     actions.setRightbar(1)
     expect(store.getSnapshot().layoutInfo.rightbar).toBe(300)
   })

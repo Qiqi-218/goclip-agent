@@ -329,6 +329,7 @@ CREATE TABLE IF NOT EXISTS timeline_segments(
   end_us INTEGER NOT NULL,
   speed REAL NOT NULL DEFAULT 1.0,
   muted INTEGER NOT NULL DEFAULT 0,
+  clip_id TEXT NOT NULL,
   PRIMARY KEY (timeline_id, ordinal),
   CHECK (end_us > start_us),
   CHECK (speed > 0)
@@ -338,7 +339,14 @@ CREATE TABLE IF NOT EXISTS jobs(
   timeline_id TEXT NOT NULL REFERENCES timelines(id) ON DELETE CASCADE,
   status TEXT NOT NULL,
   output TEXT,
-  detail TEXT
+  detail TEXT,
+  input_snapshot TEXT,
+  timeline_revision INTEGER,
+  filename TEXT,
+  render_options TEXT,
+  started_at INTEGER,
+  finished_at INTEGER,
+  cancel_requested_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS evidence(
   asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
@@ -394,9 +402,19 @@ CREATE TABLE IF NOT EXISTS timeline_history(
   created_at INTEGER NOT NULL,
   PRIMARY KEY (timeline_id, revision)
 );
+-- HTTP retries carry an operation id.  Keeping the canonical response makes a lost
+-- response safe to retry instead of applying a second delete or split.
+CREATE TABLE IF NOT EXISTS timeline_operations(
+  operation_id TEXT PRIMARY KEY,
+  timeline_id TEXT NOT NULL REFERENCES timelines(id) ON DELETE CASCADE,
+  request_hash TEXT NOT NULL,
+  response TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS assets_by_project ON assets(project_id);
 CREATE INDEX IF NOT EXISTS timelines_by_project ON timelines(project_id);
 CREATE INDEX IF NOT EXISTS jobs_by_timeline ON jobs(timeline_id);
+CREATE INDEX IF NOT EXISTS timeline_operations_by_timeline ON timeline_operations(timeline_id);
 `
 
 /** Local processing cache with OSS as the durable project and media store. */
@@ -412,6 +430,15 @@ export class VideoWorkspace {
    * blocking a different project.
    */
   private readonly manifestWrites = new Map<string, Promise<void>>()
+  /**
+   * The browser may submit several exports before the first FFmpeg invocation settles.
+   * Keep the expensive work serial in this process: render() owns a shared stage recorder and
+   * media materialisation is deliberately heavy. The persisted jobs row is created before this
+   * queue, so closing the browser never cancels a request merely because it is waiting.
+   */
+  private renderQueue: Promise<void> = Promise.resolve()
+  /** Controllers are deliberately per job: cancelling one film must never abort the next queued one. */
+  private readonly activeRenders = new Map<string, AbortController>()
   /**
    * What the model calls made during one tool invocation cost.
    *
@@ -457,11 +484,16 @@ export class VideoWorkspace {
     this.addTimelineNameColumn(db)
     this.addTimelineSubtitleStyleColumn(db)
     this.addSegmentNameColumn(db)
+    this.addSegmentClipIdColumn(db)
+    this.addJobSnapshotColumns(db)
     this.backfillSingleClipTimelines(db)
     // restore 依赖 this.db 已就位（它自己会去读），所以先赋值再恢复。
     this.db = db
     this.repairStoredAnalyses(db)
     await this.restore()
+    // A process cannot retain an ffmpeg child across a restart.  Do not leave the UI saying
+    // "rendering" forever; queued work is safe to resume because its input snapshot is durable.
+    this.recoverRenderJobs()
     // A failed manifest upload must not make startup unusable.  Existing local rows are
     // authoritative for this process, and pending projects are retried in the background.
     void this.retryPendingManifests().catch(error => console.warn(`video-workspace: 重试待同步项目失败：${error instanceof Error ? error.message : String(error)}`))
@@ -534,6 +566,67 @@ export class VideoWorkspace {
     } catch (error) { console.warn(`video-workspace: 补片段 name 列失败：${error instanceof Error ? error.message : String(error)}`) }
   }
 
+  /** Add immutable segment identities to databases created before clip_id existed. */
+  private addSegmentClipIdColumn(db: DatabaseSync): void {
+    try {
+      const columns = db.prepare('PRAGMA table_info(timeline_segments)').all() as Array<{ name: string }>
+      if (!columns.some(column => column.name === 'clip_id')) db.exec('ALTER TABLE timeline_segments ADD COLUMN clip_id TEXT')
+      const missing = db.prepare("SELECT timeline_id, ordinal FROM timeline_segments WHERE clip_id IS NULL OR clip_id='' ").all() as Array<{ timeline_id: string, ordinal: number }>
+      const update = db.prepare('UPDATE timeline_segments SET clip_id=? WHERE timeline_id=? AND ordinal=?')
+      for (const row of missing) update.run(`clip-${randomUUID()}`, row.timeline_id, row.ordinal)
+      db.exec('CREATE UNIQUE INDEX IF NOT EXISTS segments_clip_id ON timeline_segments(clip_id)')
+    } catch (error) { console.warn(`video-workspace: 补片段 clip_id 列失败：${error instanceof Error ? error.message : String(error)}`) }
+  }
+
+  private addJobSnapshotColumns(db: DatabaseSync): void {
+    const columns = db.prepare('PRAGMA table_info(jobs)').all() as Array<{ name: string }>
+    if (!columns.some(column => column.name === 'input_snapshot')) db.exec('ALTER TABLE jobs ADD COLUMN input_snapshot TEXT')
+    if (!columns.some(column => column.name === 'timeline_revision')) db.exec('ALTER TABLE jobs ADD COLUMN timeline_revision INTEGER')
+    if (!columns.some(column => column.name === 'filename')) db.exec('ALTER TABLE jobs ADD COLUMN filename TEXT')
+    if (!columns.some(column => column.name === 'render_options')) db.exec('ALTER TABLE jobs ADD COLUMN render_options TEXT')
+    if (!columns.some(column => column.name === 'started_at')) db.exec('ALTER TABLE jobs ADD COLUMN started_at INTEGER')
+    if (!columns.some(column => column.name === 'finished_at')) db.exec('ALTER TABLE jobs ADD COLUMN finished_at INTEGER')
+    if (!columns.some(column => column.name === 'cancel_requested_at')) db.exec('ALTER TABLE jobs ADD COLUMN cancel_requested_at INTEGER')
+  }
+
+  /** Recover persisted export rows after a host restart without pretending a dead ffmpeg still runs. */
+  private recoverRenderJobs(): void {
+    const db = this.db
+    if (db === undefined) return
+    const now = Date.now()
+    db.prepare("UPDATE jobs SET status='interrupted', detail=?, finished_at=? WHERE status IN ('running','cancelling')")
+      .run('服务在导出期间重启；原进程已停止。可使用原快照重新导出。', now)
+    const queued = db.prepare("SELECT id, timeline_id, filename, render_options, input_snapshot FROM jobs WHERE status='queued' ORDER BY rowid").all() as Array<{ id: string, timeline_id: string, filename: string | null, render_options: string | null, input_snapshot: string | null }>
+    for (const job of queued) {
+      if (job.input_snapshot === null) {
+        db.prepare("UPDATE jobs SET status='interrupted', detail=?, finished_at=? WHERE id=?")
+          .run('这项旧导出没有可恢复的输入快照。请从当前时间线重新导出。', now, job.id)
+        continue
+      }
+      try {
+        const snapshot = JSON.parse(job.input_snapshot) as { project_id: string, segments: Array<{ asset_id: string, start_us: number, end_us: number, speed: number, muted: number }> }
+        const options = job.render_options === null ? {} : JSON.parse(job.render_options) as { aspect?: 'keep' | '16:9' | '9:16' | '1:1', focus?: 'left' | 'center' | 'right', burnSubtitles?: 'transcript' | 'screen-text', subtitleStyle?: SubtitleStyleInput }
+        this.enqueueRender(job.id, job.timeline_id, job.filename ?? undefined, options, snapshot)
+      } catch {
+        db.prepare("UPDATE jobs SET status='interrupted', detail=?, finished_at=? WHERE id=?")
+          .run('导出快照损坏，无法自动恢复。请从当前时间线重新导出。', now, job.id)
+      }
+    }
+  }
+
+  /** Append one durable job to the process-local executor while preserving its immutable input. */
+  private enqueueRender(id: string, timelineId: string, filename: string | undefined, options: { aspect?: 'keep' | '16:9' | '9:16' | '1:1', focus?: 'left' | 'center' | 'right', burnSubtitles?: 'transcript' | 'screen-text', subtitleStyle?: SubtitleStyleInput }, snapshot: { project_id: string, segments: Array<{ asset_id: string, start_us: number, end_us: number, speed: number, muted: number }> }): void {
+    this.renderQueue = this.renderQueue.catch(() => undefined).then(async () => {
+      const db = await this.open()
+      const status = (db.prepare('SELECT status FROM jobs WHERE id=?').get(id) as { status: string } | undefined)?.status
+      if (status !== 'queued') return
+      const controller = new AbortController()
+      this.activeRenders.set(id, controller)
+      try { await this.render(timelineId, filename, controller.signal, options, id, snapshot) }
+      finally { this.activeRenders.delete(id) }
+    }).catch(() => undefined)
+  }
+
   /**
    * Give every single-range timeline its one clip.
    *
@@ -550,13 +643,13 @@ export class VideoWorkspace {
     try {
       const missing = db.prepare('SELECT t.id, t.asset_id, t.start_us, t.end_us FROM timelines t WHERE NOT EXISTS (SELECT 1 FROM timeline_segments s WHERE s.timeline_id = t.id)').all() as Array<{ id: string, asset_id: string, start_us: number, end_us: number }>
       if (missing.length === 0) return
-      const insert = db.prepare('INSERT INTO timeline_segments (timeline_id, ordinal, asset_id, start_us, end_us, speed, muted) VALUES (?,0,?,?,?,1.0,0)')
+      const insert = db.prepare('INSERT INTO timeline_segments (timeline_id, ordinal, asset_id, start_us, end_us, speed, muted, clip_id) VALUES (?,0,?,?,?,1.0,0,?)')
       let done = 0
       for (const row of missing) {
         // 素材已被删掉的时间线没法补片段，外键会挡住；留给它的级联清理处理。
         if (!db.prepare('SELECT 1 FROM assets WHERE id=?').get(row.asset_id)) continue
         if (row.end_us <= row.start_us) continue
-        insert.run(row.id, row.asset_id, row.start_us, row.end_us)
+        insert.run(row.id, row.asset_id, row.start_us, row.end_us, `clip-${randomUUID()}`)
         done++
       }
       if (done > 0) console.warn(`video-workspace: 已为 ${done} 条旧时间线补上其首段`)
@@ -795,13 +888,15 @@ export class VideoWorkspace {
     if (rows.length === 0) return null
     const duration = (await this.durationOf(assetId)) ?? 0
     const at = (us: number): number => (duration === 0 ? 0 : round4(Math.min(1, Math.max(0, us / duration))))
-    const segmentsOf = db.prepare('SELECT ordinal, start_us, end_us, speed, muted, name FROM timeline_segments WHERE timeline_id=? ORDER BY ordinal')
+    const segmentsOf = db.prepare('SELECT ordinal, clip_id, asset_id, start_us, end_us, speed, muted, name FROM timeline_segments WHERE timeline_id=? ORDER BY ordinal')
     return {
       duration_us: duration,
       timelines: rows.map(row => {
-        const clips = (segmentsOf.all(row.id) as Array<{ ordinal: number, start_us: number, end_us: number, speed: number, muted: number, name: string | null }>)
+        const clips = (segmentsOf.all(row.id) as Array<{ ordinal: number, clip_id: string, asset_id: string, start_us: number, end_us: number, speed: number, muted: number, name: string | null }>)
           .map(clip => ({
             ordinal: clip.ordinal,
+            clip_id: clip.clip_id,
+            asset_id: clip.asset_id,
             start_us: Math.round(clip.start_us),
             end_us: Math.round(clip.end_us),
             start: at(clip.start_us),
@@ -852,10 +947,10 @@ export class VideoWorkspace {
   async rendersOf(projectId: string, assetId: string): Promise<Data | null> {
     await this.asset(projectId, assetId)
     const db = await this.open()
-    const rows = db.prepare(`SELECT j.id, j.status, j.output, j.detail, t.id AS timeline_id, t.name AS timeline_name
+    const rows = db.prepare(`SELECT j.id, j.status, j.output, j.detail, j.timeline_revision, j.started_at, j.finished_at, t.revision AS current_revision, t.id AS timeline_id, t.name AS timeline_name
       FROM jobs j JOIN timelines t ON t.id = j.timeline_id
       WHERE t.project_id=? AND t.asset_id=?
-      ORDER BY j.rowid DESC`).all(projectId, assetId) as Array<{ id: string, status: string, output: string | null, detail: string | null, timeline_id: string, timeline_name: string | null }>
+      ORDER BY j.rowid DESC`).all(projectId, assetId) as Array<{ id: string, status: string, output: string | null, detail: string | null, timeline_revision: number | null, started_at: number | null, finished_at: number | null, current_revision: number, timeline_id: string, timeline_name: string | null }>
     if (rows.length === 0) return null
     return {
       renders: rows.map(row => ({
@@ -863,6 +958,11 @@ export class VideoWorkspace {
         status: row.status,
         timeline_id: row.timeline_id,
         timeline_name: row.timeline_name,
+        timeline_revision: row.timeline_revision,
+        current_revision: row.current_revision,
+        stale: row.timeline_revision !== null && row.timeline_revision !== row.current_revision,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
         // 播放地址交给媒体路由，而不是把 OSS 的签名地址发出去 ——
         // 那会把 AccessKeyId 带进页面，而且签在一段时间后就过期。
         // 只有真产出成片的任务才有地址；失败的任务给不出可播的东西。
@@ -1043,15 +1143,14 @@ export class VideoWorkspace {
    * @returns The stored name and the new revision.
    */
   async nameSegment(a: { timeline_id: string, base_revision: number, ordinal: number, name: string }): Promise<Data> {
-    const timeline = await this.assertRevision(a.timeline_id, a.base_revision)
-    const db = await this.open()
-    const row = db.prepare('SELECT ordinal FROM timeline_segments WHERE timeline_id=? AND ordinal=?').get(a.timeline_id, a.ordinal)
-    if (row === undefined) throw new Error(`没有第 ${a.ordinal} 段`)
     const trimmed = a.name.trim()
     const stored = trimmed === '' ? null : trimmed
-    db.prepare('UPDATE timeline_segments SET name=? WHERE timeline_id=? AND ordinal=?').run(stored, a.timeline_id, a.ordinal)
-    this.refreshTimeline(a.timeline_id, a.base_revision + 1)
-    await this.manifest(timeline.project_id)
+    const committed = await this.mutateTimeline(a.timeline_id, a.base_revision, db => {
+      const row = db.prepare('SELECT ordinal FROM timeline_segments WHERE timeline_id=? AND ordinal=?').get(a.timeline_id, a.ordinal)
+      if (row === undefined) throw new Error(`没有第 ${a.ordinal} 段`)
+      db.prepare('UPDATE timeline_segments SET name=? WHERE timeline_id=? AND ordinal=?').run(stored, a.timeline_id, a.ordinal)
+    })
+    await this.manifest(committed.project_id)
     return {
       revision: a.base_revision + 1,
       ordinal: a.ordinal,
@@ -1110,7 +1209,7 @@ export class VideoWorkspace {
    * @param path - path segments after the route prefix.
    * @returns The target, or `null` when nothing matches.
    */
-  async resolveMedia(path: readonly string[]): Promise<{ key: string, contentType: string } | null> {
+  async resolveMedia(path: readonly string[]): Promise<{ key: string, contentType: string, downloadName?: string } | null> {
     const [projectId, assetId, kind, jobId] = path
     if (projectId === undefined || assetId === undefined) return null
     if (kind === undefined) {
@@ -1126,7 +1225,7 @@ export class VideoWorkspace {
     // key out of either form so the route always signs fresh rather than reusing a stale one.
     const key = row.output.startsWith('oss://') ? row.output.slice('oss://'.length) : this.keyOfUrl(row.output)
     if (key === null) return null
-    return { key, contentType: 'video/mp4' }
+    return { key, contentType: 'video/mp4', downloadName: this.safeFilename(`${row.name ?? 'goclip-export'}-${jobId}.mp4`) }
   }
 
   /**
@@ -1542,7 +1641,7 @@ export class VideoWorkspace {
         })
       }
       return { ...result, matches: refined, refine_tolerance_seconds: this.config.refineToleranceSeconds ?? 1.5, note: run.failed.length > 0 ? '部分分片未完成，以下命中不覆盖失败时间段。' : null, stages: this.stages.snapshot() } } finally { await source.cleanup() } }
-  async createTimeline(a: { id: string,project_id: string,asset_id: string,start_us: number,end_us: number,name?: string }): Promise<Data> { await this.assertRange(a.asset_id, a.start_us, a.end_us); await this.assertAssetInProject(a.project_id, a.asset_id); const db = await this.open(); db.prepare('INSERT INTO timelines (id,name,project_id,asset_id,start_us,end_us,revision) VALUES (?,?,?,?,?,?,1)').run(a.id, a.name ?? null, a.project_id, a.asset_id, a.start_us, a.end_us); db.prepare('INSERT INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted) VALUES (?,0,?,?,?,1.0,0)').run(a.id,a.asset_id,a.start_us,a.end_us); try { db.prepare('INSERT OR REPLACE INTO timeline_history (timeline_id,revision,clips,note,created_at) VALUES (?,?,?,?,?)').run(a.id, 1, JSON.stringify([{ ordinal: 0, asset_id: a.asset_id, start_us: a.start_us, end_us: a.end_us, speed: 1, muted: 0 }]), '创建', Date.now()) } catch { /* 记不上不影响创建 */ } await this.manifest(a.project_id); return this.timeline(a.id) }
+  async createTimeline(a: { id: string,project_id: string,asset_id: string,start_us: number,end_us: number,name?: string }): Promise<Data> { await this.assertRange(a.asset_id, a.start_us, a.end_us); await this.assertAssetInProject(a.project_id, a.asset_id); const db = await this.open(); const clipId = `clip-${randomUUID()}`; db.prepare('INSERT INTO timelines (id,name,project_id,asset_id,start_us,end_us,revision) VALUES (?,?,?,?,?,?,1)').run(a.id, a.name ?? null, a.project_id, a.asset_id, a.start_us, a.end_us); db.prepare('INSERT INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted,clip_id) VALUES (?,0,?,?,?,1.0,0,?)').run(a.id,a.asset_id,a.start_us,a.end_us,clipId); try { db.prepare('INSERT OR REPLACE INTO timeline_history (timeline_id,revision,clips,note,created_at) VALUES (?,?,?,?,?)').run(a.id, 1, JSON.stringify([{ ordinal: 0, clip_id: clipId, asset_id: a.asset_id, start_us: a.start_us, end_us: a.end_us, speed: 1, muted: 0 }]), '创建', Date.now()) } catch { /* 记不上不影响创建 */ } await this.manifest(a.project_id); return this.timeline(a.id) }
   async timeline(id: string): Promise<Data> { const row = (await this.open()).prepare('SELECT * FROM timelines WHERE id=?').get(id) as Data | undefined; if (!row) throw new Error(`timeline not found: ${id}`); const segments = this.segmentsOf(id); return { ...row, segments, segment_count: segments.length, duration_us: segments.reduce((sum, s) => sum + (Number(s.end_us) - Number(s.start_us)) / (Number(s.speed) || 1), 0) } }
   /**
    * List a project's timelines, marking the ones that cover the same range of the
@@ -2012,7 +2111,7 @@ export class VideoWorkspace {
   private segmentsOf(timelineId: string): Data[] {
     const db = this.db
     if (db === undefined) return []
-    const rows = db.prepare('SELECT ordinal, asset_id, start_us, end_us, speed, muted FROM timeline_segments WHERE timeline_id=? ORDER BY ordinal').all(timelineId) as Data[]
+    const rows = db.prepare('SELECT ordinal, clip_id, asset_id, start_us, end_us, speed, muted, name FROM timeline_segments WHERE timeline_id=? ORDER BY ordinal').all(timelineId) as Data[]
     return rows.map(row => {
       const speed = Number(row.speed) || 1
       return { ...row, seconds: round2((Number(row.end_us) - Number(row.start_us)) / speed / 1e6) }
@@ -2030,19 +2129,49 @@ export class VideoWorkspace {
   private refreshTimeline(timelineId: string, revision: number): void {
     const db = this.db
     if (db === undefined) return
-    const rows = db.prepare('SELECT asset_id, start_us, end_us FROM timeline_segments WHERE timeline_id=? ORDER BY ordinal').all(timelineId) as Array<{ asset_id: string, start_us: number, end_us: number }>
+    // A revision must capture every property that changes either playback or the editor's
+    // meaning. Restoring only in/out points silently lost speed, mute and names.
+    const rows = db.prepare('SELECT ordinal, clip_id, asset_id, start_us, end_us, speed, muted, name FROM timeline_segments WHERE timeline_id=? ORDER BY ordinal').all(timelineId) as Array<{ ordinal: number, clip_id: string, asset_id: string, start_us: number, end_us: number, speed: number, muted: number, name: string | null }>
     const first = rows[0]
-    // A timeline with no clips is deliberately not allowed: it would export nothing, and
-    // `CHECK (end_us > start_us)` on the summary has no value to hold.
-    if (first === undefined) throw new Error(`时间线 ${timelineId} 的最后一段不能删除：时间线至少要保留一段。要清空请直接删除整条时间线。`)
+    // The legacy summary columns have a range CHECK, so an empty timeline keeps its last
+    // valid summary range as compatibility metadata.  The authoritative edit plan is
+    // `timeline_segments`; an empty set is intentional and simply makes preview/export unavailable.
+    if (first === undefined) {
+      db.prepare('UPDATE timelines SET revision=? WHERE id=?').run(revision, timelineId)
+    db.prepare('INSERT OR REPLACE INTO timeline_history (timeline_id,revision,clips,note,created_at) VALUES (?,?,?,?,?)')
+      .run(timelineId, revision, '[]', '清空时间线', Date.now())
+      return
+    }
     const spanning = rows.reduce((acc, row) => ({ asset_id: row.asset_id, start_us: Math.min(acc.start_us, row.start_us), end_us: Math.max(acc.end_us, row.end_us) }), { asset_id: first.asset_id, start_us: first.start_us, end_us: first.end_us })
     db.prepare('UPDATE timelines SET asset_id=?, start_us=?, end_us=?, revision=? WHERE id=?').run(spanning.asset_id, spanning.start_us, spanning.end_us, revision, timelineId)
     // 历史在这里记录，因为只有这里知道最终版本号。调用方按自己的 base_revision 记录会贴到
     // 已被占用的槽位上 —— 编辑结果覆盖掉上一个版本的快照，历史就只剩一条。
+    db.prepare('INSERT OR REPLACE INTO timeline_history (timeline_id,revision,clips,note,created_at) VALUES (?,?,?,?,?)')
+      .run(timelineId, revision, JSON.stringify(rows), null, Date.now())
+  }
+
+  /**
+   * Commit one edit and its history as one SQLite transaction.
+   *
+   * All network/FFmpeg validation deliberately happens before entering here.  Inside this
+   * short transaction the revision is re-read, so a second client cannot pass an old
+   * `base_revision` between the caller's initial read and the actual write.
+   */
+  private async mutateTimeline<T>(timelineId: string, baseRevision: number, write: (db: DatabaseSync, timeline: { project_id: string }) => T): Promise<{ project_id: string, result: T }> {
+    const db = await this.open()
+    db.exec('BEGIN IMMEDIATE')
     try {
-      db.prepare('INSERT OR REPLACE INTO timeline_history (timeline_id,revision,clips,note,created_at) VALUES (?,?,?,?,?)')
-        .run(timelineId, revision, JSON.stringify(rows), null, Date.now())
-    } catch { /* 历史记不上不该挡住编辑本身 */ }
+      const row = db.prepare('SELECT revision, project_id FROM timelines WHERE id=?').get(timelineId) as { revision: number, project_id: string } | undefined
+      if (row === undefined) throw new Error(`时间线 ${timelineId} 不存在`)
+      if (row.revision !== baseRevision) throw new Error(`revision conflict: 当前是 ${row.revision}，你基于 ${baseRevision} 在改。请重新读取时间线后再改。`)
+      const result = write(db, row)
+      this.refreshTimeline(timelineId, baseRevision + 1)
+      db.exec('COMMIT')
+      return { project_id: row.project_id, result }
+    } catch (error) {
+      try { db.exec('ROLLBACK') } catch { /* transaction was never opened or already rolled back */ }
+      throw error
+    }
   }
 
   /**
@@ -2079,14 +2208,15 @@ export class VideoWorkspace {
     await this.assertRevision(a.timeline_id, a.base_revision)
     const row = (await this.open()).prepare('SELECT clips FROM timeline_history WHERE timeline_id=? AND revision=?').get(a.timeline_id, a.target_revision) as { clips: string } | undefined
     if (row === undefined) throw new Error(`没有 revision ${a.target_revision} 的快照。用 video_timeline_history 看有哪些可回滚的版本。`)
-    const clips = (JSON.parse(row.clips) as Array<{ asset_id: string, start_us: number, end_us: number, speed?: number, muted?: number }>)
+    const clips = (JSON.parse(row.clips) as Array<{ clip_id?: string, asset_id: string, start_us: number, end_us: number, speed?: number, muted?: number, name?: string | null }>)
       .map(clip => {
-        const out: { asset_id: string, start_us: number, end_us: number, speed?: number, muted?: boolean } = { asset_id: clip.asset_id, start_us: clip.start_us, end_us: clip.end_us }
+        const out: { clip_id?: string, asset_id: string, start_us: number, end_us: number, speed?: number, muted?: boolean, name?: string | null } = { asset_id: clip.asset_id, start_us: clip.start_us, end_us: clip.end_us }
+        if (typeof clip.clip_id === 'string') out.clip_id = clip.clip_id
         if (typeof clip.speed === 'number' && clip.speed !== 1) out.speed = clip.speed
         if (clip.muted === 1) out.muted = true
+        if (typeof clip.name === 'string') out.name = clip.name
         return out
       })
-    if (clips.length === 0) throw new Error(`revision ${a.target_revision} 的快照是空的，无法回滚。`)
     // 回滚走 setSegments，它自己会记下这次回滚产生的版本，所以"回滚还能回滚回来"。
     const restored = await this.setSegments({ timeline_id: a.timeline_id, base_revision: a.base_revision, clips })
     return { timeline: restored, restored_from_revision: a.target_revision, note: `已回到 revision ${a.target_revision} 的样子；这次回滚本身记为 revision ${restored.revision}` }
@@ -2106,22 +2236,25 @@ export class VideoWorkspace {
    * @returns The timeline with the clip replaced by two.
    */
   async splitSegment(a: { timeline_id: string, base_revision: number, ordinal: number, asset_time_us: number }): Promise<Data> {
-    const timeline = await this.assertRevision(a.timeline_id, a.base_revision)
-    const db = await this.open()
-    const clip = db.prepare('SELECT asset_id, start_us, end_us, speed, muted FROM timeline_segments WHERE timeline_id=? AND ordinal=?').get(a.timeline_id, a.ordinal) as { asset_id: string, start_us: number, end_us: number, speed: number, muted: number } | undefined
-    if (clip === undefined) throw new Error(`没有第 ${a.ordinal} 段`)
     const at = Math.round(a.asset_time_us)
-    if (at <= clip.start_us || at >= clip.end_us) {
-      throw new Error(`切点 ${at} 不在第 ${a.ordinal} 段内（该段是 ${clip.start_us}–${clip.end_us}）。切点必须落在段的内部，落在端点上等于没切。`)
-    }
-    // 两半继承原段的播放方式：变速与静音属于这一段素材，不属于它的某一边。
-    db.prepare('DELETE FROM timeline_segments WHERE timeline_id=? AND ordinal=?').run(a.timeline_id, a.ordinal)
-    db.prepare('UPDATE timeline_segments SET ordinal = ordinal + 1 WHERE timeline_id=? AND ordinal >= ?').run(a.timeline_id, a.ordinal)
-    const insert = db.prepare('INSERT INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted) VALUES (?,?,?,?,?,?,?)')
-    insert.run(a.timeline_id, a.ordinal, clip.asset_id, clip.start_us, at, clip.speed, clip.muted)
-    insert.run(a.timeline_id, a.ordinal + 1, clip.asset_id, at, clip.end_us, clip.speed, clip.muted)
-    this.refreshTimeline(a.timeline_id, a.base_revision + 1)
-    await this.manifest(timeline.project_id)
+    const committed = await this.mutateTimeline(a.timeline_id, a.base_revision, db => {
+      const clip = db.prepare('SELECT clip_id, asset_id, start_us, end_us, speed, muted, name FROM timeline_segments WHERE timeline_id=? AND ordinal=?').get(a.timeline_id, a.ordinal) as { clip_id: string, asset_id: string, start_us: number, end_us: number, speed: number, muted: number, name: string | null } | undefined
+      if (clip === undefined) throw new Error(`没有第 ${a.ordinal} 段`)
+      if (at <= clip.start_us || at >= clip.end_us) throw new Error(`切点 ${at} 不在第 ${a.ordinal} 段内（该段是 ${clip.start_us}–${clip.end_us}）。切点必须落在段的内部，落在端点上等于没切。`)
+      // 两半继承原段的播放方式：变速与静音属于这一段素材，不属于它的某一边。
+      db.prepare('DELETE FROM timeline_segments WHERE timeline_id=? AND ordinal=?').run(a.timeline_id, a.ordinal)
+      // 不能直接在唯一键上做 ordinal + 1：SQLite 可能先更新中间某一行，
+      // 与尚未移动的下一行撞键。先把受影响的行停到负数停车位，再一次性落到新位置。
+      const following = db.prepare('SELECT ordinal FROM timeline_segments WHERE timeline_id=? AND ordinal>=? ORDER BY ordinal DESC').all(a.timeline_id, a.ordinal) as Array<{ ordinal: number }>
+      const shift = db.prepare('UPDATE timeline_segments SET ordinal=? WHERE timeline_id=? AND ordinal=?')
+      for (const row of following) shift.run(ORDINAL_PARKING - row.ordinal, a.timeline_id, row.ordinal)
+      for (const row of following) shift.run(row.ordinal + 1, a.timeline_id, ORDINAL_PARKING - row.ordinal)
+      const insert = db.prepare('INSERT INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted,name,clip_id) VALUES (?,?,?,?,?,?,?,?,?)')
+      // The first half remains the selected clip; only the newly created right half gets a new id.
+      insert.run(a.timeline_id, a.ordinal, clip.asset_id, clip.start_us, at, clip.speed, clip.muted, clip.name, clip.clip_id)
+      insert.run(a.timeline_id, a.ordinal + 1, clip.asset_id, at, clip.end_us, clip.speed, clip.muted, null, `clip-${randomUUID()}`)
+    })
+    await this.manifest(committed.project_id)
     return { timeline: await this.timeline(a.timeline_id), split_at_us: at, note: `第 ${a.ordinal} 段在 ${round2(at / 1e6)} 秒处切成两段` }
   }
 
@@ -2137,24 +2270,24 @@ export class VideoWorkspace {
    * @returns The timeline with the two clips replaced by one.
    */
   async mergeSegments(a: { timeline_id: string, base_revision: number, ordinal: number }): Promise<Data> {
-    const timeline = await this.assertRevision(a.timeline_id, a.base_revision)
-    const db = await this.open()
-    const first = db.prepare('SELECT asset_id, start_us, end_us, speed, muted FROM timeline_segments WHERE timeline_id=? AND ordinal=?').get(a.timeline_id, a.ordinal) as { asset_id: string, start_us: number, end_us: number, speed: number, muted: number } | undefined
-    const second = db.prepare('SELECT asset_id, start_us, end_us, speed, muted FROM timeline_segments WHERE timeline_id=? AND ordinal=?').get(a.timeline_id, a.ordinal + 1) as { asset_id: string, start_us: number, end_us: number, speed: number, muted: number } | undefined
-    if (first === undefined) throw new Error(`没有第 ${a.ordinal} 段`)
-    if (second === undefined) throw new Error(`第 ${a.ordinal} 段后面没有可合并的段（它是最后一段）。`)
-    if (first.asset_id !== second.asset_id) throw new Error(`第 ${a.ordinal} 与 ${a.ordinal + 1} 段来自不同素材，合成一段没有意义 —— 中间那段素材会消失。`)
-    if (first.speed !== second.speed || first.muted !== second.muted) throw new Error(`两段的播放方式不同（变速 ${first.speed}/${second.speed}，静音 ${first.muted}/${second.muted}），合成一段无法同时表达这两种设置。先把设置调成一致。`)
-    // 只有首尾相接才真的是连续的一段；中间有缺口时合并会把缺口也算进成片。
-    if (first.end_us !== second.start_us) {
-      throw new Error(`两段在素材上不连续（前段到 ${first.end_us}，后段从 ${second.start_us} 开始，相差 ${round2((second.start_us - first.end_us) / 1e6)} 秒）。合并会把中间那段画面也算进来，所以拒绝。若确实想连起来，请分别保留两段。`)
-    }
-    db.prepare('UPDATE timeline_segments SET end_us=? WHERE timeline_id=? AND ordinal=?').run(second.end_us, a.timeline_id, a.ordinal)
-    db.prepare('DELETE FROM timeline_segments WHERE timeline_id=? AND ordinal=?').run(a.timeline_id, a.ordinal + 1)
-    db.prepare('UPDATE timeline_segments SET ordinal = ordinal - 1 WHERE timeline_id=? AND ordinal > ?').run(a.timeline_id, a.ordinal + 1)
-    this.refreshTimeline(a.timeline_id, a.base_revision + 1)
-    await this.manifest(timeline.project_id)
-    return { timeline: await this.timeline(a.timeline_id), note: `第 ${a.ordinal} 与 ${a.ordinal + 1} 段已合成一段（${round2((second.end_us - first.start_us) / 1e6)} 秒）` }
+    const committed = await this.mutateTimeline(a.timeline_id, a.base_revision, db => {
+      const first = db.prepare('SELECT asset_id, start_us, end_us, speed, muted FROM timeline_segments WHERE timeline_id=? AND ordinal=?').get(a.timeline_id, a.ordinal) as { asset_id: string, start_us: number, end_us: number, speed: number, muted: number } | undefined
+      const second = db.prepare('SELECT asset_id, start_us, end_us, speed, muted FROM timeline_segments WHERE timeline_id=? AND ordinal=?').get(a.timeline_id, a.ordinal + 1) as { asset_id: string, start_us: number, end_us: number, speed: number, muted: number } | undefined
+      if (first === undefined) throw new Error(`没有第 ${a.ordinal} 段`)
+      if (second === undefined) throw new Error(`第 ${a.ordinal} 段后面没有可合并的段（它是最后一段）。`)
+      if (first.asset_id !== second.asset_id) throw new Error(`第 ${a.ordinal} 与 ${a.ordinal + 1} 段来自不同素材，合成一段没有意义 —— 中间那段素材会消失。`)
+      if (first.speed !== second.speed || first.muted !== second.muted) throw new Error(`两段的播放方式不同（变速 ${first.speed}/${second.speed}，静音 ${first.muted}/${second.muted}），合成一段无法同时表达这两种设置。先把设置调成一致。`)
+      if (first.end_us !== second.start_us) throw new Error(`两段在素材上不连续（前段到 ${first.end_us}，后段从 ${second.start_us} 开始，相差 ${round2((second.start_us - first.end_us) / 1e6)} 秒）。合并会把中间那段画面也算进来，所以拒绝。若确实想连起来，请分别保留两段。`)
+      db.prepare('UPDATE timeline_segments SET end_us=? WHERE timeline_id=? AND ordinal=?').run(second.end_us, a.timeline_id, a.ordinal)
+      db.prepare('DELETE FROM timeline_segments WHERE timeline_id=? AND ordinal=?').run(a.timeline_id, a.ordinal + 1)
+      const following = db.prepare('SELECT ordinal FROM timeline_segments WHERE timeline_id=? AND ordinal>? ORDER BY ordinal DESC').all(a.timeline_id, a.ordinal + 1) as Array<{ ordinal: number }>
+      const shift = db.prepare('UPDATE timeline_segments SET ordinal=? WHERE timeline_id=? AND ordinal=?')
+      for (const row of following) shift.run(ORDINAL_PARKING - row.ordinal, a.timeline_id, row.ordinal)
+      for (const row of following) shift.run(row.ordinal - 1, a.timeline_id, ORDINAL_PARKING - row.ordinal)
+      return round2((second.end_us - first.start_us) / 1e6)
+    })
+    await this.manifest(committed.project_id)
+    return { timeline: await this.timeline(a.timeline_id), note: `第 ${a.ordinal} 与 ${a.ordinal + 1} 段已合成一段（${committed.result} 秒）` }
   }
 
   /**
@@ -2866,6 +2999,27 @@ export class VideoWorkspace {
     return row
   }
 
+  /** Return a previous command response, refusing to reuse an id for a different request. */
+  async operationResult(timelineId: string, operationId: string, request: unknown): Promise<Data | null> {
+    const hash = createHash('sha256').update(JSON.stringify(request)).digest('hex')
+    const row = (await this.open()).prepare('SELECT request_hash, response FROM timeline_operations WHERE operation_id=? AND timeline_id=?').get(operationId, timelineId) as { request_hash: string, response: string } | undefined
+    if (row === undefined) return null
+    if (row.request_hash !== hash) throw new Error('operation conflict: 同一个 operation_id 不能用于不同编辑请求。')
+    return JSON.parse(row.response) as Data
+  }
+
+  /** Persist the canonical result after a successful command so a lost HTTP response is retry-safe. */
+  async rememberOperation(timelineId: string, operationId: string, request: unknown, response: Data): Promise<void> {
+    const hash = createHash('sha256').update(JSON.stringify(request)).digest('hex')
+    const db = await this.open()
+    try {
+      db.prepare('INSERT INTO timeline_operations (operation_id,timeline_id,request_hash,response,created_at) VALUES (?,?,?,?,?)').run(operationId, timelineId, hash, JSON.stringify(response), Date.now())
+    } catch {
+      const prior = db.prepare('SELECT request_hash FROM timeline_operations WHERE operation_id=? AND timeline_id=?').get(operationId, timelineId) as { request_hash: string } | undefined
+      if (prior?.request_hash !== hash) throw new Error('operation conflict: 同一个 operation_id 不能用于不同编辑请求。')
+    }
+  }
+
   /**
    * Append one clip to a timeline.
    *
@@ -2878,25 +3032,46 @@ export class VideoWorkspace {
     await this.assertRange(a.asset_id, a.start_us, a.end_us)
     await this.assertAssetInProject(timeline.project_id, a.asset_id)
     if (a.speed !== undefined && !(a.speed > 0)) throw new Error(`speed 必须大于 0，收到 ${a.speed}`)
-    const db = await this.open()
-    const next = (db.prepare('SELECT COALESCE(MAX(ordinal), -1) + 1 AS n FROM timeline_segments WHERE timeline_id=?').get(a.timeline_id) as { n: number }).n
-    db.prepare('INSERT INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted) VALUES (?,?,?,?,?,?,0)').run(a.timeline_id, next, a.asset_id, a.start_us, a.end_us, a.speed ?? 1)
-    this.refreshTimeline(a.timeline_id, a.base_revision + 1)
-    await this.manifest(timeline.project_id)
+    const committed = await this.mutateTimeline(a.timeline_id, a.base_revision, db => {
+      const next = (db.prepare('SELECT COALESCE(MAX(ordinal), -1) + 1 AS n FROM timeline_segments WHERE timeline_id=?').get(a.timeline_id) as { n: number }).n
+      db.prepare('INSERT INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted,clip_id) VALUES (?,?,?,?,?,?,0,?)').run(a.timeline_id, next, a.asset_id, a.start_us, a.end_us, a.speed ?? 1, `clip-${randomUUID()}`)
+    })
+    await this.manifest(committed.project_id)
+    return this.timeline(a.timeline_id)
+  }
+
+  /** Insert a source range before one visible position instead of forcing every paste to the end. */
+  async insertSegment(a: { timeline_id: string, base_revision: number, asset_id: string, start_us: number, end_us: number, ordinal: number, speed?: number }): Promise<Data> {
+    const timeline = await this.assertRevision(a.timeline_id, a.base_revision)
+    await this.assertRange(a.asset_id, a.start_us, a.end_us)
+    await this.assertAssetInProject(timeline.project_id, a.asset_id)
+    if (!Number.isInteger(a.ordinal) || a.ordinal < 0) throw new Error(`插入位置必须是非负整数，收到 ${a.ordinal}`)
+    if (a.speed !== undefined && !(a.speed > 0)) throw new Error(`speed 必须大于 0，收到 ${a.speed}`)
+    const committed = await this.mutateTimeline(a.timeline_id, a.base_revision, db => {
+      const count = (db.prepare('SELECT COUNT(*) AS n FROM timeline_segments WHERE timeline_id=?').get(a.timeline_id) as { n: number }).n
+      if (a.ordinal > count) throw new Error(`插入位置 ${a.ordinal} 超出时间线：当前共有 ${count} 段`)
+      const following = db.prepare('SELECT ordinal FROM timeline_segments WHERE timeline_id=? AND ordinal>=? ORDER BY ordinal DESC').all(a.timeline_id, a.ordinal) as Array<{ ordinal: number }>
+      const shift = db.prepare('UPDATE timeline_segments SET ordinal=? WHERE timeline_id=? AND ordinal=?')
+      for (const row of following) shift.run(ORDINAL_PARKING - row.ordinal, a.timeline_id, row.ordinal)
+      for (const row of following) shift.run(row.ordinal + 1, a.timeline_id, ORDINAL_PARKING - row.ordinal)
+      db.prepare('INSERT INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted,clip_id) VALUES (?,?,?,?,?,?,0,?)').run(a.timeline_id, a.ordinal, a.asset_id, a.start_us, a.end_us, a.speed ?? 1, `clip-${randomUUID()}`)
+    })
+    await this.manifest(committed.project_id)
     return this.timeline(a.timeline_id)
   }
 
   /** Remove one clip by position, closing the gap so ordinals stay contiguous. */
   async removeSegment(a: { timeline_id: string, base_revision: number, ordinal: number }): Promise<Data> {
-    const timeline = await this.assertRevision(a.timeline_id, a.base_revision)
-    const db = await this.open()
-    const count = (db.prepare('SELECT COUNT(*) AS n FROM timeline_segments WHERE timeline_id=?').get(a.timeline_id) as { n: number }).n
-    if (!Number.isInteger(a.ordinal) || a.ordinal < 0 || a.ordinal >= count) throw new Error(`没有第 ${a.ordinal} 段：这条时间线共 ${count} 段（序号从 0 开始）`)
-    if (count === 1) throw new Error('这是唯一的一段，删掉后时间线就没有内容了。若确实不要，请删除整条时间线。')
-    db.prepare('DELETE FROM timeline_segments WHERE timeline_id=? AND ordinal=?').run(a.timeline_id, a.ordinal)
-    db.prepare('UPDATE timeline_segments SET ordinal = ordinal - 1 WHERE timeline_id=? AND ordinal > ?').run(a.timeline_id, a.ordinal)
-    this.refreshTimeline(a.timeline_id, a.base_revision + 1)
-    await this.manifest(timeline.project_id)
+    const committed = await this.mutateTimeline(a.timeline_id, a.base_revision, db => {
+      const count = (db.prepare('SELECT COUNT(*) AS n FROM timeline_segments WHERE timeline_id=?').get(a.timeline_id) as { n: number }).n
+      if (!Number.isInteger(a.ordinal) || a.ordinal < 0 || a.ordinal >= count) throw new Error(`没有第 ${a.ordinal} 段：这条时间线共 ${count} 段（序号从 0 开始）`)
+      db.prepare('DELETE FROM timeline_segments WHERE timeline_id=? AND ordinal=?').run(a.timeline_id, a.ordinal)
+      const following = db.prepare('SELECT ordinal FROM timeline_segments WHERE timeline_id=? AND ordinal>? ORDER BY ordinal DESC').all(a.timeline_id, a.ordinal) as Array<{ ordinal: number }>
+      const shift = db.prepare('UPDATE timeline_segments SET ordinal=? WHERE timeline_id=? AND ordinal=?')
+      for (const row of following) shift.run(ORDINAL_PARKING - row.ordinal, a.timeline_id, row.ordinal)
+      for (const row of following) shift.run(row.ordinal - 1, a.timeline_id, ORDINAL_PARKING - row.ordinal)
+    })
+    await this.manifest(committed.project_id)
     return this.timeline(a.timeline_id)
   }
 
@@ -2910,14 +3085,13 @@ export class VideoWorkspace {
    * `WHERE ordinal = ?` that moves them, renumbering it twice.
    */
   async reorderSegment(a: { timeline_id: string, base_revision: number, from: number, to: number }): Promise<Data> {
-    const timeline = await this.assertRevision(a.timeline_id, a.base_revision)
-    const db = await this.open()
-    const rows = db.prepare('SELECT ordinal, asset_id, start_us, end_us, speed, muted FROM timeline_segments WHERE timeline_id=? ORDER BY ordinal').all(a.timeline_id) as Data[]
-    if (!Number.isInteger(a.from) || a.from < 0 || a.from >= rows.length) throw new Error(`没有第 ${a.from} 段：这条时间线共 ${rows.length} 段`)
-    const to = Math.max(0, Math.min(rows.length - 1, a.to))
-    const moved = rows.splice(a.from, 1)[0]
-    if (moved === undefined) throw new Error(`没有第 ${a.from} 段`)
-    rows.splice(to, 0, moved)
+    const committed = await this.mutateTimeline(a.timeline_id, a.base_revision, db => {
+      const rows = db.prepare('SELECT ordinal, asset_id, start_us, end_us, speed, muted FROM timeline_segments WHERE timeline_id=? ORDER BY ordinal').all(a.timeline_id) as Data[]
+      if (!Number.isInteger(a.from) || a.from < 0 || a.from >= rows.length) throw new Error(`没有第 ${a.from} 段：这条时间线共 ${rows.length} 段`)
+      const to = Math.max(0, Math.min(rows.length - 1, a.to))
+      const moved = rows.splice(a.from, 1)[0]
+      if (moved === undefined) throw new Error(`没有第 ${a.from} 段`)
+      rows.splice(to, 0, moved)
     // `rows` is now the order the clips should have, but each row still carries the
     // ordinal it was read with, and `ordinal` is the slot a clip occupies rather than a
     // label attached to it. Parking therefore has to move each row out of the slot it
@@ -2925,20 +3099,15 @@ export class VideoWorkspace {
     // `rows` — while placing writes the index. Both directions run high-to-low so every
     // `WHERE ordinal = ?` still finds a row that no earlier step has already moved, and
     // the parking slots are negative so they never collide with a real position.
-    const shift = db.prepare('UPDATE timeline_segments SET ordinal=? WHERE timeline_id=? AND ordinal=?')
-    for (let index = rows.length - 1; index >= 0; index--) {
-      const row = rows[index]
-      if (row === undefined) continue
-      shift.run(ORDINAL_PARKING - index, a.timeline_id, Number(row.ordinal))
-    }
-    for (let index = rows.length - 1; index >= 0; index--) {
-      const row = rows[index]
-      if (row === undefined) continue
-      shift.run(ORDINAL_PARKING - index, a.timeline_id, Number(row.ordinal))
-    }
-    for (let index = rows.length - 1; index >= 0; index--) shift.run(index, a.timeline_id, ORDINAL_PARKING - index)
-    this.refreshTimeline(a.timeline_id, a.base_revision + 1)
-    await this.manifest(timeline.project_id)
+      const shift = db.prepare('UPDATE timeline_segments SET ordinal=? WHERE timeline_id=? AND ordinal=?')
+      for (let index = rows.length - 1; index >= 0; index--) {
+        const row = rows[index]
+        if (row === undefined) continue
+        shift.run(ORDINAL_PARKING - index, a.timeline_id, Number(row.ordinal))
+      }
+      for (let index = rows.length - 1; index >= 0; index--) shift.run(index, a.timeline_id, ORDINAL_PARKING - index)
+    })
+    await this.manifest(committed.project_id)
     return this.timeline(a.timeline_id)
   }
 
@@ -2949,29 +3118,30 @@ export class VideoWorkspace {
    * guessing wrong silently changes what the clip opens on.
    */
   async trimSegment(a: { timeline_id: string, base_revision: number, ordinal: number, edge: 'start' | 'end', delta_us: number }): Promise<Data> {
-    const timeline = await this.assertRevision(a.timeline_id, a.base_revision)
     const db = await this.open()
     const row = db.prepare('SELECT asset_id, start_us, end_us FROM timeline_segments WHERE timeline_id=? AND ordinal=?').get(a.timeline_id, a.ordinal) as { asset_id: string, start_us: number, end_us: number } | undefined
     if (row === undefined) throw new Error(`没有第 ${a.ordinal} 段`)
     const start = a.edge === 'start' ? row.start_us + a.delta_us : row.start_us
     const end = a.edge === 'end' ? row.end_us - a.delta_us : row.end_us
     await this.assertRange(row.asset_id, start, end)
-    db.prepare('UPDATE timeline_segments SET start_us=?, end_us=? WHERE timeline_id=? AND ordinal=?').run(start, end, a.timeline_id, a.ordinal)
-    this.refreshTimeline(a.timeline_id, a.base_revision + 1)
-    await this.manifest(timeline.project_id)
+    const committed = await this.mutateTimeline(a.timeline_id, a.base_revision, transaction => {
+      const latest = transaction.prepare('SELECT asset_id, start_us, end_us FROM timeline_segments WHERE timeline_id=? AND ordinal=?').get(a.timeline_id, a.ordinal) as { asset_id: string, start_us: number, end_us: number } | undefined
+      if (latest === undefined || latest.asset_id !== row.asset_id || latest.start_us !== row.start_us || latest.end_us !== row.end_us) throw new Error('revision conflict: 片段已被修改，请重新读取时间线后再改。')
+      transaction.prepare('UPDATE timeline_segments SET start_us=?, end_us=? WHERE timeline_id=? AND ordinal=?').run(start, end, a.timeline_id, a.ordinal)
+    })
+    await this.manifest(committed.project_id)
     return this.timeline(a.timeline_id)
   }
 
   /** Change one clip's playback speed or mute it, leaving its source range alone. */
   async adjustSegment(a: { timeline_id: string, base_revision: number, ordinal: number, speed?: number, muted?: boolean }): Promise<Data> {
-    const timeline = await this.assertRevision(a.timeline_id, a.base_revision)
     if (a.speed !== undefined && !(a.speed > 0)) throw new Error(`speed 必须大于 0，收到 ${a.speed}`)
-    const db = await this.open()
-    const row = db.prepare('SELECT speed, muted FROM timeline_segments WHERE timeline_id=? AND ordinal=?').get(a.timeline_id, a.ordinal) as { speed: number, muted: number } | undefined
-    if (row === undefined) throw new Error(`没有第 ${a.ordinal} 段`)
-    db.prepare('UPDATE timeline_segments SET speed=?, muted=? WHERE timeline_id=? AND ordinal=?').run(a.speed ?? row.speed, (a.muted === undefined ? row.muted === 1 : a.muted) ? 1 : 0, a.timeline_id, a.ordinal)
-    this.refreshTimeline(a.timeline_id, a.base_revision + 1)
-    await this.manifest(timeline.project_id)
+    const committed = await this.mutateTimeline(a.timeline_id, a.base_revision, db => {
+      const row = db.prepare('SELECT speed, muted FROM timeline_segments WHERE timeline_id=? AND ordinal=?').get(a.timeline_id, a.ordinal) as { speed: number, muted: number } | undefined
+      if (row === undefined) throw new Error(`没有第 ${a.ordinal} 段`)
+      db.prepare('UPDATE timeline_segments SET speed=?, muted=? WHERE timeline_id=? AND ordinal=?').run(a.speed ?? row.speed, (a.muted === undefined ? row.muted === 1 : a.muted) ? 1 : 0, a.timeline_id, a.ordinal)
+    })
+    await this.manifest(committed.project_id)
     return this.timeline(a.timeline_id)
   }
 
@@ -2982,20 +3152,19 @@ export class VideoWorkspace {
    * timing evidence, for instance — and applying it clip by clip would bump the revision
    * once per clip and leave a half-applied edit readable in between.
    */
-  async setSegments(a: { timeline_id: string, base_revision: number, clips: Array<{ asset_id: string, start_us: number, end_us: number, speed?: number, muted?: boolean }> }): Promise<Data> {
+  async setSegments(a: { timeline_id: string, base_revision: number, clips: Array<{ clip_id?: string, asset_id: string, start_us: number, end_us: number, speed?: number, muted?: boolean, name?: string | null }> }): Promise<Data> {
     const timeline = await this.assertRevision(a.timeline_id, a.base_revision)
-    if (a.clips.length === 0) throw new Error('片段列表不能为空：时间线至少要有一段。')
     for (const clip of a.clips) {
       await this.assertRange(clip.asset_id, clip.start_us, clip.end_us)
       await this.assertAssetInProject(timeline.project_id, clip.asset_id)
       if (clip.speed !== undefined && !(clip.speed > 0)) throw new Error(`speed 必须大于 0，收到 ${clip.speed}`)
     }
-    const db = await this.open()
-    db.prepare('DELETE FROM timeline_segments WHERE timeline_id=?').run(a.timeline_id)
-    const insert = db.prepare('INSERT INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted) VALUES (?,?,?,?,?,?,?)')
-    a.clips.forEach((clip, index) => insert.run(a.timeline_id, index, clip.asset_id, clip.start_us, clip.end_us, clip.speed ?? 1, clip.muted === true ? 1 : 0))
-    this.refreshTimeline(a.timeline_id, a.base_revision + 1)
-    await this.manifest(timeline.project_id)
+    const committed = await this.mutateTimeline(a.timeline_id, a.base_revision, db => {
+      db.prepare('DELETE FROM timeline_segments WHERE timeline_id=?').run(a.timeline_id)
+      const insert = db.prepare('INSERT INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted,name,clip_id) VALUES (?,?,?,?,?,?,?,?,?)')
+      a.clips.forEach((clip, index) => insert.run(a.timeline_id, index, clip.asset_id, clip.start_us, clip.end_us, clip.speed ?? 1, clip.muted === true ? 1 : 0, clip.name?.trim() === '' ? null : clip.name ?? null, clip.clip_id ?? `clip-${randomUUID()}`))
+    })
+    await this.manifest(committed.project_id)
     return this.timeline(a.timeline_id)
   }
   /**
@@ -3022,14 +3191,18 @@ export class VideoWorkspace {
    * neighbour was copied keeps the join honest by matching the copy path's codec
    * parameters; the two cannot be mixed, so the decision is made once for the export.
    */
-  async render(timelineId: string, filename: string | undefined, signal: AbortSignal, options: { aspect?: 'keep' | '16:9' | '9:16' | '1:1', focus?: 'left' | 'center' | 'right', burnSubtitles?: 'transcript' | 'screen-text', subtitleStyle?: SubtitleStyleInput } = {}): Promise<Data> {
-    const timeline = await this.timeline(timelineId) as { project_id: string, segments: Array<{ asset_id: string, start_us: number, end_us: number, speed: number, muted: number }> }
+  async render(timelineId: string, filename: string | undefined, signal: AbortSignal, options: { aspect?: 'keep' | '16:9' | '9:16' | '1:1', focus?: 'left' | 'center' | 'right', burnSubtitles?: 'transcript' | 'screen-text', subtitleStyle?: SubtitleStyleInput } = {}, queuedJobId?: string, frozen?: { project_id: string, segments: Array<{ asset_id: string, start_us: number, end_us: number, speed: number, muted: number }> }): Promise<Data> {
+    const timeline = frozen ?? await this.timeline(timelineId) as { project_id: string, segments: Array<{ asset_id: string, start_us: number, end_us: number, speed: number, muted: number }> }
     const clips = timeline.segments
     if (clips.length === 0) throw new Error(`时间线 ${timelineId} 没有任何片段，无法导出。`)
     const name = this.safeFilename(filename ?? `${timelineId}.mp4`)
-    const id = `job-${randomUUID()}`
+    const id = queuedJobId ?? `job-${randomUUID()}`
     const db = await this.open()
-    db.prepare('INSERT INTO jobs (id,timeline_id,status,output,detail) VALUES (?,?,?,?,?)').run(id, timelineId, 'running', `oss://${this.config.ossOutputPrefix}/${id}`, '')
+    if (queuedJobId === undefined) {
+      db.prepare('INSERT INTO jobs (id,timeline_id,status,output,detail) VALUES (?,?,?,?,?)').run(id, timelineId, 'running', `oss://${this.config.ossOutputPrefix}/${id}`, '')
+    } else {
+      db.prepare('UPDATE jobs SET status=?, output=?, detail=?, started_at=? WHERE id=?').run('running', `oss://${this.config.ossOutputPrefix}/${id}`, '', Date.now(), id)
+    }
     this.stages.reset()
     const work = join(this.config.dataDir, 'tmp', `${id}`)
     await mkdir(work, { recursive: true })
@@ -3244,7 +3417,7 @@ export class VideoWorkspace {
       notes.push(loudnessNote)
       if (needsFrame) notes.push(`已按 ${aspect} 重构图（保留${focus === 'left' ? '左' : focus === 'right' ? '右' : '中'}侧），不是直接裁切`)
       else notes.push('画幅保持原样')
-      db.prepare('UPDATE jobs SET status=?,output=?,detail=? WHERE id=?').run('completed', `oss://${key}`, `${note}｜${loudnessNote}`, id)
+      db.prepare('UPDATE jobs SET status=?,output=?,detail=?,finished_at=? WHERE id=?').run('completed', `oss://${key}`, `${note}｜${loudnessNote}`, Date.now(), id)
       await this.manifest(timeline.project_id)
       return { id, status: 'completed', output: `oss://${key}`, oss_key: key, oss_url, segment_count: clips.length, duration_us: Math.round(totalUs), duration_seconds: round2(totalUs / 1e6), reencoded: accurate, keyframe_gap_seconds: Number(worstGap.toFixed(3)), aspect, focus, loudness_matched: matchLoudness && acousticPayload !== undefined, loudness_target_dbfs: targetDbfs, segment_gains_db: gains.map(gain => round2(gain)), note, notes, stages: this.stages.snapshot() }
     } catch (error) {
@@ -3252,14 +3425,54 @@ export class VideoWorkspace {
       // 而「在哪一步失败」才是能据以行动的信息 —— 下载失败与烧录失败要采取的动作完全不同。
       const stages = this.stages.snapshot()
       const failedStage = [...stages].reverse().find(entry => entry.outcome === 'failed')
-      db.prepare('UPDATE jobs SET status=?,detail=? WHERE id=?').run('failed', JSON.stringify({
-        error: error instanceof Error ? error.message : String(error),
-        failed_stage: failedStage?.stage ?? null,
-        stages,
-      }), id)
+      const cancelled = signal.aborted
+      db.prepare('UPDATE jobs SET status=?,detail=?,finished_at=? WHERE id=?').run(cancelled ? 'cancelled' : 'failed', cancelled
+        ? '导出已取消。'
+        : JSON.stringify({
+            error: error instanceof Error ? error.message : String(error),
+            failed_stage: failedStage?.stage ?? null,
+            stages,
+          }), Date.now(), id)
       await this.manifest(timeline.project_id).catch(() => undefined)
       throw error
     } finally { await rm(work, { recursive: true, force: true }); await Promise.all(cleanup.map(fn => fn())) }
+  }
+
+  /**
+   * Persist and schedule an export without holding an HTTP request open for FFmpeg.
+   *
+   * The returned id is durable immediately. Execution remains intentionally single-file for this
+   * first queue implementation; a later process supervisor can resume `queued` rows after restart
+   * without changing the browser contract.
+   */
+  async submitRender(timelineId: string, filename: string | undefined, options: { aspect?: 'keep' | '16:9' | '9:16' | '1:1', focus?: 'left' | 'center' | 'right', burnSubtitles?: 'transcript' | 'screen-text', subtitleStyle?: SubtitleStyleInput } = {}): Promise<Data> {
+    const timeline = await this.timeline(timelineId) as { project_id: string, revision: number, segments: Array<{ asset_id: string, start_us: number, end_us: number, speed: number, muted: number }> }
+    if (timeline.segments.length === 0) throw new Error(`时间线 ${timelineId} 没有任何片段，无法导出。`)
+    const id = `job-${randomUUID()}`
+    const db = await this.open()
+    const snapshot = { project_id: timeline.project_id, segments: timeline.segments }
+    db.prepare('INSERT INTO jobs (id,timeline_id,status,output,detail,input_snapshot,timeline_revision,filename,render_options) VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(id, timelineId, 'queued', null, '', JSON.stringify(snapshot), timeline.revision, filename ?? null, JSON.stringify(options))
+    const queuedOptions = { ...options }
+    this.enqueueRender(id, timelineId, filename, queuedOptions, snapshot)
+    return { id, job_id: id, timeline_id: timelineId, timeline_revision: timeline.revision, status: 'queued' }
+  }
+
+  /** Cancel a queued or running export owned by a project.  The immutable snapshot remains for diagnosis/retry. */
+  async cancelRender(projectId: string, jobId: string): Promise<Data> {
+    const db = await this.open()
+    const job = db.prepare('SELECT j.id, j.status FROM jobs j JOIN timelines t ON t.id=j.timeline_id WHERE j.id=? AND t.project_id=?').get(jobId, projectId) as { id: string, status: string } | undefined
+    if (job === undefined) throw new Error(`找不到导出任务 ${jobId}`)
+    if (job.status === 'queued') {
+      db.prepare('UPDATE jobs SET status=?, detail=?, cancel_requested_at=?, finished_at=? WHERE id=?').run('cancelled', '导出已在排队时取消。', Date.now(), Date.now(), jobId)
+      return { job_id: jobId, status: 'cancelled' }
+    }
+    if (job.status === 'running' || job.status === 'cancelling') {
+      db.prepare('UPDATE jobs SET status=?, cancel_requested_at=? WHERE id=?').run('cancelling', Date.now(), jobId)
+      this.activeRenders.get(jobId)?.abort()
+      return { job_id: jobId, status: 'cancelling' }
+    }
+    return { job_id: jobId, status: job.status, note: '该导出已经结束，不能再取消。' }
   }
 
   /**
@@ -4875,7 +5088,7 @@ export class VideoWorkspace {
   private async syncStatus(projectId: string): Promise<Data> { const row = (await this.open()).prepare('SELECT status,error,attempts,updated_at FROM project_sync WHERE project_id=?').get(projectId) as { status: string, error: string | null, attempts: number, updated_at: number } | undefined; return row === undefined ? { status: 'synced' } : { status: row.status, error: row.error, attempts: row.attempts, updated_at: row.updated_at } }
   private async retryPendingManifests(): Promise<void> { const rows = (await this.open()).prepare("SELECT project_id FROM project_sync WHERE status='pending'").all() as Array<{ project_id: string }>; for (const row of rows) await this.manifest(row.project_id) }
 
-  private async uploadManifest(projectId: string): Promise<void> { const db = await this.open(); const project = db.prepare('SELECT * FROM projects WHERE id=?').get(projectId) as Data | undefined; if (!project) return; const assets = db.prepare('SELECT * FROM assets WHERE project_id=?').all(projectId); const timelines = db.prepare('SELECT * FROM timelines WHERE project_id=?').all(projectId); const jobs = db.prepare('SELECT j.* FROM jobs j JOIN timelines t ON t.id=j.timeline_id WHERE t.project_id=?').all(projectId); const analyses = db.prepare('SELECT a.id asset_id,an.instruction,an.data,an.created_at FROM assets a JOIN analyses an ON an.asset_id=a.id WHERE a.project_id=?').all(projectId); const evidence = db.prepare('SELECT e.* FROM evidence e JOIN assets a ON a.id=e.asset_id WHERE a.project_id=?').all(projectId); const chunks = db.prepare('SELECT c.* FROM model_chunks c JOIN assets a ON a.id=c.asset_id WHERE a.project_id=?').all(projectId); const segments = db.prepare('SELECT s.timeline_id, s.ordinal, s.asset_id, s.start_us, s.end_us, s.speed, s.muted FROM timeline_segments s JOIN timelines t ON t.id=s.timeline_id WHERE t.project_id=? ORDER BY s.timeline_id, s.ordinal').all(projectId); const proposals = db.prepare('SELECT * FROM proposals WHERE project_id=?').all(projectId); const prefix = this.config.ossProjectPrefix.replace(/\/$/,''); const key = `${prefix}/${projectId}/manifest.json`; await this.uploadBytes(Buffer.from(JSON.stringify({ version: 6, project, assets, timelines, jobs, analyses, evidence, chunks, segments, proposals }, null, 2)), key, 'application/json', '同步项目 manifest'); const ids = (db.prepare('SELECT id FROM projects ORDER BY id').all() as Array<{ id: string }>).map(row => row.id); await this.uploadBytes(Buffer.from(JSON.stringify({ version: 6, projects: ids }, null, 2)), `${prefix}/index.json`, 'application/json', '同步项目索引') }
+  private async uploadManifest(projectId: string): Promise<void> { const db = await this.open(); const project = db.prepare('SELECT * FROM projects WHERE id=?').get(projectId) as Data | undefined; if (!project) return; const assets = db.prepare('SELECT * FROM assets WHERE project_id=?').all(projectId); const timelines = db.prepare('SELECT * FROM timelines WHERE project_id=?').all(projectId); const jobs = db.prepare('SELECT j.* FROM jobs j JOIN timelines t ON t.id=j.timeline_id WHERE t.project_id=?').all(projectId); const analyses = db.prepare('SELECT a.id asset_id,an.instruction,an.data,an.created_at FROM assets a JOIN analyses an ON an.asset_id=a.id WHERE a.project_id=?').all(projectId); const evidence = db.prepare('SELECT e.* FROM evidence e JOIN assets a ON a.id=e.asset_id WHERE a.project_id=?').all(projectId); const chunks = db.prepare('SELECT c.* FROM model_chunks c JOIN assets a ON a.id=c.asset_id WHERE a.project_id=?').all(projectId); const segments = db.prepare('SELECT s.timeline_id, s.ordinal, s.clip_id, s.asset_id, s.start_us, s.end_us, s.speed, s.muted, s.name FROM timeline_segments s JOIN timelines t ON t.id=s.timeline_id WHERE t.project_id=? ORDER BY s.timeline_id, s.ordinal').all(projectId); const proposals = db.prepare('SELECT * FROM proposals WHERE project_id=?').all(projectId); const prefix = this.config.ossProjectPrefix.replace(/\/$/,''); const key = `${prefix}/${projectId}/manifest.json`; await this.uploadBytes(Buffer.from(JSON.stringify({ version: 7, project, assets, timelines, jobs, analyses, evidence, chunks, segments, proposals }, null, 2)), key, 'application/json', '同步项目 manifest'); const ids = (db.prepare('SELECT id FROM projects ORDER BY id').all() as Array<{ id: string }>).map(row => row.id); await this.uploadBytes(Buffer.from(JSON.stringify({ version: 7, projects: ids }, null, 2)), `${prefix}/index.json`, 'application/json', '同步项目索引') }
   /**
    * Rebuild the local index from the OSS manifest, which owns the data.
    *
@@ -4904,7 +5117,7 @@ export class VideoWorkspace {
           analyses?: Array<{ asset_id: string, instruction?: string, data: string, created_at?: number }>
           evidence?: Array<{ asset_id: string, kind: string, duration_us: number, payload: string, provider: string, provider_version: string, created_at: number }>
           chunks?: Array<{ asset_id: string, operation: string, input_key: string, start_us: number, end_us: number, status: string, payload?: string | null, error?: string | null, updated_at: number }>
-          segments?: Array<{ timeline_id: string, ordinal: number, asset_id: string, start_us: number, end_us: number, speed: number, muted: number }>
+          segments?: Array<{ timeline_id: string, ordinal: number, clip_id?: string, asset_id: string, start_us: number, end_us: number, speed: number, muted: number, name?: string | null }>
           proposals?: Array<{ id: string, project_id: string, timeline_id: string | null, status: string, revision: number, items: string, notes: string | null, created_at: number, updated_at: number }>
         }
         db.prepare('INSERT OR IGNORE INTO projects (id,name) VALUES (?,?)').run(manifest.project.id, manifest.project.name)
@@ -4942,7 +5155,7 @@ export class VideoWorkspace {
         }
         for (const row of manifest.segments ?? []) {
           if (!db.prepare('SELECT 1 FROM timelines WHERE id=?').get(row.timeline_id)) { skipped++; continue }
-          db.prepare('INSERT OR IGNORE INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted) VALUES (?,?,?,?,?,?,?)').run(row.timeline_id, row.ordinal, row.asset_id, row.start_us, row.end_us, row.speed, row.muted)
+          db.prepare('INSERT OR IGNORE INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted,name,clip_id) VALUES (?,?,?,?,?,?,?,?,?)').run(row.timeline_id, row.ordinal, row.asset_id, row.start_us, row.end_us, row.speed, row.muted, row.name ?? null, typeof row.clip_id === 'string' ? row.clip_id : `clip-${randomUUID()}`)
         }
         for (const row of manifest.proposals ?? []) {
           // 方案是未确认的计划，必须一起恢复：丢了它用户就没法回头确认自己看过的方案。
