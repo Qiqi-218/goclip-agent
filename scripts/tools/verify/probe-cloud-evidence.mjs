@@ -277,7 +277,13 @@ const ocrHit = await vw2.findSpans('pc', 'ac', { text: '危险行为请勿模仿
     ocrHit.match_count === 1 && hit !== undefined
     && hit.start_us >= 4_000_000 && hit.end_us <= 8_000_000
     && !String(hit.text).includes('bilibili'),
-    `命中 ${ocrHit.match_count} 段 @${(hit?.start_us ?? 0) / 1e6}-${(hit?.end_us ?? 0) / 1e6}s  text=${JSON.stringify(String(hit?.text ?? '').slice(0, 24))}`)
+    /*
+     * 失败时把**每一段**的区间都打出来，而不是只打第一段。这条断言红过若干次，而它当时的输出
+     * 只有第一段的区间，看不出第二段与它是什么关系 —— 于是分不清「抖动把同一句话切成两段」
+     * （该在产品侧放宽合并）与「这句话本来就出现了两次」（该改断言）。诊断信息不足会让同一个
+     * 问题反复出现而每次都要重新猜。
+     */
+    `命中 ${ocrHit.match_count} 段 [${ocrHit.matches.map(m => `${(m.start_us / 1e6).toFixed(2)}-${(m.end_us / 1e6).toFixed(2)}`).join(' ')}]  text=${JSON.stringify(String(hit?.text ?? '').slice(0, 24))}`)
 }
 
 const visualHit = await vw2.findSpans('pc', 'ac', { text: '同心圆靶子', limit: 5 })

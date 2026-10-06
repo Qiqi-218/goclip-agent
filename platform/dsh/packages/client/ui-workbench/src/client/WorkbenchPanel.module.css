@@ -191,7 +191,8 @@
 .rangeButton:focus-visible,
 .rangeAction:focus-visible {
   background: var(--dsw-alias-bg-layer-2);
-  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-color: var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-width: var(--dsw-focus-ring-width);
   outline-offset: 1px;
 }
 
@@ -267,6 +268,9 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* 这一段会滚动，而同表里存在抬高表面（`bg-layer-2` 的行与控件），所以按滚动条皮肤重绑缩略对。 */
+  --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-bg-l2);
+  --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-hover-l2);
 }
 
 .exportControls {
@@ -338,7 +342,8 @@
 }
 
 .clipRowSelected:focus-visible {
-  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-color: var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-width: var(--dsw-focus-ring-width);
   outline-offset: -2px;
 }
 

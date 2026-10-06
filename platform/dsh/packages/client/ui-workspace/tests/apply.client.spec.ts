@@ -10,7 +10,19 @@ import { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type { StoredEntry } from '@deepseek-ai/dsh-client-ui-slots'
 import { RemoteError, TestRemote } from '@deepseek-ai/dsh-client-test-runtime'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
-import { apply, inject } from '@deepseek-ai/dsh-client-ui-workspace/client'
+/*
+ * The values under test come from the browser entry by **relative source path**, the same specifier
+ * the Loader resolves, so the plugin body and this spec share one module instance.
+ *
+ * Loading them from the package subpath instead (`@deepseek-ai/dsh-client-ui-workspace/client`)
+ * produced a *second* instance of `src/client/index.ts`: Vite keys the alias-resolved id and the
+ * relative id separately, so the plugin registered its own `WorkspaceBrowser` and
+ * `menuOpenStateFactory` while this file compared against the other copy. Both are the same source,
+ * so the mismatch showed up only through identity assertions — `toBe` on a component and `toEqual` on
+ * a spec carrying `menuOpenState: menuOpenStateFactory`. The declarations stay imported from the
+ * subpath, because types are erased and carry no runtime identity.
+ */
+import { apply, inject } from '../src/client/index.ts'
 import type { WorkspaceBrowserInjected, WorkspacePickerInjected } from '@deepseek-ai/dsh-client-ui-workspace/client'
 import {
   type ArchiveSessionInjected, type ForkSessionInjected, menuOpenStateFactory, type PinSessionInjected,

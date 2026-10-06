@@ -4,6 +4,13 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
+/*
+ * `tool.call.toolview` is owned by `ui-tool`, so the seat's declaration comes from its contract rather
+ * than from a second local `SlotMap` entry: two ambient declarations merge silently and the catalog
+ * gate then cannot tell which package documents the seat. This type-only import is how the other
+ * packages registering into that seat obtain it, and it is erased at build.
+ */
+import type {} from '@deepseek-ai/dsh-client-ui-tool/client'
 import { WorkbenchDrawer, WorkbenchLauncher } from './WorkbenchDrawer.tsx'
 import { WorkbenchOpenToolView } from './WorkbenchOpenToolView.tsx'
 import { createWorkbenchController } from './workbench-source.ts'
@@ -14,11 +21,16 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
     /** The workbench's project, asset, and editor copy. */
     workbench: WorkbenchKey
   }
-  // Keep this optional enhancement independently buildable: the real ui-tool package
-  // owns the richer contract at runtime, while this local shape only needs a keyed seat.
-  interface SlotMap {
-    'tool.call.toolview': { kind: 'keyed', scope: 'session', owner: { callId: string, phase: 'preparing' | 'start' | 'result', block: { isError?: boolean, call?: { argsRaw: string } | null } }, hookContext: unknown, inject: {} }
-  }
+  /*
+   * `tool.call.toolview` is deliberately **not** redeclared here.
+   *
+   * `ui-tool` owns that slot's contract, and it declares the same name in its own registration's
+   * children table. A second ambient declaration is not additive: `SlotMap` is an interface, so the
+   * two declarations merge silently, and `scripts/gen-client-catalog.ts` then refuses the catalogue —
+   * it cannot tell which package's documentation describes the seat. Registering into a slot this
+   * package does not own is exactly what `ctx.slots.inject` is for, and that is what the
+   * registration below does.
+   */
 }
 
 declare module '@deepseek-ai/cordis' {

@@ -86,6 +86,9 @@ export const zh = {
   'timeline.scroll': '沿时间轴水平滑动（拖动滑块、点击轨道，或用方向键）',
   'timeline.saving': '正在保存编辑…',
   'timeline.saveFailed': '编辑未保存：{reason}。已重新读取当前时间线，请重试。',
+  'edit.conflict': '这条时间线刚刚有新修改，已刷新到最新版本。请基于当前内容再试一次。',
+  'edit.notSaved': '这次编辑没有保存。时间线已刷新，请再试一次；如果持续出现，请告诉助手你刚才执行的操作。',
+
   'export.heading': '导出成片',
   'export.button': '导出 MP4',
   'export.exporting': '正在导出…',
@@ -246,6 +249,9 @@ export const en = {
   'timeline.scroll': 'Scroll along the timeline (drag the thumb, click the track, or use the arrow keys)',
   'timeline.saving': 'Saving edit…',
   'timeline.saveFailed': 'Edit was not saved: {reason}. The current timeline has been reloaded; please try again.',
+  'edit.conflict': 'This timeline changed a moment ago and has been reloaded. Please try again on the current content.',
+  'edit.notSaved': 'The edit was not saved. The timeline has been reloaded; try again, and if it keeps happening tell the assistant what you did.',
+
   'export.heading': 'Export film',
   'export.button': 'Export MP4',
   'export.exporting': 'Exporting…',

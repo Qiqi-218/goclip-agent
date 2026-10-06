@@ -97,8 +97,8 @@ const { DatabaseSync } = await import('node:sqlite')
   }), Date.now())
   db.prepare('INSERT INTO timelines (id,name,project_id,asset_id,start_us,end_us,revision) VALUES (?,?,?,?,?,?,?)').run('t1', null, 'p1', 'a1', 0, 2000000, 1)
   db.prepare('INSERT INTO timelines (id,name,project_id,asset_id,start_us,end_us,revision) VALUES (?,?,?,?,?,?,?)').run('t2', null, 'p2', 'a2', 0, 1000000, 1)
-  db.prepare('INSERT INTO jobs VALUES (?,?,?,?,?)').run('j1', 't1', 'completed', 'oss://x', '')
-  db.prepare('INSERT INTO jobs VALUES (?,?,?,?,?)').run('j2', 't2', 'completed', 'oss://y', '')
+  db.prepare('INSERT INTO jobs (id,timeline_id,status,output,detail) VALUES (?,?,?,?,?)').run('j1', 't1', 'completed', 'oss://x', '')
+  db.prepare('INSERT INTO jobs (id,timeline_id,status,output,detail) VALUES (?,?,?,?,?)').run('j2', 't2', 'completed', 'oss://y', '')
   db.close()
 }
 

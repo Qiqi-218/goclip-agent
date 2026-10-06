@@ -62,9 +62,12 @@ raw.exec('PRAGMA foreign_keys=ON')
 }
 // 约束 2b：片段表是多段模型的另一半，同样不能存空区间
 {
+  // 片段表带 `timeline_id` 外键，所以要先有那条时间线 —— 否则失败的是外键，探针就测错了约束。
+  // `clip_id` 是 NOT NULL，也必须给：缺了它先撞的就不是这条 CHECK，探针会看起来「约束没生效」。
+  raw.prepare('INSERT INTO timelines (id,name,project_id,asset_id,start_us,end_us,revision) VALUES (?,?,?,?,?,?,?)').run('t1', null, 'p1', 'a1', 0, 2000000, 1)
   let threw = ''
   try {
-    raw.prepare('INSERT INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted) VALUES (?,?,?,?,?,?,?)').run('t1', 0, 'a1', 5000000, 5000000, 1.0, 0)
+    raw.prepare('INSERT INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted,clip_id) VALUES (?,?,?,?,?,?,?,?)').run('t1', 0, 'a1', 5000000, 5000000, 1.0, 0, 'c-zero')
   } catch (e) { threw = e.message }
   record('CHECK 拦住零长度片段', threw.includes('CHECK'), threw || '未拦住（插入成功）')
 }
@@ -72,7 +75,7 @@ raw.exec('PRAGMA foreign_keys=ON')
 {
   let threw = ''
   try {
-    raw.prepare('INSERT INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted) VALUES (?,?,?,?,?,?,?)').run('t1', 1, 'a1', 0, 1000000, 0, 0)
+    raw.prepare('INSERT INTO timeline_segments (timeline_id,ordinal,asset_id,start_us,end_us,speed,muted,clip_id) VALUES (?,?,?,?,?,?,?,?)').run('t1', 1, 'a1', 0, 1000000, 0, 0, 'c-slow')
   } catch (e) { threw = e.message }
   record('CHECK 拦住非正速度', threw.includes('CHECK'), threw || '未拦住（插入成功）')
 }
@@ -86,8 +89,12 @@ raw.exec('PRAGMA foreign_keys=ON')
 }
 // 约束 4：删项目要级联删掉它的素材与时间线
 {
-  raw.prepare('INSERT INTO timelines (id,name,project_id,asset_id,start_us,end_us,revision) VALUES (?,?,?,?,?,?,?)').run('t1', null, 'p1', 'a1', 0, 2000000, 1)
-  raw.prepare('INSERT INTO jobs VALUES (?,?,?,?,?)').run('j1', 't1', 'completed', 'oss://out', '')
+  /*
+   * 任务表列名显式写出：`jobs` 现在有 12 列（导出快照那批新增了 input_snapshot、timeline_revision、
+   * filename、render_options 与三个时间戳），位置式 5 值 INSERT 会直接被「列数不符」拒掉，
+   * 于是这一条测的是列数而不是级联。
+   */
+  raw.prepare('INSERT INTO jobs (id,timeline_id,status,output,detail) VALUES (?,?,?,?,?)').run('j1', 't1', 'completed', 'oss://out', '')
   raw.prepare('DELETE FROM projects WHERE id=?').run('p1')
   const leftAssets = raw.prepare('SELECT count(*) c FROM assets WHERE project_id=?').get('p1').c
   const leftTimelines = raw.prepare('SELECT count(*) c FROM timelines WHERE project_id=?').get('p1').c

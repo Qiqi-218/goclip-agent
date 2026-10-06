@@ -4310,6 +4310,14 @@ export const EVENT_API: readonly EventApiEntry[] = [
     parameters: [{ name: 'exec', description: 'the pending call (name, parsed arguments, caller agent).' }],
   },
   {
+    name: 'tools/progress',
+    mode: 'emit',
+    signature: '\'tools/progress\'(this: Scoped<ToolRuntime>, exec: Readonly<ToolExecution>, progress: JsonValue): undefined',
+    summary: 'Emit a non-durable progress update for a running tool call.',
+    description: 'Emit a non-durable progress update for a running tool call.\n\nNon-durable means it is not a session event: a listener that was not running when it fired cannot replay it, which is why anything that must survive a reload belongs on the call\'s result instead.',
+    parameters: [{ name: 'exec', description: 'the execution the update belongs to.' }, { name: 'progress', description: 'the lossless-JSON progress value; subscribers decide how to present it.' }],
+  },
+  {
     name: 'tools/ptc-dispatch-log',
     mode: 'waterfall',
     signature: '\'tools/ptc-dispatch-log\'(this: Scoped<ToolRuntime>, dispatch: PtcDispatchLog, next: () => Promise<ContentBlock[]>): Promise<ContentBlock[]>',
@@ -7687,7 +7695,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'ToolRunContext',
-    declaration: 'export interface ToolRunContext extends ToolExecution {\n    deferContext(context: UserMessage): void;\n    concludeTurn(): void;\n}',
+    declaration: 'export interface ToolRunContext extends ToolExecution {\n    progress(progress: JsonValue): void;\n    deferContext(context: UserMessage): void;\n    concludeTurn(): void;\n}',
   },
   {
     name: 'ToolRuntime',

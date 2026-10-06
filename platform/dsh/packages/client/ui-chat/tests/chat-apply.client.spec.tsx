@@ -126,8 +126,17 @@ describe('Chat apply wiring', () => {
     expect(resolveSlotLabel(views[0]?.options.label)).toBe('对话')
     expect(b.runtime.slots.spec('conversation.chat.node'))
       .toMatchObject({ kind: 'keyed', scope: 'session' })
-    expect(b.runtime.slots.entries('conversation.composer.dock').map(row => row.options.id))
-      .toEqual(['stats'])
+    /*
+     * Composer dock: nothing, deliberately.
+     *
+     * `18b97dcd "ui: show only context usage in composer"` deleted this package's only occupant of
+     * `conversation.composer.dock` — the session stats pills, seven lines of `slots.register` naming
+     * `id: 'stats'`. The dock itself is `ui-conversation`'s (`apply.ts` declares it, `InputBar.tsx`
+     * renders it), so it stays; `StatsPills` also stays, still rendered directly by its own specs.
+     * Asserting the empty list is the point: if a future change re-adds an occupant, this row is what
+     * says the composer's dock content changed on purpose.
+     */
+    expect(b.runtime.slots.entries('conversation.composer.dock')).toEqual([])
     expect(b.runtime.slots.entries('settings.general.item').map(row => row.options.id))
       .toEqual(['transcript-view', 'link-opening', 'composer-enter', 'performance-usage'])
     await b.runtime.dispose()
@@ -158,7 +167,7 @@ describe('Chat apply wiring', () => {
     expect(face.hooks.transcriptView.getSnapshot()).toBe('compact')
   })
 
-  it('shares the accepted performance preference with settings, composer, and turn tails', async () => {
+  it('shares the accepted performance preference with settings and turn tails', async () => {
     const b = await bench()
     const row = b.runtime.slots.entries('settings.general.item').find(entry => entry.options.id === 'performance-usage')!
     const face = (row.inject as unknown as () => PerformanceUsageRowInjected)()
@@ -167,8 +176,16 @@ describe('Chat apply wiring', () => {
     expect(b.chatSettings.set).toHaveBeenCalledWith('performanceUsage', 'compact')
     b.chatSettings.publish({ value: { linkOpening: 'sidebar', transcriptView: 'compact', performanceUsage: 'compact' } })
     expect(face.hooks.performanceUsage.getSnapshot()).toBe('compact')
+    /*
+     * Two readers of one observable, not three.
+     *
+     * The composer-dock pills used to be in this list, and held the same `performanceUsage` instance
+     * through their own `inject`. `18b97dcd` removed that registration, so the composer no longer
+     * reads the preference at all; the Settings row and the turn tail are what remain, and identity
+     * between them is still the property under test — an observable re-created per registration would
+     * make each row drift as soon as one of them published.
+     */
     for (const entry of [
-      b.runtime.slots.entries('conversation.composer.dock').find(entry => entry.options.id === 'stats')!,
       b.runtime.slots.entries('conversation.chat.node').find(entry => entry.options.key === 'turn-tail')!,
     ]) {
       const injected = (entry.inject as () => Pick<PerformanceUsageRowInjected, 'hooks'>)()

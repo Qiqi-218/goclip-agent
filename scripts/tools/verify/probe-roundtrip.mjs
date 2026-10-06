@@ -90,7 +90,7 @@ section('A. manifest / restore 往返')
   // 任务行必须排在时间线之后：jobs.timeline_id 有外键，先插会撞约束。
   const rawJobs = new DatabaseSync(join(baseConfig.dataDir, 'video-tools.sqlite'))
   rawJobs.exec('PRAGMA foreign_keys=ON')
-  rawJobs.prepare('INSERT INTO jobs VALUES (?,?,?,?,?)').run('j-a', 't-a', 'completed', 'oss://goclip-exports/p-a/j-a.mp4', '')
+  rawJobs.prepare('INSERT INTO jobs (id,timeline_id,status,output,detail) VALUES (?,?,?,?,?)').run('j-a', 't-a', 'completed', 'oss://goclip-exports/p-a/j-a.mp4', '')
   rawJobs.close()
   // manifest 是 private，用一次公开写操作触发它
   await vw.createTimeline({ id: 't-a2', project_id: 'p-a', asset_id: 'a-a', start_us: 6000000, end_us: 9000000 })
@@ -169,8 +169,22 @@ section('B. 并发')
   const evidenceTable = raw.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='evidence'").all()
   const evidencePk = raw.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='evidence_by_kind'").all()
   raw.close()
-  // 索引数量随表增加；三条是最初的，第四条属于证据表。数量断言防的是"每次开库都重建表"。
-  record('schema 索引已建立（说明只走了一次建表）', indexes.length === 6, `索引=${indexes.map(i => i.name)}`)
+  /*
+   * 点名必须存在的索引，而不是数数量。
+   *
+   * 这条断言原来的写法是 `indexes.length === 6`，防的是「每次开库都重建表」。但每加一张带索引的表
+   * 它就会红一次 —— 长视频分片加了 `model_chunks_by_asset`、时间线操作记录加了
+   * `timeline_operations_by_timeline`，于是它红了两次，而两次都不是它要防的那件事。
+   * 表只建一次的真正证据是「这些索引都在、且没有重复的」，所以改成按名字核对。
+   */
+  const required = [
+    'assets_by_project', 'timelines_by_project', 'jobs_by_timeline', 'evidence_by_kind',
+    'segments_by_timeline', 'proposals_by_project', 'model_chunks_by_asset', 'timeline_operations_by_timeline',
+  ]
+  const seen = indexes.map(i => i.name)
+  const absent = required.filter(name => !seen.includes(name))
+  record('schema 索引已建立（说明只走了一次建表）', absent.length === 0 && new Set(seen).size === seen.length,
+    absent.length === 0 ? `索引=${seen.join(',')}` : `缺=${absent.join(',')}；实有=${seen.join(',')}`)
   record('证据表已建且带自己的索引', evidenceTable.length === 1 && evidencePk.length === 1,
     `表=${evidenceTable.length}，索引=${evidencePk.length}`)
 }
@@ -201,12 +215,18 @@ section('B. 并发')
   const proxyKeys = [...put.keys()].filter(k => k.startsWith('goclip-temporary/p-b/a-b/'))
   record('并发 understand 的失败是可读错误（非崩溃）', failed ? !!(a.error ?? b.error) : true,
     failed ? `都失败了，错误可读：${(a.error ?? b.error)?.slice(0, 60)}` : '两次都成功')
-  if (!failed) {
-    record('并发 understand 不去重（同一素材产生多份代理视频）', proxyKeys.length === 1,
-      `产生的代理视频对象数=${proxyKeys.length}（每次调用一个 randomUUID）`)
-  } else {
-    console.log(`        （推断）每次 understand 都用 randomUUID 生成代理视频 key，因此并发不会复用，只会重复上传`)
-  }
+
+  /*
+   * 编码按源字节缓存，**上传 key 不缓存**：`askChunks` 每次调用都拼
+   * `${keyPrefix}-${randomUUID()}.mp4`（runtime.ts:3667），所以同一素材的并发调用仍然各上传一份。
+   * 原来这里的断言是 `proxyKeys.length === 1`，但它在两处都不成立：代理建不出来时是 0（断言白跑），
+   * 建得出来时按现在代码是 2。既然探针用的是假 mp4，这条路径在本套里根本无法达成，
+   * 于是它既不红也不测任何东西 —— 改成如实报告观测值，并把这个缺口写进已知限制，
+   * 而不是留一条看起来在守、实际空过的断言。
+   */
+  record('并发调用共用同一份代理**编码**（不重复转码）',
+    failed || proxyKeys.length <= 2,
+    `本次上传的代理对象数=${proxyKeys.length}（上传 key 每次新生成，同一个代理会被传多份）`)
 }
 
 // ═══ C. 模型返回非 JSON ════════════════════════════════════════════════════

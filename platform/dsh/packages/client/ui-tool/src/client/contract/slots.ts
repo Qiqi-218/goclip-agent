@@ -16,12 +16,12 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
     /**
      * Keyed Tool call view dispatched by wire Tool name. Any name is allowed,
      * including tools registered by your package. Register with
-     * `key: '<tool name>'`; a typo never renders.
+     * `key: '<tool name>'`; a typo never renders. Unclaimed keys use the generic
+     * row, and registering an occupied key replaces its view.
      *
-     * Registering an occupied key replaces its view; unclaimed keys use the
-     * generic row. The owner supplies the call identity and frozen running
-     * or settled node through explicit phase props. Preparing blocks have no dispatched
-     * arguments; useToolCallArgumentsPartial optionally subscribes to their raw prefix.
+     * The owner supplies the call identity and the frozen running or settled node
+     * through explicit phase props. A preparing block carries no complete
+     * arguments; `useToolCallArgumentsPartial` subscribes to their raw prefix.
      */
     'tool.call.toolview': {
       kind: 'keyed'
@@ -82,13 +82,12 @@ export interface ToolCallCommonProps {
   callId: string
   /** Wire Tool name and keyed dispatch value. */
   toolName: string
-  /** Session workspace root for relative summaries. */
+  /** Session workspace root for relative summaries; `home` is the Host account home, whose POSIX root displays as `~`. */
   cwd?: string | undefined
-  /** Host account home; POSIX home-rooted summaries display as `~`. */
   home?: string | undefined
   /** Open an argument path at its optional requested line. */
   openFile: (path: string, options?: OpenFileOptions) => void
-  /** Chat-supplied, session-authorized loader for durable images; Tool views do not manage attachment URLs. */
+  /** Chat-supplied, session-authorized loader for durable images; views never manage attachment URLs. */
   loadImage: MessageImageLoader
   /** Inspect this call in the trajectory view when available. */
   inspect?: (() => void) | undefined
