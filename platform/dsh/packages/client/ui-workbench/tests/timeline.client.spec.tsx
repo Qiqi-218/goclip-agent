@@ -118,6 +118,7 @@ function renderTimeline(overrides: Partial<Parameters<typeof Timeline>[0]> = {})
   const result = render(
     <Timeline
       assetDurationUs={ASSET_US}
+      axis="source"
       baseRevision={2}
       clips={CLIPS}
       evidence={null}

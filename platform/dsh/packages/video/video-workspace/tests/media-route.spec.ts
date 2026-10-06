@@ -230,6 +230,7 @@ describe('durable export snapshots', () => {
       await workspace.createTimeline({ id: 'timeline', project_id: 'project', asset_id: 'asset', start_us: 1_000_000, end_us: 20_000_000 })
 
       const submitted = await workspace.submitRender('timeline', 'travel-cut.mp4', { aspect: '9:16', burnSubtitles: 'transcript' })
+      if (typeof submitted.job_id !== 'string') throw new Error('submitRender did not return a job id')
       const row = db.prepare('SELECT timeline_revision, input_snapshot, filename, render_options FROM jobs WHERE id=?').get(submitted.job_id) as { timeline_revision: number, input_snapshot: string, filename: string, render_options: string }
       expect(row.timeline_revision).toBe(1)
       expect(JSON.parse(row.input_snapshot)).toMatchObject({ project_id: 'project', segments: [{ asset_id: 'asset', start_us: 1_000_000, end_us: 20_000_000 }] })
