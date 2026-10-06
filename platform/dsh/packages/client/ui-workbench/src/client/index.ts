@@ -1,8 +1,9 @@
 /** Workbench browser plugin: a project-aware drawer that leaves the conversation mounted. */
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
-import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type { SidebarRightTabDefinition } from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
+import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import { WorkbenchDrawer, WorkbenchLauncher } from './WorkbenchDrawer.tsx'
 import { WorkbenchOpenToolView } from './WorkbenchOpenToolView.tsx'
@@ -28,32 +29,40 @@ declare module '@deepseek-ai/cordis' {
 }
 
 const WORKBENCH_ID = 'workbench'
+const WORKBENCH_TAB_ID = '@deepseek-ai/dsh-client-ui-workbench/workbench'
+const WORKBENCH_TAB_KIND = 'video-workbench'
 
 /** Required client services: the slot registry and this package's dictionary. */
-export const inject = ['slots', 'locale', 'layout']
+export const inject = ['slots', 'locale', 'sidebarRight', 'sidebarRightTabs']
 
 /** Register the project-aware overlay and persistent sidebar launcher. */
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register('workbench', { zh, en }), 'ui-workbench: dictionaries')
   const t = ctx.locale.bind('workbench')
-  const workbench = createWorkbenchController()
+  const workbench = createWorkbenchController(() => { ctx.sidebarRight.openTab(WORKBENCH_TAB_KIND) })
   ctx.reflect.provide('workbench', workbench)
 
-  ctx.slots.inject('rightbar', () => ctx.slots.register({
-    name: 'rightbar',
-    locale: 'workbench',
+  ctx.effect(() => ctx.sidebarRightTabs.register({
+    id: WORKBENCH_TAB_ID,
+    kind: WORKBENCH_TAB_KIND,
+    priority: 'builtin',
+    title: () => t('entry'),
+  } satisfies SidebarRightTabDefinition), 'ui-workbench: sidebar tab type')
+
+  ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
+    name: 'sidebar.right.pane.tab', key: WORKBENCH_TAB_ID, locale: 'workbench',
     inject: () => ({
       t,
       hooks: workbench.hooks,
-      close: workbench.close,
+      close: () => {
+        const active = ctx.sidebarRight.active()
+        if (active?.kind === WORKBENCH_TAB_KIND) ctx.sidebarRight.close(active.id)
+        workbench.close()
+      },
       showProjectHome: workbench.showProjectHome,
       selectProject: workbench.selectProject,
       selectAsset: workbench.selectAsset,
       selectTimeline: workbench.selectTimeline,
-      syncPresentation: (shown: boolean) => {
-        if (shown) ctx.layout.openRightbar(true, false)
-        else ctx.layout.closeRightbar()
-      },
     }),
   }, WorkbenchDrawer))
 

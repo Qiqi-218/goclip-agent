@@ -18,9 +18,6 @@
       "path": "../ui-dockkit"
     },
     {
-      "path": "../ui-layout"
-    },
-    {
       "path": "../ui-primitives"
     },
     {
@@ -28,6 +25,9 @@
     },
     {
       "path": "../ui-sidebar"
+    },
+    {
+      "path": "../ui-sidebar-right"
     },
     {
       "path": "../ui-slots"

@@ -66,7 +66,7 @@ function publishHash(projectId: string | null, assetId: string | null, timelineI
 }
 
 /** Create the one live workbench controller for the browser root. */
-export function createWorkbenchController(): WorkbenchController {
+export function createWorkbenchController(onOpen?: () => void): WorkbenchController {
   const stored = readStoredContext()
   const address = readAddressContext()
   const initial = address.projectId !== null || address.assetId !== null ? address : stored
@@ -94,6 +94,7 @@ export function createWorkbenchController(): WorkbenchController {
       saveContext(state.projectId, state.assetId, state.timelineId)
       publishHash(state.projectId, state.assetId, state.timelineId)
       notify()
+      onOpen?.()
     },
     close: () => { if (state.open) { state = { ...state, open: false, expanded: false }; notify() } },
     expand: () => { if (!state.expanded) { state = { ...state, expanded: true }; notify() } },

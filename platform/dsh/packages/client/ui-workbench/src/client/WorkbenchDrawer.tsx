@@ -8,7 +8,6 @@ import type { WorkbenchController } from './workbench-source.ts'
 import css from './WorkbenchDrawer.module.css'
 
 type WorkbenchInjected = Pick<WorkbenchController, 'hooks' | 'close' | 'showProjectHome' | 'selectProject' | 'selectAsset' | 'selectTimeline'> & {
-  syncPresentation: (shown: boolean) => void
 }
 
 type DrawerProps = PropsLocale<'workbench'> & InjectFace<WorkbenchInjected>
@@ -48,7 +47,7 @@ export function WorkbenchLauncher({ wide, t, useState, open }: LauncherProps): R
 }
 
 /** The product-facing workbench surface: project home, asset browser, or editor. */
-export function WorkbenchDrawer({ t, useState, close, showProjectHome, selectProject, selectAsset, selectTimeline, syncPresentation }: DrawerProps): ReactNode {
+export function WorkbenchDrawer({ t, useState, close, showProjectHome, selectProject, selectAsset, selectTimeline }: DrawerProps): ReactNode {
   const state = useState(current => current)
   const [projects, setProjects] = useReactState<LoadState<ProjectSummary[]>>({ status: 'idle', value: emptyProjects })
   const [recentAssets, setRecentAssets] = useReactState<LoadState<AssetSummary[]>>({ status: 'idle', value: emptyAssets })
@@ -62,21 +61,13 @@ export function WorkbenchDrawer({ t, useState, close, showProjectHome, selectPro
   const useLayoutStore = <T,>(selector: (state: LayoutState) => T): T => useSyncExternalStore(layoutStore.subscribe, () => selector(layoutStore.getSnapshot()))
 
   useEffect(() => {
-    syncPresentation(state.open)
-  }, [state.open, syncPresentation])
-
-  useEffect(() => () => { syncPresentation(false) }, [syncPresentation])
-
-  useEffect(() => {
-    if (!state.open) return
     closeRef.current?.focus()
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') close() }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [close, state.open])
+  }, [close])
 
   useEffect(() => {
-    if (!state.open) return
     const controller = new AbortController()
     setProjects(current => ({ ...current, status: 'loading' }))
     setRecentAssets(current => ({ ...current, status: 'loading' }))
@@ -91,10 +82,10 @@ export function WorkbenchDrawer({ t, useState, close, showProjectHome, selectPro
       else setRecentAssets(current => ({ ...current, status: 'failed' }))
     })
     return () => controller.abort()
-  }, [state.open])
+  }, [])
 
   useEffect(() => {
-    if (!state.open || state.projectId === null) { setAssets({ status: 'idle', value: emptyAssets }); return }
+    if (state.projectId === null) { setAssets({ status: 'idle', value: emptyAssets }); return }
     const controller = new AbortController()
     setAssets(current => ({ ...current, status: 'loading' }))
     void readAssets(state.projectId, controller.signal).then(result => {
@@ -103,9 +94,7 @@ export function WorkbenchDrawer({ t, useState, close, showProjectHome, selectPro
       else setAssets(current => ({ ...current, status: 'failed' }))
     })
     return () => controller.abort()
-  }, [state.open, state.projectId])
-
-  if (!state.open) return null
+  }, [state.projectId])
 
   const activeProject = projects.value.find(project => project.id === state.projectId) ?? null
   const activeAsset = assets.value.find(asset => asset.id === state.assetId) ?? null

@@ -35,14 +35,17 @@ import type {} from './contract/slots.ts'
 import { GuideBody, type GuideInjected } from './tabs/guide/GuideBody.tsx'
 import { GuideTitle } from './tabs/guide/GuideTitle.tsx'
 import { ExpandButton } from './shell/ExpandButton.tsx'
+import { RightbarSeat, type SidebarRightInjected } from './shell/SidebarRight.tsx'
 import { closeWithPaneFocus, openWithPaneFocus } from './shell/close-focus.ts'
+import { RightbarRoot, type RightbarRootInjected } from './shell/RightbarRoot.tsx'
 import { SidebarSessionViews } from './session-views.ts'
 import { createSidebarRightController, type SidebarRightController } from './service.ts'
 import { SidebarRightTabRegistry } from './tab-registry.ts'
 import { createSidebarRightStore } from './stores.ts'
 import { en, zh } from './locales.ts'
 import { GUIDE_ID, guideDefinition } from './tabs/guide/definition.ts'
-import { guideTabInfoFactory } from './tab-info.ts'
+import { guideTabInfoFactory, tabInfoFactory } from './tab-info.ts'
+import type { TabId } from '@deepseek-ai/dsh-client-ui-dockkit'
 import { defaultSeed } from './contract/seed.ts'
 
 export type { SidebarRightTarget } from './focus.ts'
@@ -117,7 +120,7 @@ export function apply(ctx: ClientContext): void {
   // The automatic fullscreen rule as the seats last rendered it: the frame
   // hands them its width as owner props, and every seat reports the same rule.
   let autoFullscreen = false
-  const { controller, adopt, forget, show } = createSidebarRightController(
+  const { controller, adopt, forget, show, measure } = createSidebarRightController(
     tabs,
     (address, signal) => { ctx.resources.pin(address, signal) },
     {
@@ -182,11 +185,51 @@ export function apply(ctx: ClientContext): void {
         } }
       },
     }
+    const injected: Omit<SidebarRightInjected, 'keyedHooks' | 'occurrence' | 'closeTab' | 'measureRoom'> = {
+      syncPresentation({ shown, track, fullscreen }) {
+        if (shown) layout.openRightbar(track, fullscreen)
+        else layout.closeRightbar()
+      },
+      reportAutoFullscreen: (value) => { autoFullscreen = value },
+      splitPane: (paneId) => { controller.split(paneId) },
+      toggleFullscreen: () => { const target = controller.commandTarget(); if (target !== undefined) controller.toggleFullscreen(target) },
+      openTab: (kind, options) => { controller.openTab(kind, options) },
+      hooks: {
+        shortcuts: ctx.shortcuts.catalog,
+        tabTypes: { subscribe: listener => tabs.subscribe(listener), getSnapshot: () => tabs.entries() },
+      },
+    }
     const disposeTypes = [tabs.register(guideDefinition(t))]
-    // The workbench owns the root rightbar. Keep this plugin's service and tab
-    // registries alive for dependent features, but do not mount the legacy
-    // detail surface or its session seats.
-    const disposeSeat = (): void => {}
+    const disposeSeat = ctx.slots.inject('rightbar', function* () {
+      yield ctx.slots.register({
+        name: 'rightbar',
+        children: { 'rightbar.session': { kind: 'single', scope: 'session' } },
+        inject: (): RightbarRootInjected => ({
+          hooks: { views: views.source },
+          mountView: reference => views.mount(reference),
+        }),
+      }, RightbarRoot)
+      yield ctx.slots.register({
+        name: 'rightbar.session',
+        locale: NS,
+        children: {
+          'sidebar.right.pane.tab': { kind: 'keyed', scope: 'session', inject: { hooks: { tabInfo: tabInfoFactory } } },
+          'sidebar.right.pane.tab.title': { kind: 'keyed', scope: 'session', inject: { hooks: { tabInfo: tabInfoFactory } } },
+          'sidebar.right.tab.menu.item': { kind: 'list', scope: 'session' },
+        },
+        store,
+        inject: (sessionId): SidebarRightInjected => ({
+          ...injected,
+          measureRoom: (canSplitPane) => { measure(sessionId, canSplitPane) },
+          closeTab: (tabId) => {
+            try { controller.closeIn(sessionId, tabId) }
+            catch (error) { console.error('Sidebar tab close failed:', error) }
+          },
+          keyedHooks: { tabNavigation: key => controller.tabDomain.occurrence(sessionId, { id: key as TabId }).navigation },
+          occurrence: tab => controller.tabDomain.occurrence(sessionId, tab),
+        }),
+      }, RightbarSeat)
+    })
     // The expand button shares the panel's store: it only needs to know whether
     // the panel is expanded, and to ask for it to be. The header's corner seat
     // is its own place, past the utilities, so showing and hiding it moves
