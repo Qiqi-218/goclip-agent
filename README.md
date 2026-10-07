@@ -1,3 +1,10 @@
+---
+# ModelScope Studio metadata
+domain:
+tags: []
+license: Apache License 2.0
+---
+
 # goclip 智能剪辑助手
 
 **一个能听懂人话的长视频理解与智能剪辑助手**：把长视频解析成多维可检索的证据，
