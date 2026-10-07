@@ -86,10 +86,10 @@ try {
 // `.env`，启动器却因为找不到 `.env.ps1` 直接退出 —— 而 setup.sh 的提示还在教人
 // 「配置 runtime/.env」。这条只在真机 Linux 上跑才会暴露。
 const envFiles = ['.env', '.env.ps1'].filter(name => existsSync(join(runtimeDir, name)))
-if (envFiles.length === 0) {
+if (envFiles.length === 0 && (!process.env.GOCLIP_WEB_USERNAME || !process.env.GOCLIP_WEB_PASSWORD)) {
   fail(
-    '缺少凭据文件 runtime/.env（Linux/macOS）或 runtime/.env.ps1（Windows）',
-    '按部署手册的「配置环境」一节填写模型与 OSS 凭据',
+    '缺少凭据文件或 Web 登录环境变量',
+    '本地请配置 runtime/.env（Linux/macOS）或 runtime/.env.ps1（Windows）；云端请配置 GOCLIP_WEB_USERNAME 与 GOCLIP_WEB_PASSWORD',
   )
 }
 
@@ -107,6 +107,13 @@ if (envFiles.includes('.env')) {
     }
     process.env[match[1]] = value
   }
+}
+
+if (!process.env.GOCLIP_WEB_USERNAME || !process.env.GOCLIP_WEB_PASSWORD) {
+  fail(
+    '缺少 Web 登录账号或密码',
+    '请在 runtime/.env（或 Windows 的 runtime/.env.ps1）设置 GOCLIP_WEB_USERNAME 与 GOCLIP_WEB_PASSWORD',
+  )
 }
 
 // DSH_HOME 决定 profiles 与 sessions 的位置。指向包内，避免和机器上其它 DSH 混在一起。

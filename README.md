@@ -163,11 +163,18 @@ bash setup.sh      # 构建基座 → 装 profile → 摆好启动器
 
 - Linux / macOS：`runtime/.env`
 - Windows：`runtime/.env.ps1`
+- ModelScope 创空间：在空间设置中添加环境变量；密钥和登录密码放入 Secrets，端点、Bucket 放入普通变量
+
+ModelScope Secrets：`AUTOCLIP_TEXT_API_KEY`、`GOCLIP_WEB_USERNAME`、`GOCLIP_WEB_PASSWORD`、`GOCLIP_OSS_ACCESS_KEY_ID`、`GOCLIP_OSS_ACCESS_KEY_SECRET`。普通变量：`AUTOCLIP_TEXT_BASE_URL`、`GOCLIP_OSS_ENDPOINT`、`GOCLIP_OSS_BUCKET`。
 
 ```bash
 AUTOCLIP_TEXT_BASE_URL=https://<workspace>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
 AUTOCLIP_TEXT_MODEL=qwen3.8-omni-flash
 AUTOCLIP_TEXT_API_KEY=sk-...
+
+# Web 登录账号（必填，打开页面后会显示 GoClip 登录表单）
+GOCLIP_WEB_USERNAME=admin
+GOCLIP_WEB_PASSWORD=请换成一串强密码
 
 GOCLIP_OSS_ENDPOINT=oss-cn-beijing.aliyuncs.com
 GOCLIP_OSS_BUCKET=your-bucket
@@ -186,13 +193,11 @@ Bucket 建议保持私有。RAM 用户至少需要 `oss:PutObject` / `GetObject`
 ./start.ps1                                            # Windows
 ```
 
-打开日志里打印的 `http://127.0.0.1:<port>/?token=...`。
+本地打开日志里打印的地址；部署到 ModelScope 后打开创空间页面。页面会先显示 GoClip 登录表单，输入 `GOCLIP_WEB_USERNAME` 和 `GOCLIP_WEB_PASSWORD` 后进入剪辑工作台。
 
-> **只能绑回环。** DSH 拒绝 `--host 0.0.0.0`（安全设计），webserver 的配置类型也只接受
-> `127.0.0.1 | 0.0.0.0`。要让外部访问，必须靠反向代理或端口映射 —— 详见
-> `docs-参赛/10-公网部署实作手册.md`。
->
-> **每次重启令牌都会变**，旧链接会显示「authentication required」。
+服务启动时会强制检查这两个变量；账号密码不要提交到 Git。登录成功后会用 HttpOnly Cookie 保持会话，容器重启后需要重新登录。
+
+本地使用建议绑定回环地址。ModelScope 容器通过平台映射 `7860` 端口，并由平台代理提供外部访问。
 
 ---
 

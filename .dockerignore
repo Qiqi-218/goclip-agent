@@ -12,4 +12,16 @@ node_modules
 **/.storages
 **/coverage
 **/*.tsbuildinfo
-branding/concepts/renders
+
+# ── 绝不进镜像的本机文件 ──────────────────────────────────────────────────────
+#
+# Docker 的构建上下文是**工作区**，不是 git 索引：`.gitignore` 忽略 `runtime/`
+# 不代表 `COPY . .` 不会把它拷进去。而 `runtime/.env` 里是模型密钥、
+# OSS AccessKey/Secret 与 Web 登录密码 —— 一旦进层，发布出去就撤不回来。
+runtime/
+.env
+.env.ps1
+*.log
+
+# 本机样片（几十 MB 的视频，只在本地开发用）
+media/
