@@ -12,6 +12,4 @@ node_modules
 **/.storages
 **/coverage
 **/*.tsbuildinfo
-platform/dsh/apps/desktop
-platform/dsh/snapshots
 branding/concepts/renders
