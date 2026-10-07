@@ -8,6 +8,12 @@ COPY . .
 
 WORKDIR /app/platform/dsh
 RUN pnpm install --frozen-lockfile
+
+# ModelScope's Docker context does not include .git, while the client build
+# normally derives this value with `git rev-parse HEAD`.
+ARG DSH_CLIENT_COMMIT_HASH=0000000
+ENV DSH_CLIENT_COMMIT_HASH=${DSH_CLIENT_COMMIT_HASH}
+
 RUN pnpm run build
 
 EXPOSE 7860
