@@ -120,11 +120,32 @@ function historyLoader(timelineId: string): (asset: WorkbenchAsset, signal: Abor
   return (asset, signal) => readHistory(asset, timelineId, signal)
 }
 
-function messageOf(error: unknown): string {
+/**
+ * Which known failure a rejected edit is, or null when it is none of them.
+ *
+ * Classification only — the sentence is the dictionary's. The two render sites already wrap the
+ * reason in `timeline.saveFailed` / `export.failed`, so copy that lived here would arrive translated
+ * inside a translated template, and the same failure would read two different ways depending on which
+ * call reported it.
+ *
+ * @param error - whatever the rejected promise carried.
+ * @returns the dictionary key for a recognised failure, or null.
+ */
+function classifyEditFailure(error: unknown): 'edit.conflict' | 'edit.notSaved' | null {
   const message = error instanceof Error ? error.message : String(error)
-  if (message.includes('revision conflict')) return '这条时间线刚刚有新修改，已刷新到最新版本。请基于当前内容再试一次。'
-  if (message.includes('UNIQUE constraint') || message.includes('timeline_segments')) return '这次编辑没有保存。时间线已刷新，请再试一次；如果持续出现，请告诉助手你刚才执行的操作。'
-  return message
+  // 时间线的乐观并发检查在版本被别处推进时以此措辞拒绝。
+  if (message.includes('revision conflict')) return 'edit.conflict'
+  if (message.includes('UNIQUE constraint') || message.includes('timeline_segments')) return 'edit.notSaved'
+  return null
+}
+
+/**
+ * The raw reason a rejected call carried, for the `{reason}` template slot.
+ * @param error - whatever the rejected promise carried.
+ * @returns the message text.
+ */
+function reasonOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 /**
@@ -170,12 +191,14 @@ export function WorkbenchPanel({ t, asset, initialTimelineId, onTimelineChange, 
   const [sourceInUs, setSourceInUs] = useState<number | null>(null)
   const [sourceOutUs, setSourceOutUs] = useState<number | null>(null)
   const [saving, setSaving] = useState(false)
-  const [editError, setEditError] = useState<string | null>(null)
+    /** Which known failure the last edit hit — a dictionary key — or the raw reason when unclassified. */
+  const [editError, setEditError] = useState<'edit.conflict' | 'edit.notSaved' | { reason: string } | null>(null)
   // The exact state before this session's last undo. A fresh edit clears redo, so it
   // can never silently overwrite a newer cut.
   const [redoRevision, setRedoRevision] = useState<number | null>(null)
   const [exporting, setExporting] = useState(false)
-  const [exportError, setExportError] = useState<string | null>(null)
+    /** Same shape as `editError`: a dictionary key for a recognised failure, otherwise the raw reason. */
+  const [exportError, setExportError] = useState<'edit.conflict' | 'edit.notSaved' | { reason: string } | null>(null)
   const [cancellingJobId, setCancellingJobId] = useState<string | null>(null)
   const [exportAspect, setExportAspect] = useState<'keep' | '16:9' | '9:16' | '1:1'>('keep')
   const [burnSubtitles, setBurnSubtitles] = useState(false)
@@ -202,7 +225,7 @@ export function WorkbenchPanel({ t, asset, initialTimelineId, onTimelineChange, 
     setEditError(null)
     void applyTimelineEdit(target, intent)
       .then(() => { setSelectedOrdinal(null); setTimelineRefresh(current => current + 1) })
-      .catch(error => setEditError(messageOf(error)))
+      .catch(error => setEditError(classifyEditFailure(error) ?? { reason: reasonOf(error) }))
       .finally(() => setSaving(false))
   }, [saving, target])
   // 选中的片段由面板持有：时间线只报告「点了哪一段」，动作条是面板的一部分。
@@ -247,7 +270,7 @@ export function WorkbenchPanel({ t, asset, initialTimelineId, onTimelineChange, 
     setExportError(null)
     void exportTimeline(target, activeId, { aspect: exportAspect, ...(burnSubtitles ? { burnSubtitles: 'transcript' as const } : {}) })
       .then(() => { setPollRenders(true); setRenderRefresh(current => current + 1) })
-      .catch(error => setExportError(messageOf(error)))
+      .catch(error => setExportError(classifyEditFailure(error) ?? { reason: reasonOf(error) }))
       .finally(() => setExporting(false))
   }, [activeId, burnSubtitles, exportAspect, exporting, target])
   const cancelFilm = useCallback((jobId: string) => {
@@ -255,7 +278,7 @@ export function WorkbenchPanel({ t, asset, initialTimelineId, onTimelineChange, 
     setCancellingJobId(jobId)
     void cancelExport(target.projectId, jobId)
       .then(() => { setPollRenders(true); setRenderRefresh(current => current + 1) })
-      .catch(error => setExportError(messageOf(error)))
+      .catch(error => setExportError(classifyEditFailure(error) ?? { reason: reasonOf(error) }))
       .finally(() => setCancellingJobId(null))
   }, [cancellingJobId, target])
   useEffect(() => {
@@ -484,7 +507,7 @@ export function WorkbenchPanel({ t, asset, initialTimelineId, onTimelineChange, 
             {exporting ? t('export.exporting') : t('export.button')}
           </button>
         </div>
-        {exportError !== null && <p className={styles.exportHeaderError} role="alert">{t('export.failed', { reason: exportError })}</p>}
+        {exportError !== null && <p className={styles.exportHeaderError} role="alert">{typeof exportError === 'string' ? t(exportError) : t('export.failed', { reason: exportError.reason })}</p>}
         {previewMode === 'source' && (
           <div className={styles.sourceRange} data-source-range="">
             <button type="button" className={styles.rangeButton} onClick={setSourceIn}>{t('sourceRange.setIn')}</button>
@@ -727,7 +750,7 @@ export function WorkbenchPanel({ t, asset, initialTimelineId, onTimelineChange, 
       <p className={styles.shortcuts} data-shortcuts="">{t('shortcuts.hint')}</p>
 
       {saving && <p className={styles.pending} data-save-state="saving">{t('timeline.saving')}</p>}
-      {editError !== null && <p className={styles.note} data-save-error="" role="alert">{t('timeline.saveFailed', { reason: editError })}</p>}
+      {editError !== null && <p className={styles.note} data-save-error="" role="alert">{typeof editError === 'string' ? t(editError) : t('timeline.saveFailed', { reason: editError.reason })}</p>}
 
       {curve.status === 'absent' && (
         <p className={styles.note}>

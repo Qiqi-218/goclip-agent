@@ -55,8 +55,9 @@ function createAuth(
   store: RecordCredentials,
   maxAgeDays = 30,
   processOwner: object = {},
+  publicAccess = false,
 ): Promise<BrowserAuth> {
-  return BrowserAuth.create(processOwner, credentials(store), maxAgeDays)
+  return BrowserAuth.create(processOwner, credentials(store), maxAgeDays, publicAccess)
 }
 
 function request(url: string, authority = '127.0.0.1:3080', init?: {
@@ -91,6 +92,15 @@ afterEach(() => {
 })
 
 describe('BrowserAuth', () => {
+  it('allows public access without a launch token when configured', async () => {
+    const auth = await createAuth(new RecordCredentials(), 30, {}, true)
+    const res = response()
+
+    expect(auth.authenticatedUrl('https://example.com/')).toBe('https://example.com/')
+    expect(auth.authorizeIndex(request('/', 'example.com'), res.value)).toBe(true)
+    expect(auth.isAuthenticated(request('/', 'example.com'))).toBe(true)
+  })
+
   it('mints one process token and a persistent authority-bound cookie', async () => {
     const store = new RecordCredentials()
     const processOwner = {}

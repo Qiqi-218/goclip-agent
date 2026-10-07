@@ -180,8 +180,19 @@ await vw.timingEvidence('pf', 'af', new AbortController().signal)
 
 // ── 缺证据时要如实说缺什么 ─────────────────────────────────────────────────
 {
+  /*
+   * 这份夹具只算了声学与镜头两类证据，所以转写、屏文字、画面描述**确实没有** ——
+   * 断言 `evidence_missing` 为空会把「如实报告缺什么」当成失败，方向是反的。
+   * 这里断言的是它点名了那三项，且点的是**工具名**（模型据此知道该去调什么）。
+   */
   const bare = await vw.findSpans('pf', 'af', { min_dbfs: -25 })
-  record('有条件可用时 evidence_missing 为空', bare.evidence_missing.length === 0, JSON.stringify(bare.evidence_missing))
+  const named = (bare.evidence_missing ?? []).join(' ')
+  record('未测过的证据被逐项点名（转写/屏文字/画面描述）',
+    named.includes('video_evidence_transcript') && named.includes('video_evidence_ocr') && named.includes('video_evidence_visual'),
+    JSON.stringify(bare.evidence_missing))
+  record('算过的两类不在这份缺失清单里',
+    !named.includes('acoustic') && !named.includes('shot'),
+    `available=${JSON.stringify(bare.evidence_available)}`)
 }
 
 // ── 重叠要标注出来，否则同一内容会被当成多个候选 ────────────────────────────

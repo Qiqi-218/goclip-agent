@@ -223,8 +223,9 @@ describe('durable export snapshots', () => {
     privateWorkspace.restore = async () => {}
     privateWorkspace.manifest = async () => {}
     privateWorkspace.enqueueRender = vi.fn()
+    let db: DatabaseSync | undefined
     try {
-      const db = await privateWorkspace.open()
+      db = await privateWorkspace.open()
       db.prepare('INSERT INTO projects (id,name) VALUES (?,?)').run('project', 'Project')
       db.prepare('INSERT INTO assets (id,project_id,path,meta) VALUES (?,?,?,?)').run('asset', 'project', '/tmp/asset.mp4', JSON.stringify({ duration_us: 60_000_000 }))
       await workspace.createTimeline({ id: 'timeline', project_id: 'project', asset_id: 'asset', start_us: 1_000_000, end_us: 20_000_000 })
@@ -238,6 +239,8 @@ describe('durable export snapshots', () => {
       expect(JSON.parse(row.render_options)).toEqual({ aspect: '9:16', burnSubtitles: 'transcript' })
       expect(privateWorkspace.enqueueRender).toHaveBeenCalledOnce()
     } finally {
+      // A file with an open handle cannot be unlinked on Windows; close before removing.
+      db?.close()
       await rm(dataDir, { recursive: true, force: true })
     }
   })
@@ -250,8 +253,9 @@ describe('stable timeline clip identities', () => {
     const privateWorkspace = workspace as unknown as { restore: () => Promise<void>, manifest: () => Promise<void> }
     privateWorkspace.restore = async () => {}
     privateWorkspace.manifest = async () => {}
+    let db: DatabaseSync | undefined
     try {
-      const db = await (workspace as unknown as { open: () => Promise<DatabaseSync> }).open()
+      db = await (workspace as unknown as { open: () => Promise<DatabaseSync> }).open()
       db.prepare('INSERT INTO projects (id,name) VALUES (?,?)').run('project', 'Project')
       db.prepare('INSERT INTO assets (id,project_id,path,meta) VALUES (?,?,?,?)').run('asset', 'project', '/tmp/asset.mp4', JSON.stringify({ duration_us: 60_000_000 }))
       await workspace.createTimeline({ id: 'timeline', project_id: 'project', asset_id: 'asset', start_us: 0, end_us: 40_000_000 })
@@ -263,6 +267,8 @@ describe('stable timeline clip identities', () => {
       await workspace.removeSegment({ timeline_id: 'timeline', base_revision: 4, ordinal: 0 })
       expect((await workspace.timeline('timeline') as { segments: Array<{ ordinal: number }> }).segments.map(segment => segment.ordinal)).toEqual([0])
     } finally {
+      // A file with an open handle cannot be unlinked on Windows; close before removing.
+      db?.close()
       await rm(dataDir, { recursive: true, force: true })
     }
   })
@@ -273,8 +279,9 @@ describe('stable timeline clip identities', () => {
     const privateWorkspace = workspace as unknown as { restore: () => Promise<void>, manifest: () => Promise<void> }
     privateWorkspace.restore = async () => {}
     privateWorkspace.manifest = async () => {}
+    let db: DatabaseSync | undefined
     try {
-      const db = await (workspace as unknown as { open: () => Promise<DatabaseSync> }).open()
+      db = await (workspace as unknown as { open: () => Promise<DatabaseSync> }).open()
       db.prepare('INSERT INTO projects (id,name) VALUES (?,?)').run('project', 'Project')
       db.prepare('INSERT INTO assets (id,project_id,path,meta) VALUES (?,?,?,?)').run('asset', 'project', '/tmp/asset.mp4', JSON.stringify({ duration_us: 60_000_000 }))
       await workspace.createTimeline({ id: 'timeline', project_id: 'project', asset_id: 'asset', start_us: 20_000_000, end_us: 30_000_000 })
@@ -285,6 +292,8 @@ describe('stable timeline clip identities', () => {
       expect(segments[0]?.start_us).toBe(0)
       expect(segments[1]?.clip_id).toBe(original)
     } finally {
+      // A file with an open handle cannot be unlinked on Windows; close before removing.
+      db?.close()
       await rm(dataDir, { recursive: true, force: true })
     }
   })
@@ -299,8 +308,9 @@ describe('stable timeline clip identities', () => {
     }
     privateWorkspace.restore = async () => {}
     privateWorkspace.manifest = async () => {}
+    let db: DatabaseSync | undefined
     try {
-      const db = await privateWorkspace.open()
+      db = await privateWorkspace.open()
       db.prepare('INSERT INTO projects (id,name) VALUES (?,?)').run('project', 'Project')
       db.prepare('INSERT INTO assets (id,project_id,path,meta) VALUES (?,?,?,?)').run('asset', 'project', '/tmp/asset.mp4', JSON.stringify({ duration_us: 60_000_000 }))
       await workspace.createTimeline({ id: 'timeline', project_id: 'project', asset_id: 'asset', start_us: 0, end_us: 40_000_000 })
@@ -321,6 +331,8 @@ describe('stable timeline clip identities', () => {
       expect(restored.segments).toHaveLength(1)
       expect(restored.segments[0]?.clip_id).toBe(originalId)
     } finally {
+      // A file with an open handle cannot be unlinked on Windows; close before removing.
+      db?.close()
       await rm(dataDir, { recursive: true, force: true })
     }
   })
@@ -331,8 +343,9 @@ describe('stable timeline clip identities', () => {
     const privateWorkspace = workspace as unknown as { restore: () => Promise<void>, manifest: () => Promise<void> }
     privateWorkspace.restore = async () => {}
     privateWorkspace.manifest = async () => {}
+    let db: DatabaseSync | undefined
     try {
-      const db = await (workspace as unknown as { open: () => Promise<DatabaseSync> }).open()
+      db = await (workspace as unknown as { open: () => Promise<DatabaseSync> }).open()
       db.prepare('INSERT INTO projects (id,name) VALUES (?,?)').run('project', 'Project')
       db.prepare('INSERT INTO assets (id,project_id,path,meta) VALUES (?,?,?,?)').run('asset', 'project', '/tmp/asset.mp4', JSON.stringify({ duration_us: 60_000_000 }))
       await workspace.createTimeline({ id: 'timeline', project_id: 'project', asset_id: 'asset', start_us: 0, end_us: 10_000_000 })
@@ -344,6 +357,8 @@ describe('stable timeline clip identities', () => {
       await workspace.revertTimeline({ timeline_id: 'timeline', base_revision: 2, target_revision: 1 })
       expect((await workspace.timeline('timeline') as { segments: unknown[] }).segments).toHaveLength(1)
     } finally {
+      // A file with an open handle cannot be unlinked on Windows; close before removing.
+      db?.close()
       await rm(dataDir, { recursive: true, force: true })
     }
   })

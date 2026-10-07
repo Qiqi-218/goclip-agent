@@ -35,6 +35,9 @@
 .row:hover:not(:disabled),
 .row:focus-visible:not(:disabled) {
   background: var(--dsw-alias-bg-layer-2);
+  /* An elevated surface rebinds the scrollbar thumb pair; the l1 default paints a base-surface bar. */
+  --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-bg-l2);
+  --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-hover-l2);
   outline: none;
 }
 

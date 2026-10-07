@@ -190,6 +190,7 @@ export class BrowserAuth {
     processOwner: object,
     private readonly secret: Buffer,
     maxAgeDays: number,
+    private readonly publicAccess: boolean,
   ) {
     this.launchToken = processLaunchToken(processOwner)
     this.maxAgeMilliseconds = maxAgeDays * DAY_MILLISECONDS
@@ -211,8 +212,9 @@ export class BrowserAuth {
     processOwner: object,
     credentials: CredentialProvider,
     maxAgeDays: number,
+    publicAccess = false,
   ): Promise<BrowserAuth> {
-    return new BrowserAuth(processOwner, await initializeSecret(credentials), maxAgeDays)
+    return new BrowserAuth(processOwner, await initializeSecret(credentials), maxAgeDays, publicAccess)
   }
 
   /**
@@ -222,6 +224,10 @@ export class BrowserAuth {
    */
   authenticatedUrl(baseUrl: string): string {
     const url = new URL(baseUrl)
+    if (this.publicAccess) {
+      url.searchParams.delete(TOKEN_QUERY)
+      return url.href
+    }
     url.searchParams.set(TOKEN_QUERY, this.launchToken)
     return url.href
   }
@@ -236,6 +242,7 @@ export class BrowserAuth {
    * @returns true only when the caller may serve index.html.
    */
   authorizeIndex(req: ConnectionIndexRequest, res: ConnectionIndexResponse): boolean {
+    if (this.publicAccess) return true
     /* v8 ignore next -- node:http always supplies url on server requests. */
     const url = new URL(req.url ?? '/', 'http://dsh.invalid')
     const tokens = url.searchParams.getAll(TOKEN_QUERY)
@@ -285,6 +292,7 @@ export class BrowserAuth {
    * @returns true only for an unexpired cookie signed by this activation's loaded secret.
    */
   isAuthenticated(request: ConnectionTrustRequest): boolean {
+    if (this.publicAccess) return true
     const authority = requestAuthority(request.headers)
     const rawCookie = header(request.headers, 'cookie')
     if (authority === undefined || rawCookie === undefined) return false

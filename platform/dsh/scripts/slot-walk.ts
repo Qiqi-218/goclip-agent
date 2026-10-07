@@ -7,6 +7,7 @@
  * reachable-export closure.
  */
 
+import { execFileSync } from 'node:child_process'
 import { globSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve, sep } from 'node:path'
 import ts from 'typescript'
@@ -85,9 +86,35 @@ export interface ScannedFile {
 }
 
 /**
+ * The repository's tracked files, `/`-normalized, or null when git cannot answer.
+ * @param scanRoot - repository root to ask about.
+ * @returns the tracked repository-relative paths.
+ */
+function trackedFiles(scanRoot: string): Set<string> | null {
+  try {
+    const listing = execFileSync('git', ['ls-files', '-z'], {
+      cwd: scanRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    return new Set(listing.split('\0').filter(Boolean).map(path => path.split(sep).join('/')))
+  } catch {
+    // A tree without git (`sources` in a published tarball, a sandbox without the binary) has no
+    // index to consult; the glob alone is then the whole answer, which is how this read before.
+    return null
+  }
+}
+
+/**
  * Parse every file matching `patterns`, keeping the ones that carry a slot
  * contract merge or a registration call. Files without either are skipped so
  * the scan stays cheap over the whole workspace.
+ *
+ * The scan reads the repository's **tracked** files, not whatever the glob finds on disk. `tsc`
+ * writes declaration output beside the sources (the base config sets `declaration: true`), and a
+ * `.d.ts` name ends in `.ts`, so a plain glob reports every slot twice — once from the source, once
+ * from its emitted declaration — and fails the catalogue only after something has run a type-check.
+ * The repository's own answer is its index: those declarations are not tracked, while the
+ * hand-written contract declarations that the type index needs are.
+ *
  * @param scanRoot - repository root the patterns resolve against.
  * @param patterns - glob(s) selecting the TypeScript/TSX files to scan.
  * @returns one entry per interesting file, in path order.
@@ -95,8 +122,11 @@ export interface ScannedFile {
 export function scanSlotFiles(scanRoot: string, patterns: readonly string[]): ScannedFile[] {
   const out: ScannedFile[] = []
   const names = new Map<string, string>()
+  const tracked = trackedFiles(scanRoot)
   const rels = [...new Set(globSync(patterns as string[], { cwd: scanRoot })
-    .map(path => path.split(sep).join('/')))].sort()
+    .map(path => path.split(sep).join('/')))]
+    .filter(rel => tracked === null || tracked.has(rel))
+    .sort()
   for (const rel of rels) {
     const abs = resolve(scanRoot, rel)
     const text = readFileSync(abs, 'utf8')
@@ -122,8 +152,14 @@ export function scanSlotFiles(scanRoot: string, patterns: readonly string[]): Sc
 export function indexExportedTypes(scanRoot: string, patterns: readonly string[]): Map<string, TypeDeclaration> {
   const index = new Map<string, TypeDeclaration>()
   const ambiguous = new Set<string>()
+  // Same reason as `scanSlotFiles`: an emitted declaration beside its source declares every name a
+  // second time, and a name seen twice is dropped as ambiguous — which erases exactly the owner-props
+  // declaration the catalogue resolves against it.
+  const tracked = trackedFiles(scanRoot)
   const rels = [...new Set(globSync(patterns as string[], { cwd: scanRoot })
-    .map(path => path.split(sep).join('/')))].sort()
+    .map(path => path.split(sep).join('/')))]
+    .filter(rel => tracked === null || tracked.has(rel))
+    .sort()
   for (const rel of rels) {
     const abs = resolve(scanRoot, rel)
     const sf = ts.createSourceFile(abs, readFileSync(abs, 'utf8'), ts.ScriptTarget.Latest, true, scriptKindOf(rel))

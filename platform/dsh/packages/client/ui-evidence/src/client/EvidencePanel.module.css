@@ -215,7 +215,8 @@
   top: 50%;
   height: 12px;
   transform: translateY(-50%);
-  border: 1px solid var(--dsw-alias-border-l3);
+  /* 实心中性色边框是 0.5px 发丝线：1px 会与抬高描边叠成双线并撑动布局。 */
+  border: 0.5px solid var(--dsw-alias-border-l3);
   border-radius: var(--dsw-radius-xs);
   background: transparent;
 }

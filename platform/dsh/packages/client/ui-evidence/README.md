@@ -1,4 +1,28 @@
+---
+description: "Client evidence plugin for the dsh web client: the read-only multi-lane timeline card drawn at the call site of a single video_evidence_view result."
+kind: "package-reference"
+---
+
 # @deepseek-ai/dsh-client-ui-evidence — 证据总览面板
+
+## Summary
+
+把 `video_evidence_view` 一次调用的结果画成一张**只读**的多轨时间轴卡片：八条轨道共用同一条时间轴，左边缘对齐即同一时刻。卡片就出现在对话里该次调用的位置（`tool.call.toolview` 的键控席位，键就是工具名），不新开页面、不加按钮、不改任何数据，也不发任何请求 —— 它读的是随会话日志持久化的 `presentationMeta.evidence_view`，所以重开一次会话日志，面板照原样画出来。
+
+## Table of Contents
+
+- [Summary](#summary)
+- [Table of Contents](#table-of-contents)
+- [它画什么](#它画什么)
+- [数据从哪来](#数据从哪来)
+- [组件看不到 ctx](#组件看不到-ctx)
+- [三个刻意的选择](#三个刻意的选择)
+- [验收](#验收)
+- [Model Experience](#model-experience)
+- [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
+- [Dev Note](#dev-note)
+
+-----
 
 把 `video_evidence_view` 一次调用的结果画成一张**只读**的多轨时间轴卡片。
 
@@ -69,3 +93,19 @@ None, as the browser draws measurements the host already computed; it contribute
 #### KV Cache effect
 
 Does not invalidate; the panel renders persisted evidence metadata and does not add anything to the model request prefix.
+
+## Known Limitations and Deferred Work
+
+- **卡片只读，并且只在调用处画。** 它出现在对话里该次调用的位置（`tool.call.toolview` 的键控席位，键就是工具名），不新开页面、不加按钮、不改任何数据。
+- **面板不发任何请求，载荷缺 `evidence_view` 时只显示「无数据」。** 老日志或投影失败的调用无法在界面里重算，画成空画布会被读成「证据全空」这个不成立的结论。
+- **异轴判定读宿主给的 `on_this_axis`。** 载荷里没有 asset id，界面无法自己推导「这一段属不属于这条时间轴」，所以这条结论只能由产出方给出。
+- **响度轨道用固定量程 −60…0 dBFS。** 按素材自身动态范围拉伸会让动态范围只有 2.2 dB 的素材看上去处处都响；代价是单条素材自己的起伏不再由纵轴反映。
+
+<a id="dev-note"></a>
+### Dev Note
+
+**卡片只读，并且在调用处画。** `apply` 只做两件事：注册 `evidence` 命名空间的字典，把组件注册进 `tool.call.toolview` 的键控席位 —— 键就是工具名。不新开页面、不加按钮、不改任何数据，卡片出现的位置就是这次调用本身的位置。
+
+**画的是持久化的那一份，不是当场取的。** 宿主侧 `presentationMeta` 投影只留面板要画的字段，随 `tool/result` 事件写进会话日志；卡片读 `block.meta`，经 `evidenceViewModel()` 收窄后交给 SVG 与色块。因为不依赖这个插件自己的内存状态，重开一次会话日志，面板照原样画出来。
+
+**读不出结论时如实说「无数据」，不画空画布。** 空画布看上去像「证据全空」，那是**另一种**、且不成立的结论；同理，`missing` 为 `null` 时面板不会替投影补一句「七维齐全」——「说了没缺」和「没说」是两件事。

@@ -162,12 +162,26 @@ let tl = null
     tl.segment_count === 2 && tl.segments.map(s => s.ordinal).join(',') === '0,1',
     `段数=${tl.segment_count}，序号=${JSON.stringify(tl.segments.map(s => s.ordinal))}`)
 
-  let refused = false
+  /*
+   * 删掉最后一段会留下空时间线，而**空是允许的状态**：编辑计划以 `timeline_segments` 为准，
+   * 清空只是让预览与导出暂时不可用，封面/字幕/导出三处都会明确报「没有任何片段」，
+   * 再插一段就恢复。所以这里断言的是那条明确的报错，而不是「拒绝删除」——
+   * 探针原先期待的「唯一的一段不能删」在产品里并不存在（工具描述曾这么写，已一并改正）。
+   */
   tl = await vw.setSegments({ timeline_id: 'tm', base_revision: tl.revision, clips: [{ asset_id: 'am', start_us: 0, end_us: 500_000 }] })
-  const one = tl
-  try { await vw.removeSegment({ timeline_id: 'tm', base_revision: one.revision, ordinal: 0 }) }
-  catch (error) { refused = String(error.message).includes('唯一的一段') }
-  record('拒绝删掉最后一段（否则会导出空文件）', refused, refused ? '明确拒绝并说明原因' : '没有拦住')
+  tl = await vw.removeSegment({ timeline_id: 'tm', base_revision: tl.revision, ordinal: 0 })
+  record('删掉最后一段后时间线为空（这是允许的状态）',
+    tl.segment_count === 0 && tl.segments.length === 0,
+    `段数=${tl.segment_count}`)
+
+  let refused = ''
+  try { await vw.submitRender('tm', 'empty.mp4') }
+  catch (error) { refused = String(error.message) }
+  record('空时间线导出被明确拒绝并说明原因',
+    refused.includes('没有任何片段'), refused || '没有拦住（导出被接受）')
+
+  tl = await vw.setSegments({ timeline_id: 'tm', base_revision: tl.revision, clips: [{ asset_id: 'am', start_us: 0, end_us: 500_000 }] })
+  record('重新插入一段即可恢复', tl.segment_count === 1, `段数=${tl.segment_count}`)
 }
 
 // ── 一次性设置：去停顿场景的实际用法 ───────────────────────────────────────

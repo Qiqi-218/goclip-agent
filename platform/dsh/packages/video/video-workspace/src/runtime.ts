@@ -448,6 +448,16 @@ export class VideoWorkspace {
    * the attempt that answered, not for every refusal along the way.
    */
   private usage: ModelUsage[] = []
+  /**
+   * Uploads in flight or already done, by destination key.
+   *
+   * Object keys are derived from content, so the same bytes can be asked for more than once — a retry
+   * after a model error, or two windows of one call that resolved to the same chunk. Holding the
+   * promise is what lets concurrent askers join one PUT; an upload that fails is removed so the next
+   * attempt really retries. Bounded by the number of distinct proxies one run produces, which is small
+   * and released with the instance.
+   */
+  private readonly uploads = new Map<string, Promise<string>>()
   /** 本次调用的阶段耗时，供界面展示处理管线。 */
   private readonly stages = new StageRecorder()
   constructor(private readonly config: Config) {}
@@ -2379,9 +2389,9 @@ export class VideoWorkspace {
     const windowEnd = candidate.end / 1e6 + padSeconds
     const source = await this.materialize(assetPath, signal)
     try {
-      const file = await this.prepare(source.path, signal, { startSeconds: windowStart, endSeconds: windowEnd, fps })
-      const key = `${this.config.ossPrefix.replace(/\/$/,'')}/verify/${randomUUID()}.mp4`
-      const url = await this.stages.timed('上传核对片段', () => this.uploadFile(file, key, 'video/mp4'))
+      const clip = await this.prepare(source.path, signal, { startSeconds: windowStart, endSeconds: windowEnd, fps })
+      const key = `${this.config.ossPrefix.replace(/\/$/,'')}/verify/${clip.digest}.mp4`
+      const url = await this.stages.timed('上传核对片段', () => this.uploadFile(clip.file, key, 'video/mp4'))
       const prompt = `这是一段视频的截取，原素材的第 ${round2(windowStart)} 秒到第 ${round2(windowEnd)} 秒。请只回答：其中目标内容真正开始和结束的时刻，用相对这段截取的时间（秒，可带一位小数）。只返回 JSON：{"start_seconds":0.0,"end_seconds":1.0,"found":true}。如果这段里根本没有目标内容，found 填 false。`
       const answer = await this.stages.timed('模型二次核对', () => this.ask(url, prompt, signal, { model: this.config.verifyModel }))
       if (answer.found === false) return { start: candidate.start, end: candidate.end, before: candidate, verified: false, note: '二次核对说这段里没有目标内容，保留原区间。' }
@@ -3664,8 +3674,11 @@ export class VideoWorkspace {
     if (options.durationUs <= chunkUs) {
       const answer = await this.stages.timed(options.stage, async () => {
         const proxy = await this.prepare(options.path, options.signal)
-        const key = `${this.config.ossPrefix.replace(/\/$/, '')}/${options.keyPrefix}-${randomUUID()}.mp4`
-        const url = await this.uploadFile(proxy, key, 'video/mp4')
+        // 上传 key 由**内容标识**决定，不再是每次一个新 UUID：同一个代理因此只上传一次，
+        // 重试与并发调用都命中同一个对象。原来每次 `understand` 都会重新上传同一份代理，
+        // 而编码本身早已按源字节缓存 —— 省下了转码，却在后一步把省下的又付了回去。
+        const key = `${this.config.ossPrefix.replace(/\/$/, '')}/${proxy.digest}.mp4`
+        const url = await this.uploadFile(proxy.file, key, 'video/mp4')
         return this.ask(url, options.prompt, options.signal, this.emptyExtractionGuard(options.field, options.benign, options.model))
       })
       const kept = (Array.isArray(answer[options.field]) ? answer[options.field] as Data[] : [])
@@ -3695,8 +3708,9 @@ export class VideoWorkspace {
       try {
         const answer = await this.stages.timed(label, async () => {
           const trimmed = await this.prepare(options.path, options.signal, { startSeconds: from, endSeconds: from + seconds, fps: WINDOW_PROXY_FPS })
-          const key = `${this.config.ossPrefix.replace(/\/$/, '')}/${options.keyPrefix}-${randomUUID()}.mp4`
-          const url = await this.uploadFile(trimmed, key, 'video/mp4')
+          // 同上一处：key 由内容标识决定，重试这一窗时不会把同一段再传一遍。
+          const key = `${this.config.ossPrefix.replace(/\/$/, '')}/${trimmed.digest}.mp4`
+          const url = await this.uploadFile(trimmed.file, key, 'video/mp4')
           return this.ask(url, options.prompt, options.signal, this.emptyExtractionGuard(options.field, options.benign, options.model))
         })
         // 模型给的时间是相对它看到的那段素材开头，也就是窗口起点 fromUs，
@@ -4493,13 +4507,13 @@ export class VideoWorkspace {
     }
   }
 
-  private async prepare(path: string, signal: AbortSignal, trim?: { startSeconds: number, endSeconds: number, fps: number }): Promise<string> {
+  private async prepare(path: string, signal: AbortSignal, trim?: { startSeconds: number, endSeconds: number, fps: number }): Promise<{ file: string, digest: string }> {
     return this.stages.timed('生成代理视频', async () => {
       await mkdir(join(this.config.dataDir, 'tmp'), { recursive: true })
       const key = await this.hashFile(path)
       const tag = trim === undefined ? `proxy-${key}` : `proxy-${key}-${Math.round(trim.startSeconds * 1000)}-${Math.round(trim.endSeconds * 1000)}-${trim.fps}`
       const file = join(this.config.dataDir, 'tmp', `${tag}.mp4`)
-      if (existsSync(file)) { this.stages.skipped('生成代理视频 · 复用缓存', '同一素材（同一区间）的代理已存在'); return file }
+      if (existsSync(file)) { this.stages.skipped('生成代理视频 · 复用缓存', '同一素材（同一区间）的代理已存在'); return { file, digest: tag } }
       const partial = `${file}.part`
       const rate = trim === undefined ? 1 : trim.fps
       // 截取区间的代理读的是这一小段，所以帧率可以调高：同样的输入体积换取更细的时间分辨。
@@ -4523,7 +4537,7 @@ export class VideoWorkspace {
       const audio = hasAudio ? ['-c:a', 'aac', '-b:a', '64k'] : ['-an']
       await this.run('ffmpeg',['-nostdin','-y',...seek,'-i',path,'-vf',`${this.proxyScaleFilter()},fps=${rate}`,'-c:v','libx264','-preset','veryfast','-crf','25',...audio,'-f','mp4',partial],signal)
       await rename(partial, file)
-      return file
+      return { file, digest: tag }
     })
   }
   /** Delete cached proxies, which are rebuildable from the assets they came from. */
@@ -4619,6 +4633,41 @@ export class VideoWorkspace {
    */
   private signedUrl(key: string, method = 'GET'): string { const expires = String(Math.floor(Date.now() / 1000) + this.config.signedUrlSeconds); return `${this.objectUrl(key)}?OSSAccessKeyId=${encodeURIComponent(this.credentials().id)}&Expires=${expires}&Signature=${encodeURIComponent(this.signature(method, key, expires))}` }
   /**
+   * Stream a file to OSS instead of holding it in memory, once per destination key.
+   *
+   * The body must be a web `ReadableStream`: the global `fetch` rejects a Node
+   * `ReadStream` outright ("The string argument must be of type string or an instance
+   * of Buffer or ArrayBuffer"). `duplex: 'half'` is the Node extension that permits a
+   * streaming request body at all.
+   *
+   * Callers derive an object's key from its content, so the same bytes can be asked for twice — a
+   * retry after a model error, or two windows of one call that resolved to the same chunk. Caching the
+   * **promise** rather than the result is what makes concurrent callers join one upload instead of
+   * racing: both await the same PUT rather than both starting one. A failure is not remembered, so the
+   * next attempt really retries.
+   *
+   * @param path - local file to stream.
+   * @param key - destination object key, which also identifies the bytes for the memo.
+   * @param contentType - media type to declare.
+   * @param label - stage label for progress and error text.
+   * @returns the signed URL for the uploaded object.
+   */
+  private async uploadFile(path: string, key: string, contentType: string, label = '上传 OSS 文件'): Promise<string> {
+    const inFlight = this.uploads.get(key)
+    if (inFlight !== undefined) return inFlight
+    const started = this.uploadOnce(path, key, contentType, label)
+    this.uploads.set(key, started)
+    try {
+      return await started
+    } catch (error) {
+      // A failed upload must not be remembered, or the retry would re-await the same rejection.
+      this.uploads.delete(key)
+      throw error
+    }
+  }
+
+  /** One PUT, split out so {@link uploadFile} can memoize the promise rather than the result. */
+  /**
    * Stream a file to OSS instead of holding it in memory.
    *
    * The body must be a web `ReadableStream`: the global `fetch` rejects a Node
@@ -4626,7 +4675,7 @@ export class VideoWorkspace {
    * of Buffer or ArrayBuffer"). `duplex: 'half'` is the Node extension that permits a
    * streaming request body at all.
    */
-  private async uploadFile(path: string, key: string, contentType: string, label = '上传 OSS 文件'): Promise<string> { const date = new Date().toUTCString(); const credentials = this.credentials(); const bytes = String((await stat(path)).size); const response = await this.fetchWithRetry(label, () => { const body = Readable.toWeb(createReadStream(path)) as unknown as BodyInit; return fetch(this.objectUrl(key), { method:'PUT', ...{ duplex: 'half' } as Record<string, unknown>, headers:{Date:date,'Content-Length':bytes,'Content-Type':contentType,Authorization:`OSS ${credentials.id}:${this.signature('PUT',key,date,contentType)}`}, body }) }); if (!response.ok) { const detail = (await response.text()).trim().replace(/\s+/g, ' ').slice(0, 500); throw new Error(`${label}失败：HTTP ${response.status}${detail === '' ? '' : ` ${detail}`}`) } return this.signedUrl(key) }
+  private async uploadOnce(path: string, key: string, contentType: string, label: string): Promise<string> { const date = new Date().toUTCString(); const credentials = this.credentials(); const bytes = String((await stat(path)).size); const response = await this.fetchWithRetry(label, () => { const body = Readable.toWeb(createReadStream(path)) as unknown as BodyInit; return fetch(this.objectUrl(key), { method:'PUT', ...{ duplex: 'half' } as Record<string, unknown>, headers:{Date:date,'Content-Length':bytes,'Content-Type':contentType,Authorization:`OSS ${credentials.id}:${this.signature('PUT',key,date,contentType)}`}, body }) }); if (!response.ok) { const detail = (await response.text()).trim().replace(/\s+/g, ' ').slice(0, 500); throw new Error(`${label}失败：HTTP ${response.status}${detail === '' ? '' : ` ${detail}`}`) } return this.signedUrl(key) }
   /** SHA-256 of a file, computed in chunks so the file never sits in the heap. */
   private async hashFile(path: string): Promise<string> { const hash = createHash('sha256'); await pipeline(createReadStream(path), hash); return hash.digest('hex') }
   /**
@@ -4787,8 +4836,10 @@ export class VideoWorkspace {
       }
       try {
         const proxy = await this.prepare(a.sourcePath, a.signal, { startSeconds: window.startUs / 1e6, endSeconds: window.endUs / 1e6, fps: 1 })
-        const key = `${this.config.ossPrefix.replace(/\/$/, '')}/chunks/${a.assetId}/${a.operation}-${window.startUs}-${window.endUs}-${randomUUID()}.mp4`
-        const url = await this.stages.timed(`上传模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`, () => this.uploadFile(proxy, key, 'video/mp4', `上传模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`))
+        // 片段级缓存按 `inputKey` 命中，这里再加一层内容标识：同一窗被重算（或两处并发问同一段）时
+        // 不再把同一份分片重复上传。素材与窗口仍留在 key 里，便于在桶里认人。
+        const key = `${this.config.ossPrefix.replace(/\/$/, '')}/chunks/${a.assetId}/${a.operation}-${window.startUs}-${window.endUs}-${proxy.digest}.mp4`
+        const url = await this.stages.timed(`上传模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`, () => this.uploadFile(proxy.file, key, 'video/mp4', `上传模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`))
         const data = await this.stages.timed(`模型分片 ${round2(window.startUs / 1e6)}–${round2(window.endUs / 1e6)} 秒`, () => this.ask(url, a.prompt(window), a.signal, { reset: false }))
         write.run(a.assetId, a.operation, inputKey, window.startUs, window.endUs, 'completed', JSON.stringify(data), null, Date.now())
         chunks.push({ ...window, data })

@@ -76,6 +76,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
     ctx: Context,
     private readonly trustedHosts: readonly string[],
     private readonly browserAuth: BrowserAuth,
+    private readonly publicAccess = false,
   ) {
     super(ctx, 'connection')
     this.operator = new OperatorPeer(ctx)
@@ -103,7 +104,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
   /** Apply the configured Host/Origin fence, then browser authentication. */
   requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection {
     if (!isTrustedApiRequest(request, this.trustedHosts)) return 403
-    return this.browserAuth.isAuthenticated(request) ? undefined : 401
+    return this.publicAccess || this.browserAuth.isAuthenticated(request) ? undefined : 401
   }
 
   /** A request that passes the fence and authentication speaks for the operator. */

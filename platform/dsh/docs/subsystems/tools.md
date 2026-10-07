@@ -697,6 +697,31 @@ Types: [Scoped](scope.md)
 
 Source: [`packages/core/tools/src/index.ts`](../../packages/core/tools/src/index.ts)
 
+<a id="toolsprogress--emit"></a>
+
+#### `tools/progress` — emit
+
+Emit a non-durable progress update for a running tool call.
+
+Non-durable means it is not a session event: a listener that was not running when it fired cannot replay it, which is why anything that must survive a reload belongs on the call's result instead.
+
+```ts cordis-catalog
+/**
+ * Emit a non-durable progress update for a running tool call.
+ *
+ * Non-durable means it is not a session event: a listener that was not running when it fired cannot
+ * replay it, which is why anything that must survive a reload belongs on the call's result instead.
+ * @param exec - the execution the update belongs to.
+ * @param progress - the lossless-JSON progress value; subscribers decide how to present it.
+ * @mode emit
+ */
+'tools/progress'(this: Scoped<ToolRuntime>, exec: Readonly<ToolExecution>, progress: JsonValue): undefined
+```
+
+Types: [Scoped](scope.md)
+
+Source: [`packages/core/tools/src/index.ts`](../../packages/core/tools/src/index.ts)
+
 <a id="toolsptc-dispatch-log--waterfall"></a>
 
 #### `tools/ptc-dispatch-log` — waterfall

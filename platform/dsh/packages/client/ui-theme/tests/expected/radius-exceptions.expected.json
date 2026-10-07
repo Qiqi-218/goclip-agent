@@ -63,5 +63,16 @@
     ".keyBadge: border-radius: 10px",
     ".unbound: border-radius: 10px",
     ".recorder: border-radius: 10px"
+  ],
+  "ui-workbench/src/client/WorkbenchPanel.module.css": [
+    ".exportHeaderError: border-radius: 6px",
+    ".previewMode, .previewModeOn: border-radius: 5px",
+    ".sourceRange: border-radius: 6px",
+    ".rangeButton, .rangeAction: border-radius: 5px",
+    ".historyAction: border-radius: 5px",
+    ".timelinePicker select: border-radius: 5px",
+    ".exportLabel select: border-radius: 5px",
+    ".exportButton: border-radius: 6px",
+    ".createTimeline: border-radius: 6px"
   ]
 }

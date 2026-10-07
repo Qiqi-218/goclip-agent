@@ -118,6 +118,10 @@ function renderTimeline(overrides: Partial<Parameters<typeof Timeline>[0]> = {})
   const result = render(
     <Timeline
       assetDurationUs={ASSET_US}
+      /*
+       * `axis` 是必填的：`exactOptionalPropertyTypes` 下，`Partial<...>` 的 overrides 展开会把它变成
+       * `'source' | 'film' | undefined`，与必填签名不符。夹具因此显式给值。
+       */
       axis="source"
       baseRevision={2}
       clips={CLIPS}

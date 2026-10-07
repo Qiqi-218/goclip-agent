@@ -73,7 +73,8 @@ export function OutputList({ renders, t, onCancel, cancellingJobId = null }: Out
             <p className={styles.meta}>
               <span className={styles.name}>{render.timeline_name ?? render.timeline_id}</span>
               <span>{t('output.job', { job: render.job_id.slice(0, 8) })}</span>
-              {render.timeline_revision !== null && <span data-render-revision="">r{render.timeline_revision}</span>}
+              {/* 与版本列表同一处文案：`r` 是给人看的字，必须走字典。 */}
+              {render.timeline_revision !== null && <span data-render-revision="">{t('revision.label', { revision: String(render.timeline_revision) })}</span>}
             </p>
             {render.stale && <p className={styles.stale} data-render-stale="">{t('output.stale', { revision: String(render.current_revision) })}</p>}
             {render.url !== null && <a className={styles.download} data-render-download={render.job_id} href={`${render.url}?download=1`}>{t('output.download')}</a>}

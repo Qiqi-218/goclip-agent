@@ -16,10 +16,12 @@
 .headerActions { display: flex; flex: none; align-items: center; gap: 8px; }
 .quietButton, .closeButton { border: 0; background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer; }
 .quietButton { padding: 6px 8px; font-size: 12px; }
-.quietButton:hover, .quietButton:focus-visible, .closeButton:hover, .closeButton:focus-visible { color: var(--dsw-alias-label-primary); outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px; }
+.quietButton:hover, .quietButton:focus-visible, .closeButton:hover, .closeButton:focus-visible { color: var(--dsw-alias-label-primary); outline-color: var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary)); outline-width: var(--dsw-focus-ring-width); outline-offset: 2px; }
 .closeButton { padding: 2px 8px; font-size: 24px; line-height: 1; }
 .error { flex: none; padding: 8px 16px; background: var(--dsw-alias-bg-danger, #fff1f0); color: var(--dsw-alias-label-danger, #b42318); font-size: 12px; }
-.home, .browser { flex: 1; min-height: 0; overflow: auto; padding: 24px 20px 32px; }
+/* The drawer sits on `bg-layer-1`, so its scroll containers rebind the scrollbar thumb pair; the l1
+   default would paint a base-surface bar over an elevated panel. */
+.home, .browser { flex: 1; min-height: 0; overflow: auto; padding: 24px 20px 32px; --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-bg-l2); --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-hover-l2); }
 .intro { max-width: 560px; margin-bottom: 28px; }
 .eyebrow { color: var(--dsw-alias-label-tertiary); font-size: 11px; font-weight: 600; letter-spacing: .04em; }
 h1, h2, p { margin: 0; }
@@ -40,7 +42,7 @@ h1, h2, p { margin: 0; }
 .createRow { display: flex; gap: 8px; margin-top: 12px; }
 .createRow input { min-width: 0; flex: 1; }
 input { box-sizing: border-box; min-height: 34px; padding: 7px 9px; border: 0.5px solid var(--dsw-alias-border-l2); border-radius: var(--dsw-radius-xs); background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary); font: inherit; font-size: 13px; }
-input:focus-visible { border-color: var(--dsw-alias-brand-primary); outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 1px; }
+input:focus-visible { border-color: var(--dsw-alias-brand-primary); outline-color: var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary)); outline-width: var(--dsw-focus-ring-width); outline-offset: 1px; }
 .primaryButton { flex: none; min-height: 34px; padding: 7px 12px; border: 0; border-radius: var(--dsw-radius-xs); background: var(--dsw-alias-brand-primary); color: var(--dsw-alias-label-on-brand, #fff); cursor: pointer; font: inherit; font-size: 12px; font-weight: 600; }
 .primaryButton:disabled { cursor: not-allowed; opacity: .45; }
 .note { margin-top: 14px; color: var(--dsw-alias-label-tertiary); font-size: 13px; line-height: 1.5; }

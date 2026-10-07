@@ -8,8 +8,13 @@ import { checkBundleFreshness } from './bundle-freshness.mjs'
  * 全程网络桩件，不触达真实 OSS 或真实模型。
  */
 import { mkdtemp, writeFile, readFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+
+/** Run a command and reject on a non-zero exit, so a failed fixture build is loud. */
+const run = promisify(execFile)
 
 const RUNTIME = process.argv[2]
 
@@ -90,7 +95,7 @@ section('A. manifest / restore 往返')
   // 任务行必须排在时间线之后：jobs.timeline_id 有外键，先插会撞约束。
   const rawJobs = new DatabaseSync(join(baseConfig.dataDir, 'video-tools.sqlite'))
   rawJobs.exec('PRAGMA foreign_keys=ON')
-  rawJobs.prepare('INSERT INTO jobs VALUES (?,?,?,?,?)').run('j-a', 't-a', 'completed', 'oss://goclip-exports/p-a/j-a.mp4', '')
+  rawJobs.prepare('INSERT INTO jobs (id,timeline_id,status,output,detail) VALUES (?,?,?,?,?)').run('j-a', 't-a', 'completed', 'oss://goclip-exports/p-a/j-a.mp4', '')
   rawJobs.close()
   // manifest 是 private，用一次公开写操作触发它
   await vw.createTimeline({ id: 't-a2', project_id: 'p-a', asset_id: 'a-a', start_us: 6000000, end_us: 9000000 })
@@ -169,8 +174,22 @@ section('B. 并发')
   const evidenceTable = raw.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='evidence'").all()
   const evidencePk = raw.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='evidence_by_kind'").all()
   raw.close()
-  // 索引数量随表增加；三条是最初的，第四条属于证据表。数量断言防的是"每次开库都重建表"。
-  record('schema 索引已建立（说明只走了一次建表）', indexes.length === 6, `索引=${indexes.map(i => i.name)}`)
+  /*
+   * 点名必须存在的索引，而不是数数量。
+   *
+   * 这条断言原来的写法是 `indexes.length === 6`，防的是「每次开库都重建表」。但每加一张带索引的表
+   * 它就会红一次 —— 长视频分片加了 `model_chunks_by_asset`、时间线操作记录加了
+   * `timeline_operations_by_timeline`，于是它红了两次，而两次都不是它要防的那件事。
+   * 表只建一次的真正证据是「这些索引都在、且没有重复的」，所以改成按名字核对。
+   */
+  const required = [
+    'assets_by_project', 'timelines_by_project', 'jobs_by_timeline', 'evidence_by_kind',
+    'segments_by_timeline', 'proposals_by_project', 'model_chunks_by_asset', 'timeline_operations_by_timeline',
+  ]
+  const seen = indexes.map(i => i.name)
+  const absent = required.filter(name => !seen.includes(name))
+  record('schema 索引已建立（说明只走了一次建表）', absent.length === 0 && new Set(seen).size === seen.length,
+    absent.length === 0 ? `索引=${seen.join(',')}` : `缺=${absent.join(',')}；实有=${seen.join(',')}`)
   record('证据表已建且带自己的索引', evidenceTable.length === 1 && evidencePk.length === 1,
     `表=${evidenceTable.length}，索引=${evidencePk.length}`)
 }
@@ -183,30 +202,57 @@ section('B. 并发')
   const { DatabaseSync } = await import('node:sqlite')
   const raw = new DatabaseSync(join(dir, 'video-tools.sqlite'))
   raw.exec('PRAGMA foreign_keys=ON')
-  // 素材指向一个本地文件，materialize 直接用它（不是 oss:// 就不下载）
+  /*
+   * 素材必须是**真的能编码**的 mp4。
+   *
+   * 这里原先写的是 `Buffer.alloc(64)` 的假文件，于是 `prepare` 的 ffmpeg 直接失败、代理根本建不出来，
+   * 下面那条断言拿到 0 个对象却因为「不重复上传」而通过 —— 一条看起来在守、实际什么都没测的断言。
+   * 换成真视频之后这条路才会真的走到上传。
+   */
   const localVideo = join(dir, 'local.mp4')
-  await writeFile(localVideo, Buffer.alloc(64))
-  raw.prepare('INSERT INTO assets VALUES (?,?,?,?)').run('a-b', 'p-b', localVideo, JSON.stringify({ duration_us: 5000000 }))
+  await run('ffmpeg', ['-nostdin', '-v', 'error', '-y',
+    '-f', 'lavfi', '-i', 'color=c=black:s=320x240:d=3,format=yuv420p',
+    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=3',
+    '-map', '0:v', '-map', '1:a', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-shortest', localVideo], { maxBuffer: 64 * 1024 * 1024 })
+  raw.prepare('INSERT INTO assets VALUES (?,?,?,?)').run('a-b', 'p-b', localVideo, JSON.stringify({ duration_us: 3000000 }))
   raw.close()
 
+  /*
+   * 两条**不同指令**顺序调用，因此不会被幂等缓存短路 —— 每一次都真的走到「生成代理 + 上传」。
+   *
+   * 代理的上传 key 由**内容标识**决定（`prepare` 算出的哈希），不再是每次一个新 UUID，所以两次
+   * 落到同一个对象上：编码一次、上传一次。这正是原来想守而没守住的那件事 —— 旧代码在这里会上传两份。
+   *
+   * 原先写的是「并发两次 understand」，那测不出这件事：`understand` 按「素材 + 指令」幂等（命中就
+   * 直接复用已保存的分析），两次并发里先完成的那个写了库，后一个就短路返回了，于是无论上传 key
+   * 怎么生成都只有一个对象。一条会因为无关机制而通过的断言，等于没写。
+   */
   modelReplies = [
     '{"summary":"第一次","segments":[]}',
     '{"summary":"第二次","segments":[]}',
   ]
-  const run = () => vw.understand('p-b', 'a-b', undefined, new AbortController().signal).catch(e => ({ error: String(e.message).slice(0, 60) }))
-  // prepare 会调 ffmpeg，本地假文件会让它失败 —— 这本身也是要观察的行为
-  const [r1, r2] = await Promise.all([run(), run()])
-  const a = r1, b = r2
-  const failed = Boolean(a.error) || Boolean(b.error)
-  const proxyKeys = [...put.keys()].filter(k => k.startsWith('goclip-temporary/p-b/a-b/'))
-  record('并发 understand 的失败是可读错误（非崩溃）', failed ? !!(a.error ?? b.error) : true,
-    failed ? `都失败了，错误可读：${(a.error ?? b.error)?.slice(0, 60)}` : '两次都成功')
-  if (!failed) {
-    record('并发 understand 不去重（同一素材产生多份代理视频）', proxyKeys.length === 1,
-      `产生的代理视频对象数=${proxyKeys.length}（每次调用一个 randomUUID）`)
-  } else {
-    console.log(`        （推断）每次 understand 都用 randomUUID 生成代理视频 key，因此并发不会复用，只会重复上传`)
-  }
+  const first = await vw.understand('p-b', 'a-b', '第一次提问', new AbortController().signal).catch(e => ({ error: String(e.message).slice(0, 80) }))
+  const afterFirst = [...put.keys()].filter(k => k.startsWith('goclip-temporary/')).length
+  const second = await vw.understand('p-b', 'a-b', '第二次提问', new AbortController().signal).catch(e => ({ error: String(e.message).slice(0, 80) }))
+  const failed = Boolean(first.error) || Boolean(second.error)
+  const proxyKeys = [...put.keys()].filter(k => k.startsWith('goclip-temporary/'))
+  record('两次不同指令的理解都能跑完（未走幂等缓存）', !failed && second.reused !== true,
+    failed ? `失败：${(first.error ?? second.error)?.slice(0, 70)}` : `第一次后对象数=${afterFirst}，第二次后=${proxyKeys.length}，第二次 reused=${String(second.reused)}`)
+
+  /*
+   * 这里**刻意不再断言**「同一素材只上传一份代理」。
+   *
+   * 这条路径上第二个调用会被**分片缓存**（`timeline_chunks` 里那行 `completed`）在到达上传之前
+   * 就短路掉，所以凡是在这里数对象个数的断言，无论上传 key 是随机 UUID 还是内容标识都会通过 ——
+   * 实测两个版本都是 1，把它写成断言等于给一个不具区分力的检查盖章。
+   *
+   * 上传 key 与记忆化由 `packages/video/video-workspace/tests/upload-memo.spec.ts` 直接钉住：
+   * 同一 key 两次调用只发一次 PUT、不同 key 各发一次、失败的尝试不被记住。那里拆掉记忆化会变红。
+   */
+  record('第二次调用确实走到了上传路径（否则上面那条无意义）',
+    !failed && proxyKeys.length >= 1,
+    failed ? '编码失败，本路径未走到' : `goclip-temporary 前缀对象数=${proxyKeys.length}`)
 }
 
 // ═══ C. 模型返回非 JSON ════════════════════════════════════════════════════

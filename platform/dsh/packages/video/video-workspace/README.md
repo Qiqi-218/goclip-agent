@@ -1,4 +1,25 @@
+---
+description: "DSH-native video editing plugin that registers the video_* tools and drives FFmpeg with Qwen Omni for import, understanding, search, timeline editing, and export, keeping OSS as the durable store and SQLite as a rebuildable local cache."
+kind: "package-bundle"
+---
+
 # dsh-video-workspace
+
+## Summary
+
+`dsh-video-workspace` registers the `video_*` tools inside the DSH process and drives FFmpeg with Qwen Omni to import, understand, search, edit, and export video. Source media, the project `manifest.json`, analysis results, and exported films live in private OSS, which is the durable store; FFmpeg works from a local temporary cache, and the local SQLite file is only an index and recovery cache. It needs no Go service, and a read-only media route serves asset bytes with Range support, render output, and measurement JSON.
+
+## Table of Contents
+
+- [Summary](#summary)
+- [Table of Contents](#table-of-contents)
+- [只读媒体路由](#只读媒体路由)
+- [字幕样式](#字幕样式)
+- [Model Experience](#model-experience)
+- [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
+- [Dev Note](#dev-note)
+
+-----
 
 DSH 原生视频剪辑插件。它在 DSH 进程内注册 `video_*` 工具，调用 FFmpeg 和 Qwen Omni 完成视频导入、理解、检索、时间线编辑和导出。
 
@@ -68,3 +89,14 @@ Append-only. A tool call appends its result, and this package never rewrites an 
 - **字幕样式的阴影只有偏移量，没有颜色** —— ASS 的 `Shadow` 只接受偏移，阴影颜色跟着 `BackColour` 走。因此有底框时阴影与底框二者只能取一，这一条写进了 `toAssStyle` 的注释；要真正的彩色阴影得改用 `drawtext` 滤镜逐条绘制。
 - **浏览器预览不是最终成片** —— 工作台会在画面上提供字幕样式的近似预览，但浏览器字体替换、libass 字体和实际输出尺寸可能不同；最终效果以 `video_render_submit` 导出的成片为准。
 - **`video_understand` 单次上传有 192 秒上限**，更长的素材走的是分段窗口；这个上限是模型侧的限制，不是本包的选择。
+
+<a id="dev-note"></a>
+### Dev Note
+
+**OSS is the durable store; every local copy is a cache.** Source media, the project `manifest.json`, analyses, intermediates, and exports are uploaded to private OSS, FFmpeg works only from local temporary files, and the SQLite database is a local index and recovery cache — so a lost or rebuilt local database costs a re-index, not the project.
+
+**Every timeline edit must carry the `base_revision` the caller just read.** The write transaction re-reads the revision inside the transaction, so a second client cannot pass an old `base_revision` between the caller's initial read and the actual write; the conflict fails loud instead of overwriting another editor's work. Reverting is an edit too: it advances the revision rather than erasing what happened, so a revert can itself be reverted.
+
+**Playback addresses always point at the read-only media route, never at a signed OSS URL.** A signed URL carries the AccessKeyId and expires, so the route re-signs per request and forwards Range. Three measured OSS behaviors shape the route: a signature covers the HTTP method (a GET signature answered with HEAD is 403), OSS does not report 416 (an out-of-range Range silently returns 200 with the whole object), and the route must therefore decide range validity itself while keeping unmeasured (404), missing asset (404), and read failure (502) distinguishable.
+
+**Subtitle style is one JSON column, `timelines.subtitle_style`, burned at the film's real pixel height.** Position is a nine-cell grid plus margins rather than coordinates, font size and margins are fractions of frame height rather than pixels, and only the fields a caller names are replaced; a rejection lists every problematic field at once because reporting one per round trips the model three times.
