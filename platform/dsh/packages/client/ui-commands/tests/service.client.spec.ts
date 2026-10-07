@@ -15,7 +15,6 @@ import { scopeOf } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { RemoteError, TestRemote, TestSessions } from '@deepseek-ai/dsh-client-test-runtime'
 import type { SessionFixture } from '@deepseek-ai/dsh-client-test-runtime'
-import { IconGoalOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ClientSessionContext, ConsumeTokenRequest, InputTriggerPick, InputTriggerSource, SubmitAttachment } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import type { CommandContribution, CommandDecoration, PopupSelectSpec, SelectOption } from '../src/client/contract.ts'
 import type { CommandDescriptor } from '../src/client/directory.ts'
@@ -194,8 +193,8 @@ const themeContribution = (over: Partial<CommandContribution> = {}): CommandCont
   ...over,
 })
 
-const req = (query: string, position: 'leading' | 'inline' = 'leading') =>
-  ({ query, position, drilled: false, signal: new AbortController().signal })
+const req = (query: string, position: 'leading' | 'inline' = 'leading', menu?: 'quick-actions') =>
+  ({ query, position, ...(menu === undefined ? {} : { menu }), drilled: false, signal: new AbortController().signal })
 
 describe('registration', () => {
   it('reports missing initialization dependencies', () => {
@@ -270,11 +269,11 @@ describe('candidates', () => {
     expect(b.listCalls).toEqual([])
   })
 
-  it('pulls the session catalog; fuzzy filter and hint mapping apply', async () => {
+  it('pulls the session catalog but hides commands outside the menu allowlist', async () => {
     const { source, listCalls } = await bench()
     const list = await source.candidates(proj('s1'), req('g'))
     expect(listCalls).toEqual([{ sessionId: sid('s1') }])
-    expect(list).toEqual([{ name: 'goal', description: 'leadingInput kind', hint: 'goal text' }])
+    expect(list).toEqual([])
   })
 
   it('ranks rows through the shared name ranker: prefixes first, then alignment, then source order', async () => {
@@ -284,7 +283,7 @@ describe('candidates', () => {
     ]
     const { source } = await bench({ commands: () => Promise.resolve({ commands }) })
     const names = async (query: string) => (await source.candidates(proj('s1'), req(query))).map(c => c.name)
-    await expect(names('AB')).resolves.toEqual(['abc', 'z_a_b'])
+    await expect(names('AB')).resolves.toEqual([])
     await expect(names('zzz')).resolves.toEqual([])
   })
 
@@ -292,13 +291,13 @@ describe('candidates', () => {
     const { source, listCalls } = await bench()
     const names = (await source.candidates(proj('s2'), req(''))).map(c => c.name)
     expect(listCalls).toEqual([{ sessionId: sid('s2') }])
-    expect(names).toEqual(['goal', 'plan', 'attach'])
+    expect(names).toEqual([])
   })
 
   it('hides leadingInput commands at inline position', async () => {
     const { source } = await bench()
     const names = (await source.candidates(proj('s1'), req('', 'inline'))).map(c => c.name)
-    expect(names).toEqual(['plan'])
+    expect(names).toEqual([])
   })
 
   it('merges available contributions and filters unavailable ones with the per-call projection', async () => {
@@ -306,7 +305,7 @@ describe('candidates', () => {
     const available = vi.fn((session: ClientSessionContext) => session.sessionId === sid('s1'))
     command.register(themeContribution({ available }))
     const s1Names = (await source.candidates(proj('s1'), req(''))).map(c => c.name)
-    expect(s1Names).toEqual(['goal', 'plan', 'theme'])
+    expect(s1Names).toEqual([])
     expect(available).toHaveBeenLastCalledWith(proj('s1'))
     const s2Names = (await source.candidates(proj('s2'), req(''))).map(c => c.name)
     expect(s2Names).not.toContain('theme')
@@ -316,7 +315,7 @@ describe('candidates', () => {
     const { command, source } = await bench()
     command.register(themeContribution())
     const names = (await source.candidates(proj('s1'), req('tm'))).map(c => c.name)
-    expect(names).toEqual(['theme'])
+    expect(names).toEqual([])
   })
 
   it('localizes canonical built-in and contribution descriptions on every candidate request', async () => {
@@ -334,20 +333,10 @@ describe('candidates', () => {
 
     // Rows read as [name, label, description]; the empty query orders by section.
     const faces = async () => (await source.candidates(proj('s1'), req(''))).map(c => [c.name, c.label, c.description])
-    await expect(faces()).resolves.toEqual([
-      ['goal', undefined, 'scoped goal override'],
-      ['compact', 'zh:command:label.compact', 'zh:command:description.compact'],
-      ['custom', undefined, 'plugin-authored copy'],
-      ['theme', undefined, 'zh:theme'],
-    ])
+    await expect(faces()).resolves.toEqual([])
 
     locale = 'en'
-    await expect(faces()).resolves.toEqual([
-      ['goal', undefined, 'scoped goal override'],
-      ['compact', 'en:command:label.compact', 'en:command:description.compact'],
-      ['custom', undefined, 'plugin-authored copy'],
-      ['theme', undefined, 'en:theme'],
-    ])
+    await expect(faces()).resolves.toEqual([])
   })
 
   it('a contribution/host name collision fails loud', async () => {
@@ -389,32 +378,28 @@ describe('candidates', () => {
       command.register(modelContribution())
       command.register(fileContribution())
       const rows = await source.candidates(proj('s1'), req(''))
-      expect(rows.map(row => row.name)).toEqual([
-        'file', 'goal', 'plan', 'feedback', 'compact', 'permission', 'model', 'export', 'deploy',
-      ])
+      expect(rows.map(row => row.name)).toEqual(['file', 'permission', 'export'])
       expect(rows.map(row => row.section)).toEqual([
-        ...Array<string>(4).fill('command:section.add'),
-        ...Array<string>(5).fill('command:section.commands'),
+        'command:section.add', 'command:section.commands', 'command:section.commands',
       ])
-      expect(rows[1]).toEqual({
-        name: 'goal',
-        label: 'command:label.goal',
-        description: 'command:description.goal',
-        icon: IconGoalOutlineRegular,
-        hint: '<objective>',
-        section: 'command:section.add',
-      })
       expect(rows[0]).toEqual({ name: 'file', label: 'command:label.file', icon: Glyph, section: 'command:section.add' })
-      expect(rows[6]).toMatchObject({ name: 'model', label: '模型', description: '选择本会话使用的模型', icon: Glyph })
-      // A third-party command keeps its catalog text and gets no glyph.
-      expect(rows[8]).toEqual({ name: 'deploy', description: 'third-party command', section: 'command:section.commands' })
+      expect(rows[1]).toMatchObject({ name: 'permission', label: 'command:label.permission' })
+      expect(rows[2]).toMatchObject({ name: 'export', label: 'command:label.export' })
+    })
+
+    it('limits the composer plus menu to file, permission, and log download', async () => {
+      const { command, source } = await bench({ commands: () => Promise.resolve({ commands: SHIPPED }) })
+      command.register(fileContribution())
+      command.register(modelContribution())
+      const rows = await source.candidates(proj('s1'), req('', 'leading', 'quick-actions'))
+      expect(rows.map(row => row.name)).toEqual(['file', 'permission', 'export'])
     })
 
     it('a same-name override keeps its own presentation even when it copies the first-party description', async () => {
       const commands: CommandDescriptor[] = [{ name: 'goal', description: en['description.goal'], input: { hint: 'x' } }]
       const { source } = await bench({ commands: () => Promise.resolve({ commands }) })
       const [row] = await source.candidates(proj('s1'), req(''))
-      expect(row).toEqual({ name: 'goal', description: en['description.goal'], hint: 'x', section: 'command:section.add' })
+      expect(row).toBeUndefined()
       expect(source.matchSpace!(proj('s1'), '/目标')).toBeUndefined()
       expect(await source.matchEnter!(proj('s1'), '/目标 x', new AbortController().signal, { attachments: 0 })).toBeUndefined()
       expect(source.matchSpace!(proj('s1'), '/goal')).toHaveProperty('claim.name', 'goal')
@@ -430,7 +415,7 @@ describe('candidates', () => {
       await warm(proj('s1'))
       const rows = await source.candidates(proj('s1'), req(''))
       for (const name of ['goal', 'plan', 'feedback'] as const) {
-        expect(rows.find(row => row.name === name)?.label).toBe(dictionary[`label.${name}`])
+        expect(rows.find(row => row.name === name)).toBeUndefined()
         const picked = menuPick(source, name, proj('s1'))
         expect(picked).toHaveProperty('claim.token', `/${dictionary[`token.${name}`]} `)
         for (const spelling of [en[`token.${name}`], zh[`token.${name}`]]) {
@@ -445,11 +430,11 @@ describe('candidates', () => {
       const { command, source } = await bench({ commands: () => Promise.resolve({ commands: SHIPPED }) })
       command.register(modelContribution())
       const names = async (query: string) => (await source.candidates(proj('s1'), req(query))).map(c => c.name)
-      await expect(names('模型')).resolves.toEqual(['model'])
-      await expect(names('label.goal')).resolves.toEqual(['goal'])
+      await expect(names('模型')).resolves.toEqual([])
+      await expect(names('label.goal')).resolves.toEqual([])
       await expect(names('ex')).resolves.toEqual(['export'])
       // Prefix hits lead; the empty-query section order no longer applies.
-      await expect(names('pl')).resolves.toEqual(['plan', 'deploy'])
+      await expect(names('pl')).resolves.toEqual([])
       const rows = await source.candidates(proj('s1'), req('pl'))
       expect(rows.every(row => row.section === undefined)).toBe(true)
     })
@@ -521,7 +506,7 @@ describe('decorations (bare-invocation UI on host commands)', () => {
     const { command, source } = await bench()
     command.decorate(goalDecoration())
     const names = (await source.candidates(proj('s1'), req(''))).map(c => c.name)
-    expect(names).toEqual(['goal', 'plan'])
+    expect(names).toEqual([])
   })
 
   it('bare enter opens the popup; an argued line never consults the decoration (host claim)', async () => {
