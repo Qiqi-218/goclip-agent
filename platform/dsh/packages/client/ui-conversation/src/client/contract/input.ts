@@ -93,6 +93,13 @@ export interface InputTriggerHit {
   readonly quoted: boolean
   readonly position: 'leading' | 'inline'
   readonly span: TokenSpan
+  /**
+   * Scope for a programmatically opened quick-action menu.
+   *
+   * The input-trigger controller's own `TriggerHit` carries this, and this interface is the slice of it
+   * that a caller here may set; a hit built without it opens the source's default menu.
+   */
+  readonly menu?: 'quick-actions'
 }
 
 /** Structural per-Session trigger provider consumed by the input shell. */
