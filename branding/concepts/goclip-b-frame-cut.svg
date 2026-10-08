@@ -1,7 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
-  <title id="title">GoClip B — Frame Cut</title>
-  <desc id="desc">Two squared film-frame corners form a compact C and reveal a cut path through the centre.</desc>
-  <path fill="#111111" fill-rule="evenodd" d="M44 42h74v28H72v116h46v28H44zm168 0h-74v28h46v116h-46v28h74z"/>
-  <path fill="#111111" d="M92 106h72v28H92z"/>
-  <path fill="#111111" d="m151 84 43 36-43 36z"/>
-</svg>

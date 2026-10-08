@@ -368,7 +368,7 @@ describe('SettingsPanel navigation', () => {
     expect(screen.getByTestId('section-general')).toBeTruthy()
   })
 
-  it('gives every section a nav glyph, distinct for the ids the shell knows', () => {
+  it('shows only General and Models even when other sections are registered', () => {
     mount({
       rows: [
         { id: 'general', order: 0, label: 'General' },
@@ -380,15 +380,11 @@ describe('SettingsPanel navigation', () => {
       ],
     })
     openPanel()
-    // Glyphs carry no id of their own, so the drawn paths are what tells them apart.
-    const glyphs = ['General', 'Models', 'Agent presets', 'Plugins', 'Archived sessions', 'Contributed']
-      .map(name => screen.getByRole('button', { name }).querySelector('svg')?.innerHTML)
-
-    expect(glyphs.every(glyph => glyph !== undefined && glyph !== '')).toBe(true)
-    // The four ids the shell names get their own glyph; every other section —
-    // including one this package never heard of — shares the gear.
-    expect(new Set(glyphs.slice(0, 5)).size).toBe(5)
-    expect(glyphs[5]).toBe(glyphs[0])
+    expect(screen.getByRole('button', { name: 'General' }).querySelector('svg')).not.toBeNull()
+    expect(screen.getByRole('button', { name: 'Models' }).querySelector('svg')).not.toBeNull()
+    for (const name of ['Agent presets', 'Plugins', 'Archived sessions', 'Contributed']) {
+      expect(screen.queryByRole('button', { name })).toBeNull()
+    }
   })
 
   it('switches the rendered section on nav click', () => {
@@ -496,13 +492,13 @@ it('explicitly reopens one onboarding editor during an existing session', () => 
   expect(screen.queryByTestId('onboarding')).toBeNull()
 })
 
-it('opens Account from the contributed sidebar launcher', () => {
-  const { renderSlot } = mount({ rows: [{ id: 'account', order: -10, label: 'Account' }] })
+it('opens General from the contributed sidebar launcher', () => {
+  const { renderSlot } = mount({ rows: [{ id: 'general', order: 0, label: 'General' }] })
   const launcher = renderSlot.mock.calls.find(call => call[0] === 'settings.launcher')!
   expect(launcher[1]).toMatchObject({ settingsOpen: false })
   act(() => { (launcher[1] as { openSettings: () => void }).openSettings() })
-  expect(screen.getByTestId('section-account')).toBeTruthy()
-  expect(screen.getByRole('button', { name: 'Account' }).querySelector('svg')).not.toBeNull()
+  expect(screen.getByTestId('section-general')).toBeTruthy()
+  expect(screen.getByRole('button', { name: 'General' }).querySelector('svg')).not.toBeNull()
   expect(renderSlot.mock.calls.filter(call => call[0] === 'settings.launcher').at(-1)?.[1]).toMatchObject({ settingsOpen: true })
   fireEvent.keyDown(document, { key: 'Escape' })
   expect(renderSlot.mock.calls.filter(call => call[0] === 'settings.launcher').at(-1)?.[1]).toMatchObject({ settingsOpen: false })

@@ -89,6 +89,7 @@
   height: 5px;
   margin: 0 5px 1px 0;
   border-radius: 50%;
+  corner-shape: round;
   background: var(--dsw-alias-brand-primary);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--dsw-alias-brand-primary) 14%, transparent);
   content: '';
@@ -582,7 +583,8 @@
 .laneOff:focus-visible,
 .laneOn:focus-visible {
   background: var(--dsw-alias-bg-layer-2);
-  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-width: var(--dsw-focus-ring-width);
   outline-offset: 1px;
 }
 /* 片段的名字：比时间更醒目一点，因为它是人给的标签而不是测量值。 */

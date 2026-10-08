@@ -420,7 +420,9 @@ export const Config: z<Config> = z.object({
   verifyPadSeconds: z.number().default(3),
   verifyFps: z.number().default(3),
   proxyHeight: z.number().default(720),
-  subtitleFont: z.string().default('Microsoft YaHei'),
+  // macOS does not include Microsoft YaHei; fontconfig silently maps it to a
+  // Latin-only font on this platform, leaving Chinese subtitles blank.
+  subtitleFont: z.string().default(process.platform === 'darwin' ? 'Hiragino Sans' : 'Microsoft YaHei'),
   subtitleFontSize: z.number().default(22),
   subtitleMarginV: z.number().default(28),
   /**

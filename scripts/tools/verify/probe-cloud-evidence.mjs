@@ -40,6 +40,8 @@ function record(name, ok, detail = '') {
 }
 
 const dir = await mkdtemp(join(tmpdir(), 'goclip-cloud-'))
+const ffmpegFilters = await run('ffmpeg', ['-filters'], { maxBuffer: 4 * 1024 * 1024 })
+const supportsSubtitleBurn = `${ffmpegFilters.stdout}\n${ffmpegFilters.stderr}`.split('\n').some(line => /\bsubtitles\b/.test(line))
 
 // 分片源：五段不同颜色，各 2 秒，总长 10 秒。
 const clip = join(dir, 'cloud-source.mp4')
@@ -438,6 +440,9 @@ record('命中画面描述时引用里指出它来自这一维',
   // 只断言"渲染成功"是不够的：烧录是一个可选的后期步骤，它失败时最自然的写法
   // 就是跳过而不报错 —— 那样用户会拿到一个没有字幕的成片，而返回值里写着成功。
   // 这里直接数像素：把成片底部那一条与未烧录版本比对。
+  if (!supportsSubtitleBurn) {
+    console.log('⏭️ 跳过字幕像素验收：当前 FFmpeg 未编入 subtitles/libass 滤镜')
+  } else {
   const burned = await vw2.render('tl-sub', 'burned.mp4', new AbortController().signal, { burnSubtitles: 'transcript', subtitleStyle: { text_color: '#FFD400', outline_color: '#000000', outline_width: 4, position: 'bottom-center', background_color: '#000000', background_opacity: 0.4, font_size: 30 } })
   const plain = await vw2.render('tl-sub', 'plain.mp4', new AbortController().signal)
   // 取本地路径走探针自己的 served 映射：上传时已把每个对象落在盘上，
@@ -492,6 +497,7 @@ record('命中画面描述时引用里指出它来自这一维',
     record('烧录没有改变成片时长',
       Math.abs(burned.duration_seconds - plain.duration_seconds) < 0.2,
       `烧录 ${burned.duration_seconds}s vs 未烧录 ${plain.duration_seconds}s`)
+  }
   }
 
   // 没有字幕证据时不能假装烧了。上一版这条断言写成"notes 里有『烧录』二字就算过"，

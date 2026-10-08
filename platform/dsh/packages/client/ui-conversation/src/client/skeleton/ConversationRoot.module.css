@@ -543,3 +543,6 @@ button.crumb:hover {
 .embeddedBody[data-content-phase='settling'] .composerSeat {
   visibility: hidden;
 }
+
+/* Preserve the project menu anchor without displaying a project chip. */
+.workspacePickerAnchor { display: block; height: 0; flex: 1 1 auto; }

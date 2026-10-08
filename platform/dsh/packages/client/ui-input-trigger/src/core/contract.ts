@@ -18,6 +18,8 @@ export interface TriggerHit {
   readonly position: TriggerPosition
   /** Token span; draftRev injected by the caller. */
   readonly span: TokenSpan
+  /** Optional scope for a programmatically opened quick-action menu. */
+  readonly menu?: 'quick-actions'
 }
 
 /**

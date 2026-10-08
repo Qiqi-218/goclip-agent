@@ -3399,7 +3399,7 @@ export class VideoWorkspace {
           const escaped = srt.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'")
           await this.stages.timed('烧录字幕', () => this.run('ffmpeg', [
             '-nostdin', '-y', '-i', output,
-            '-vf', `subtitles='${escaped}':force_style='${toAssStyle(style, pictureHeight, pictureWidth)}'`,
+            '-vf', `subtitles=filename='${escaped}':force_style='${toAssStyle(style, pictureHeight, pictureWidth)}'`,
             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
             '-c:a', 'copy', burned,
           ], signal))

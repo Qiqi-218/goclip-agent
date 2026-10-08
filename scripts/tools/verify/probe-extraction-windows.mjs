@@ -1,16 +1,14 @@
 /**
  * Windowed extraction: the arithmetic that decides whether a cut lands on the right footage.
  *
- * A long extraction answer does not fit in one model reply — measured, a 43-minute
- * transcription died mid-JSON around 21335 characters while 8 and 15 minutes came back
- * whole. The fix splits the media into windows, which introduces two ways to be wrong:
+ * A long visual extraction answer does not fit in one model reply. Splitting the media
+ * into windows introduces two ways to be wrong:
  *
  *   1. A window's own timestamps are relative to that window. Merging without shifting
  *      them back onto the asset timeline makes the second window appear before the first,
  *      and a creator selecting it cuts the wrong part of the video.
- *   2. A trailing remainder that is too short to answer about returns nothing. Measured:
- *      a 3-minute asset returned an empty list while 8 and 15 minutes returned 88 and 161
- *      lines, so a short tail is folded into the window before it rather than asked about.
+ *   2. A trailing remainder that is too short to answer about returns nothing, so a short
+ *      tail is folded into the window before it rather than asked about.
  *
  * The model is stubbed; what is under test is the merge, not the model.
  */
@@ -80,7 +78,7 @@ globalThis.fetch = async (url, init) => {
     // 每窗都声称自己覆盖 0–60 秒（窗口内相对时间）。
     // 合并后必须变成 0–60 / 600–660 / 1200–1260；不偏移的话三条都会落在 0–60。
     return new Response(JSON.stringify({
-      choices: [{ message: { content: JSON.stringify({ entries: [{ start_us: 0, end_us: 60_000_000, text: `第${order}窗的台词` }] }) }, finish_reason: 'stop' }],
+      choices: [{ message: { content: JSON.stringify({ scenes: [{ start_us: 0, end_us: 60_000_000, description: `第${order}窗的画面` }] }) }, finish_reason: 'stop' }],
       usage: { completion_tokens: 10, completion_tokens_details: { reasoning_tokens: 0, text_tokens: 10 } },
     }), { status: 200 })
   }
@@ -105,6 +103,9 @@ const baseConfig = {
   acousticSampleRate: 8000, acousticWindowMs: 1000, acousticPeakLimit: 20,
   shotSceneThreshold: 0.3, shotMinSeconds: 0.4, shotPacingWindowSeconds: 5, shotBusyLimit: 8,
   silenceMinSeconds: 0.4, silenceNoiseDb: -30, refineToleranceSeconds: 1.5, verifyBoundaries: false,
+  ocrSampleSeconds: 1,
+  ocrModel: 'stub-ocr',
+  visionModel: 'stub-vision',
   asrModel: 'stub-asr', asrBaseUrl: 'http://stub.invalid/api/v1', asrPollMs: 10, asrTimeoutMs: 5000, asrApiKeyEnv: 'STUB_ID',
 }
 process.env.STUB_ID = 'x'
@@ -127,7 +128,7 @@ async function scenario(name, { chunkSeconds, failCall = -1, assetSeconds = 1800
   db.close()
   modelCalls = 0
   failOnCall = failCall
-  const result = await vw.ocrEvidence('pw', assetId, new AbortController().signal)
+  const result = await vw.visualEvidence('pw', assetId, new AbortController().signal)
   vw.dispose()
   return { result, calls: modelCalls }
 }
@@ -135,7 +136,7 @@ async function scenario(name, { chunkSeconds, failCall = -1, assetSeconds = 1800
 // ---- 1. 三窗，时间码必须平移回素材时间轴 -------------------------------
 console.log('=== 30 分钟素材按 10 分钟切：三个窗口的时间码必须落在各自位置 ===')
 const three = await scenario('three', { chunkSeconds: 600 })
-const lines = three.result.entries ?? []
+const lines = three.result.scenes ?? []
 record('产生了三个窗口的调用', three.calls === 3, `模型调用 ${three.calls} 次`)
 record('三窗的结果被合并成三条', lines.length === 3, `line_count=${lines.length}`)
 
@@ -152,7 +153,7 @@ console.log('\n=== 素材 20.5 分钟、chunk 10 分钟：末窗只有 30 秒，
 const folded = await scenario('folded', { chunkSeconds: 600, assetSeconds: 1230, file: clipLong })
 record('只发了两个请求（末窗被合并，没有单独去问那 30 秒）',
   folded.calls === 2, `模型调用 ${folded.calls} 次`)
-const foldedLines = folded.result.entries ?? []
+const foldedLines = folded.result.scenes ?? []
 record('第二窗覆盖到素材末尾，没有留下没被读过的区间',
   foldedLines.length >= 2 && foldedLines[foldedLines.length - 1].end_us <= 1_230_000_000,
   foldedLines.map(l => `${(l.start_us / 1e6).toFixed(0)}-${(l.end_us / 1e6).toFixed(0)}s`).join(' '))
@@ -160,7 +161,7 @@ record('第二窗覆盖到素材末尾，没有留下没被读过的区间',
 // ---- 3. 一窗失败不能丢掉其余窗口 --------------------------------------
 console.log('\n=== 第二窗失败：其余窗口的结果必须保留并说明缺口 ===')
 const partial = await scenario('partial', { chunkSeconds: 600, failCall: 2 })
-const partialLines = partial.result.entries ?? []
+const partialLines = partial.result.scenes ?? []
 record('失败窗口之外的结果仍然保留',
   partialLines.length === 2, `line_count=${partialLines.length}（三窗中第二窗失败）`)
 record('缺口被如实报出来，而不是假装完整',

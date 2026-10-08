@@ -527,6 +527,7 @@ export class InputTriggerController {
           quoted: hit.quoted,
           position: hit.position,
           drilled: this.drilled,
+          ...(hit.menu === 'quick-actions' ? { menu: 'quick-actions' as const } : {}),
           signal: controller.signal,
         })
         .then(

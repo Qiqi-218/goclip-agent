@@ -1,6 +1,6 @@
 {
-  "name": "DeepSeek Harness",
-  "short_name": "DSH",
+  "name": "goclip",
+  "short_name": "goclip",
   "start_url": "./",
   "scope": "./",
   "display": "fullscreen",

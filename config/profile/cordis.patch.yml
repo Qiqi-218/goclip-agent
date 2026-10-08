@@ -37,6 +37,30 @@
     provider: bailian
     model: qwen3.8-omni-flash
 
+# 默认模型只有一个来源：百炼（Qwen）。DeepSeek 两条通路整条删掉。
+#
+# `dsh-base` 默认挂两个 DeepSeek adapter：`llm-deepseek`（官方 API Key，
+# provider id `deepseek-official`，显示名「DeepSeek」）和 `llm-deepseek-account`
+# （账号登录，provider id `deepseek-account`，显示名「DeepSeek Account」）。
+#
+# 关键在**它们不检查密钥就注册路由**：`discoverModels` 直接返回内置目录
+# （DeepSeek-V41-Flash / DeepSeek-V4-Pro），于是输入框旁的模型选择器里会出现
+# 这两组，而且 `provider-order.ts` 把 deepseek-account / deepseek-official
+# **恒定排在最前**——本机没有 DEEPSEEK_API_KEY，选中就是「看着能用、一发起就失败」。
+# 「设置 → 模型」里的 DeepSeek 卡片也来自这两行（provider 目录是按注册路由拼的）。
+#
+# 禁掉 adapter 行 = 这两条 provider 路由不存在：选择器分组、设置页卡片、
+# 默认模型候补一起消失，界面上只剩「阿里云百炼 / Qwen」。
+#
+# 账号平台行 `deepseek-account`（@deepseek-ai/dsh-deepseek-account-platform）**保留**：
+# 它只提供登录、凭据与账号服务，不注册任何模型路由；`web-search-deepseek`、
+# `account-controller` 等仍在注入它，禁掉会连带影响它们。
+- id: llm-deepseek
+  disabled: true
+
+- id: llm-deepseek-account
+  disabled: true
+
 - id: ui-settings-general
   name: "@deepseek-ai/dsh-client-ui-settings-general"
   config:
@@ -134,15 +158,29 @@
   config:
     default: goclip
 
-# ── 工作区落点：所有东西都留在 E:\huabei ────────────────────────────────────
+# 面向剪辑场景，工作区必须由用户选择素材目录；首次打开不再创建空的默认工作区。
+# 插件管理仍是内部组合机制，但不暴露为用户设置入口。
+- id: ui-settings-plugins
+  disabled: true
+
+- id: ui-settings-plugin-inventory
+  disabled: true
+
+# ── 客户端 UI 精简 ────────────────────────────────────────────────────────────
 #
-# 不设这一项时，首次使用的工作区目录是 `<系统文档目录>\deepseek-harness\default-workspace`，
-# 也就是 `C:\Users\1\Documents\deepseek-harness\default-workspace` —— 在 C 盘。
-# 这有两个问题：一是「所有文件都保存在 E:\huabei」做不到；二是 Agent 用相对路径操作时
-# 基准落在那个空目录，而不是我们的项目根。
-#
-# 指定 documentsDirectory 后，首次工作区变成
-# `E:\huabei\deepseek-harness\default-workspace`，整个会话的路径基准都在 E:\huabei 之内。
-- id: workspace-controller
-  config:
-    documentsDirectory: !!js process.env.GOCLIP_RUNTIME ?? process.cwd()
+# 侧栏「插件」面板（ui-plugin-manager）去掉后，藏在插件页里的 shell、
+# 智能体循环、子智能体、网页搜索等设置项随之消失；账号与余额、模式与预设、
+# 会话日志上传都是面向开发者的 DeepSeek 生态入口，剪辑产品用不上。
+# 设置导航因此只剩「通用设置」与「模型」两页；新会话页 hero 行的预设选择
+# 胶囊（ui-agent-preset 注册）也不再出现。
+- id: ui-plugin-manager
+  disabled: true
+
+- id: ui-settings-account
+  disabled: true
+
+- id: ui-agent-preset
+  disabled: true
+
+- id: ui-settings-session-log
+  disabled: true

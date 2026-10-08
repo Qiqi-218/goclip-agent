@@ -74,7 +74,8 @@
 .speed:focus-visible,
 .speedOn:focus-visible,
 .mutedOn:focus-visible {
-  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-width: var(--dsw-focus-ring-width);
   outline-offset: 1px;
 }
 

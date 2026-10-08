@@ -276,6 +276,10 @@ export function SidebarRoot({
         </button>
       </Tooltip>
 
+      <div className={css.footerActions}>
+        {renderSlot('sidebar.footer.action', { wide })}
+      </div>
+
       {panels.length > 0 && (
         <nav className={css.panelList} aria-label={t('panels.label')}>
           {panels.map(({ id, label }) => (
@@ -301,11 +305,8 @@ export function SidebarRoot({
         })}
       </div>
 
-      {/* Footer actions stack above Settings in both sidebar widths. */}
+      {/* Settings stays pinned to the bottom in both sidebar widths. */}
       <div className={css.footArea}>
-        <div className={css.footerActions}>
-          {renderSlot('sidebar.footer.action', { wide })}
-        </div>
         <div className={css.settingsArea}>
           {renderSlot('sidebar.settings', { wide })}
         </div>

@@ -401,9 +401,9 @@ let tl = null
   let failure = null
   try { proxy = await vw.prepare(portrait, new AbortController().signal) } catch (error) { failure = error }
   record('竖屏素材能生成代理视频', proxy !== null,
-    proxy === null ? `失败：${String(failure?.message ?? '').split('\n').slice(-1)[0]?.slice(0, 90)}` : proxy.split(/[\\/]/).pop())
+    proxy === null ? `失败：${String(failure?.message ?? '').split('\n').slice(-1)[0]?.slice(0, 90)}` : proxy.file.split(/[\\/]/).pop())
   if (proxy !== null) {
-    const probed = await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', proxy], { maxBuffer: 1 << 20 })
+    const probed = await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', proxy.file], { maxBuffer: 1 << 20 })
     const [w, h] = String(probed.stdout).trim().split(',').map(Number)
     record('竖屏代理保持竖屏且宽度为偶数', w > 0 && h > 0 && h > w && w % 2 === 0, `${w}x${h}`)
     // 从素材自身探测高度：写死期望值会在换 fixture 尺寸时变成假失败。

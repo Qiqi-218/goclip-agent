@@ -165,30 +165,33 @@
   overflow: hidden;
 }
 
-.runningWhaleAnimated {
-  display: none;
-  position: absolute;
-  inset: 0;
+.runningMark {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
-.runningWhaleStill {
-  display: initial;
+.runningMarkRing {
+  opacity: 0.3;
 }
 
-@supports (mask-mode: alpha) and (mask-image: url('')) {
-  @media (prefers-reduced-motion: no-preference) and (forced-colors: none) {
-    .runningWhaleAnimated {
-      display: block;
-      background: currentColor;
-      mask: url('./running-whale@2x.png') center / 100% 100% no-repeat;
-      mask-mode: alpha;
-      /* Keep animated-mask repaints on an icon-sized composited layer. */
-      will-change: transform;
-    }
+.runningMarkSweep {
+  stroke-dasharray: 30 70;
+  animation: dsh-chat-running-sweep 1.5s linear infinite;
+}
 
-    .runningWhaleStill {
-      display: none;
-    }
+@keyframes dsh-chat-running-sweep {
+  from { stroke-dashoffset: 0; }
+  to { stroke-dashoffset: -100; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .runningMarkRing {
+    opacity: 1;
+  }
+
+  .runningMarkSweep {
+    display: none;
   }
 }
 

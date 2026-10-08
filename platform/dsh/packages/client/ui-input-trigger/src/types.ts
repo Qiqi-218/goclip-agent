@@ -118,6 +118,8 @@ export interface CandidateRequest {
   readonly position: TriggerPosition
   /** Whether this menu was opened or last re-scoped by a drill pick; see {@link HeaderRequest.drilled}. */
   readonly drilled: boolean
+  /** Optional scope for a programmatically opened quick-action menu. */
+  readonly menu?: 'quick-actions'
   readonly signal: AbortSignal
 }
 
